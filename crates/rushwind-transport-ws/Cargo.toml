@@ -19,5 +19,5 @@ tokio = { workspace = true, features = ["macros"] }
 rushwind-core = { workspace = true }
 rushwind-transport-axum = { workspace = true }
 futures = { workspace = true }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
