@@ -75,3 +75,110 @@ impl RequestContext {
         }
     }
 }
+
+/// The bearer token carried by the Authorization header (`Bearer` /
+/// `bearer` prefix), `None` when the header is absent or another
+/// scheme rides.
+pub fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+        .map(|t| t.to_owned())
+}
+
+/// Which header leads the client-IP probe — the two read orders the
+/// middleware layers actually use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpSource {
+    /// `X-Real-IP` (whole trimmed value), else the first
+    /// `X-Forwarded-For` hop — the authorization/evaluation trail.
+    RealIpFirst,
+    /// The first `X-Forwarded-For` hop, else the first `X-Real-IP`
+    /// hop — the audit trail and the context bag.
+    ForwardedFirst,
+}
+
+/// Best-effort client IP: the leading header's value per the source
+/// policy, else the other header's first comma hop. The socket peer
+/// stays unavailable at this layer.
+pub fn client_ip(headers: &axum::http::HeaderMap, source: IpSource) -> String {
+    fn whole_trimmed(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    }
+
+    fn first_hop(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    }
+
+    match source {
+        IpSource::RealIpFirst => {
+            whole_trimmed(headers, "x-real-ip").or_else(|| first_hop(headers, "x-forwarded-for"))
+        }
+        IpSource::ForwardedFirst => {
+            first_hop(headers, "x-forwarded-for").or_else(|| first_hop(headers, "x-real-ip"))
+        }
+    }
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bearer_token, client_ip, IpSource};
+    use axum::http::HeaderMap;
+
+    fn h(name: &'static str, value: &str) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert(name, value.parse().unwrap());
+        m
+    }
+
+    #[test]
+    fn bearer_token_strips_both_prefix_spellings() {
+        assert_eq!(bearer_token(&HeaderMap::new()), None);
+        assert_eq!(
+            bearer_token(&h("authorization", "Bearer abc.def")),
+            Some("abc.def".to_string())
+        );
+        assert_eq!(
+            bearer_token(&h("authorization", "bearer abc.def")),
+            Some("abc.def".to_string())
+        );
+        assert_eq!(bearer_token(&h("authorization", "Basic abc")), None);
+    }
+
+    #[test]
+    fn client_ip_follows_the_source_policy() {
+        let both = h("x-forwarded-for", "203.0.113.7, 10.0.0.1");
+        assert_eq!(client_ip(&both, IpSource::RealIpFirst), "203.0.113.7");
+        assert_eq!(client_ip(&both, IpSource::ForwardedFirst), "203.0.113.7");
+
+        let real = h("x-real-ip", "198.51.100.9");
+        assert_eq!(client_ip(&real, IpSource::RealIpFirst), "198.51.100.9");
+        assert_eq!(client_ip(&real, IpSource::ForwardedFirst), "198.51.100.9");
+
+        // Both present: the leading header wins per policy.
+        let mut m = both.clone();
+        m.insert("x-real-ip", "198.51.100.9".parse().unwrap());
+        assert_eq!(client_ip(&m, IpSource::RealIpFirst), "198.51.100.9");
+        assert_eq!(client_ip(&m, IpSource::ForwardedFirst), "203.0.113.7");
+
+        assert_eq!(client_ip(&HeaderMap::new(), IpSource::RealIpFirst), "");
+        let blank = h("x-real-ip", "   ");
+        assert_eq!(client_ip(&blank, IpSource::RealIpFirst), "");
+    }
+}
