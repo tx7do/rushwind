@@ -183,7 +183,7 @@ apalis-core = { version = "0.7", features = ["json", "sleep"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 # The Postgres driver behind the storage: tokio runtime + rustls, matching
 # the workspace's no-native-tls stance.
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
