@@ -6743,7 +6743,7 @@ dependencies = [
 name = "rushwind-authn-presharedkey"
 version = "0.0.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-authn",
 ]
 
@@ -6751,7 +6751,7 @@ dependencies = [
 name = "rushwind-authn-session"
 version = "0.0.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-authn",
  "serde_json",
 ]
@@ -6794,7 +6794,7 @@ name = "rushwind-bootstrap"
 version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-ai",
  "rushwind-authn",
  "rushwind-authn-apikey",
@@ -6843,7 +6843,7 @@ name = "rushwind-broker-kafka"
 version = "0.0.1"
 dependencies = [
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-broker",
  "samsa",
  "serde",
@@ -6856,7 +6856,7 @@ dependencies = [
 name = "rushwind-broker-mqtt"
 version = "0.0.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rumqttc",
  "rushwind-broker",
  "rushwind-transport",
@@ -6985,7 +6985,7 @@ dependencies = [
 name = "rushwind-circuitbreaker-sres"
 version = "0.0.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-circuitbreaker",
  "rushwind-transport",
  "serde",
@@ -7192,7 +7192,7 @@ version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-authn",
  "rushwind-authz",
  "rushwind-health",
@@ -7390,7 +7390,7 @@ name = "rushwind-registry-servicecomb"
 version = "0.0.1"
 dependencies = [
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "reqwest 0.12.28",
  "rushwind-registry",
  "rushwind-transport",
@@ -7416,7 +7416,7 @@ dependencies = [
 name = "rushwind-retry"
 version = "0.0.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-transport",
  "tokio",
 ]
