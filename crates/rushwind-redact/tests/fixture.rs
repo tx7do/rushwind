@@ -257,3 +257,9 @@ fn a_pool_without_the_schema_yields_an_empty_plan() {
     assert_eq!(plan.message_rule_count("bare.v1.B"), 0);
     assert!(!plan.operation_skipped("/bare.v1.Nope/Get"));
 }
+
+#[test]
+fn file_skip_keeps_the_whole_file_out_of_the_plan() {
+    let plan = build_at("file_skip.binpb");
+    assert_eq!(plan.message_rule_count("skipped.v1.S"), 0);
+}

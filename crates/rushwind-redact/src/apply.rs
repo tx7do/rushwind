@@ -3,7 +3,7 @@
 //! only, in-place value replacement, per-item recursion for
 //! `element = { nested: true }`.
 
-use prost_reflect::{DynamicMessage, ReflectMessage, Value};
+use prost_reflect::{DynamicMessage, FieldDescriptor, ReflectMessage, Value};
 
 use crate::plan::RedactPlan;
 use crate::rules::{FieldRule, ScalarRule};
@@ -32,38 +32,34 @@ impl RedactPlan {
                     msg.set_field(&field, apply_scalar(scalar, current));
                 }
                 FieldRule::ElementEmpty => msg.clear_field(&field),
-                FieldRule::ElementNested { item_type } => match msg.get_field_mut(&field) {
-                    Value::List(items) => {
-                        for item in items {
-                            if let Value::Message(item_msg) = item {
-                                self.apply_message(item_type, item_msg);
-                            }
+                FieldRule::ElementNested { item_type } => {
+                    for_each_element(msg, &field, |item| {
+                        if let Value::Message(item_msg) = item {
+                            self.apply_message(item_type, item_msg);
                         }
-                    }
-                    Value::Map(entries) => {
-                        for value in entries.values_mut() {
-                            if let Value::Message(item_msg) = value {
-                                self.apply_message(item_type, item_msg);
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                FieldRule::ElementItem(scalar) => match msg.get_field_mut(&field) {
-                    Value::List(items) => {
-                        for item in items {
-                            *item = apply_scalar(scalar, item.clone());
-                        }
-                    }
-                    Value::Map(entries) => {
-                        for value in entries.values_mut() {
-                            *value = apply_scalar(scalar, value.clone());
-                        }
-                    }
-                    _ => {}
-                },
+                    });
+                }
+                FieldRule::ElementItem(scalar) => {
+                    for_each_element(msg, &field, |item| {
+                        *item = apply_scalar(scalar, item.clone());
+                    });
+                }
             }
         }
+    }
+}
+
+/// Walks the elements of a present repeated/map field — lists and map
+/// values share the element transform, keys never change.
+fn for_each_element(
+    msg: &mut DynamicMessage,
+    field: &FieldDescriptor,
+    mut redact: impl FnMut(&mut Value),
+) {
+    match msg.get_field_mut(field) {
+        Value::List(items) => items.iter_mut().for_each(&mut redact),
+        Value::Map(entries) => entries.values_mut().for_each(&mut redact),
+        _ => {}
     }
 }
 
