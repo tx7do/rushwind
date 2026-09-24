@@ -62,6 +62,13 @@ pub struct CodegenConfig<'a> {
     /// is per OPERATION, not per binding: `additional_bindings` of a
     /// whitelisted method are exempt together with the primary binding.
     pub auth_free: &'a [(&'a str, &'a str)],
+    /// The Rust expression yielding the deployment's `Option<&'static
+    /// RedactPlan>` (e.g. `Some(fixture_proto::redact_plan())`) — the
+    /// `(redact.v1)` static redaction every mounted handler threads to
+    /// the lifecycle glue. `None` emits a literal `None`: no plan, no
+    /// redaction (a pool without the vendored redact schema would build
+    /// an empty plan anyway).
+    pub redact_plan_expr: Option<&'a str>,
 }
 
 impl CodegenConfig<'_> {
@@ -71,6 +78,14 @@ impl CodegenConfig<'_> {
         self.auth_free
             .iter()
             .any(|(s, m)| *s == service_fq && *m == method_name)
+    }
+}
+
+/// The redaction argument emitted at every `glue::handle` call site.
+fn redact_arg(cfg: &CodegenConfig<'_>) -> String {
+    match cfg.redact_plan_expr {
+        Some(expr) => format!("Some({expr})"),
+        None => "None".to_owned(),
     }
 }
 
@@ -1094,6 +1109,7 @@ pub mod mounts {{"
         let _ = writeln!(out, "                }};");
         let _ = writeln!(out, "                rushwind_http_binding::glue::handle(");
         let _ = writeln!(out, "                    {},", cfg.pool_expr);
+        let _ = writeln!(out, "                    {},", redact_arg(cfg));
         let _ = writeln!(out, "                    &wire,");
         let _ = writeln!(out, "                    move |ctx, req| {{");
         let _ = writeln!(out, "                        let svc = Arc::clone(&svc);");

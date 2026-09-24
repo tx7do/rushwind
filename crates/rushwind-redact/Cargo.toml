@@ -1,0 +1,9 @@
+[package]
+name = "rushwind-redact"
+description = "The static response-redaction runtime over a caller-supplied descriptor pool: builds a redaction plan from the (redact.v1) field/method options already riding the annotated descriptor set, then mutates the response's dynamic message before protojson serialization. Semantics anchored to the reference deployment's protoc-gen-go-redact output (the generated _redactMask/_redactEmail helpers and per-message Redact methods)."
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+prost-reflect = { version = "0.16", features = ["serde"] }

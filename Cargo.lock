@@ -7217,6 +7217,7 @@ dependencies = [
  "prost 0.14.4",
  "prost-reflect",
  "rushwind-authn",
+ "rushwind-redact",
  "serde_json",
 ]
 
@@ -7299,6 +7300,13 @@ dependencies = [
  "rushwind-ratelimit",
  "rushwind-transport",
  "tokio",
+]
+
+[[package]]
+name = "rushwind-redact"
+version = "0.0.1"
+dependencies = [
+ "prost-reflect",
 ]
 
 [[package]]

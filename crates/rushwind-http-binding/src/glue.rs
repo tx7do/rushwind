@@ -24,6 +24,7 @@ use crate::codec::serialize_response;
 use crate::ctx::RequestContext;
 use crate::envelope::{codec_error, error_response, internal_error, StatusError};
 use crate::wire::RouteWire;
+use rushwind_redact::RedactPlan;
 
 /// The per-route handler tail. `call` invokes the typed service trait
 /// method for this route; the assembled [`RequestContext`] rides as its
@@ -33,6 +34,7 @@ use crate::wire::RouteWire;
 /// extension the auth middleware inserts.
 pub async fn handle<T, R, F, Fut>(
     pool: &DescriptorPool,
+    redact: Option<&RedactPlan>,
     wire: &RouteWire,
     call: F,
     mut req: axum::extract::Request,
@@ -138,7 +140,15 @@ where
     };
 
     // 4. Response serialization: 200 + application/json, EmitUnpopulated.
-    let bytes = match serialize_response(pool, wire.output_fq, &reply) {
+    //    The deployment's redaction plan rides along (the reference's
+    //    redacted server wrappers sit between the handler and the
+    //    encoder); `None` leaves the responses untouched.
+    let bytes = match serialize_response(
+        pool,
+        wire.output_fq,
+        &reply,
+        redact.map(|plan| (plan, wire.operation_id)),
+    ) {
         Ok(b) => b,
         Err(e) => return error_response(e),
     };
