@@ -17,6 +17,8 @@ rushwind-transport = { path = "crates/rushwind-transport", version = "0.0.1" }
 rushwind-core = { path = "crates/rushwind-core", version = "0.0.1" }
 rushwind-testkit = { path = "crates/rushwind-testkit", version = "0.0.1" }
 rushwind-redact = { path = "crates/rushwind-redact", version = "0.0.1" }
+rushwind-http-binding = { path = "crates/rushwind-http-binding", version = "0.1.0" }
+rushwind-storage-seaorm-support = { path = "crates/rushwind-storage-seaorm-support", version = "0.0.1" }
 rushwind-transport-axum = { path = "crates/rushwind-transport-axum", version = "0.0.1" }
 rushwind-transport-ws = { path = "crates/rushwind-transport-ws", version = "0.0.1" }
 rushwind-transport-quic = { path = "crates/rushwind-transport-quic", version = "0.0.1" }
@@ -148,6 +150,8 @@ pbjson = "0.9"
 pbjson-types = "0.9"
 pbjson-build = "0.9"
 protox = "0.9"
+# 部署服务桥(rushwind-storage-seaorm-support)的查询语法解析:与下游两仓同一钉子。
+rust-utils = { git = "https://github.com/tx7do/rust-utils", rev = "8c24baf4e6ab419621a299a5f18e349562382fca", features = ["json"] }
 serde = "1"
 serde_json = "1"
 base64 = "0.22"

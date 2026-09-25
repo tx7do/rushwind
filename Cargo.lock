@@ -7657,6 +7657,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-storage-seaorm-support"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "pbjson-types",
+ "rushwind-http-binding",
+ "rust-utils",
+ "sea-orm",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-storage-soft-delete"
 version = "0.0.1"
 dependencies = [
@@ -7820,6 +7833,14 @@ checksum = "3e0698206bcb8882bf2a9ecb4c1e7785db57ff052297085a6efd4fe42302068a"
 dependencies = [
  "cfg-if",
  "ordered-multimap",
+]
+
+[[package]]
+name = "rust-utils"
+version = "0.1.0"
+source = "git+https://github.com/tx7do/rust-utils?rev=8c24baf4e6ab419621a299a5f18e349562382fca#8c24baf4e6ab419621a299a5f18e349562382fca"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
