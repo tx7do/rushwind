@@ -18,6 +18,7 @@ rushwind-core = { path = "crates/rushwind-core", version = "0.0.1" }
 rushwind-testkit = { path = "crates/rushwind-testkit", version = "0.0.1" }
 rushwind-redact = { path = "crates/rushwind-redact", version = "0.0.1" }
 rushwind-http-binding = { path = "crates/rushwind-http-binding", version = "0.1.0" }
+rushwind-proto-build = { path = "crates/rushwind-proto-build", version = "0.0.1" }
 rushwind-storage-seaorm-support = { path = "crates/rushwind-storage-seaorm-support", version = "0.0.1" }
 rushwind-transport-axum = { path = "crates/rushwind-transport-axum", version = "0.0.1" }
 rushwind-transport-ws = { path = "crates/rushwind-transport-ws", version = "0.0.1" }

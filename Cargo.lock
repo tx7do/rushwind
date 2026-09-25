@@ -7277,6 +7277,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-proto-build"
+version = "0.0.1"
+dependencies = [
+ "pbjson-build",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
+ "protox",
+ "rushwind-gen-http",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "rushwind-ratelimit"
 version = "0.0.1"
 dependencies = [

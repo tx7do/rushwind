@@ -1,0 +1,24 @@
+[package]
+name = "rushwind-proto-build"
+description = "The contract build engine behind the deployment proto crates: the buf-built annotated closure (custom-option bytes preserved — protox's serializer drops them), the protox types face filtered to data-carrying files, prost+pbjson (and optionally tonic) type generation, and the rushwind-gen-http face emission with byte-level sub-closure slicing. A deployment build.rs shrinks to its config."
+version.workspace = true
+edition.workspace = true
+rust-version = "1.81"
+license = "MIT"
+repository = "https://github.com/tx7do/rushwind"
+
+[features]
+# The tonic service generator rides the type pass (domain gRPC
+# server/client faces beside the message types).
+tonic = ["dep:tonic-prost-build"]
+
+[dependencies]
+prost = { workspace = true }
+protox = { workspace = true }
+prost-build = { workspace = true }
+pbjson-build = { workspace = true }
+rushwind-gen-http = { path = "../rushwind-gen-http", version = "0.1.0" }
+tonic-prost-build = { version = "0.14", optional = true }
+
+[lints]
+workspace = true
