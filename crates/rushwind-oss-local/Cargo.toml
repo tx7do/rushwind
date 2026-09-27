@@ -1,0 +1,18 @@
+[package]
+name = "rushwind-oss-local"
+description = "The local-disk ObjectStorage engine: one engine instance per bucket, the object key relative to the bucket root, directories materializing on put and disappearing files reading as NotFound. The deployment fallback the MinIO-or-local pairing needs — the S3 engine's twin for the no-endpoint profile."
+version.workspace = true
+edition.workspace = true
+rust-version = "1.81"
+license = "MIT"
+repository = "https://github.com/tx7do/rushwind"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["fs"] }
+rushwind-oss = { workspace = true }

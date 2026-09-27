@@ -70,6 +70,7 @@ rushwind-broker-stomp = { path = "crates/rushwind-broker-stomp", version = "0.0.
 rushwind-broker-kafka = { path = "crates/rushwind-broker-kafka", version = "0.0.1" }
 rushwind-broker-pulsar = { path = "crates/rushwind-broker-pulsar", version = "0.0.1" }
 rushwind-oss = { path = "crates/rushwind-oss", version = "0.0.1" }
+rushwind-oss-local = { path = "crates/rushwind-oss-local", version = "0.0.1" }
 rushwind-oss-s3 = { path = "crates/rushwind-oss-s3", version = "0.0.1" }
 rushwind-ai-openai = { path = "crates/rushwind-ai-openai", version = "0.0.1" }
 # Unblock entries for the in-flight circuitbreaker/metrics families

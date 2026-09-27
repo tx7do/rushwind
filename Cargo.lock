@@ -7277,6 +7277,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-oss-local"
+version = "0.0.1"
+dependencies = [
+ "rushwind-oss",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-oss-s3"
 version = "0.0.1"
 dependencies = [
