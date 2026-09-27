@@ -7814,6 +7814,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-transport-sse"
+version = "0.0.1"
+dependencies = [
+ "axum 0.8.9",
+ "futures",
+ "rushwind-bootstrap",
+ "rushwind-http-binding",
+ "rushwind-transport",
+ "rushwind-transport-axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "rushwind-transport-webtransport"
 version = "0.0.1"
 dependencies = [

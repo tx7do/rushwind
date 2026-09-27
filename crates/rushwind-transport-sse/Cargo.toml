@@ -1,0 +1,27 @@
+[package]
+name = "rushwind-transport-sse"
+description = "The SSE notification transport: the /events wire contract (the fixed CORS preflight answered before any authorization, the three-source token extraction, the 401 plain-text error line with the nosniff marker, the anti cross-user stream check, the per-user filtered broadcast stream with the transport header pass) over a pluggable authorization Gate, the in-process notification Hub, and the bootstrap server factory — the transport both BFF deployments carried by copy-paste, extracted once."
+version.workspace = true
+edition.workspace = true
+rust-version = "1.81"
+license = "MIT"
+repository = "https://github.com/tx7do/rushwind"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+uuid = { workspace = true }
+rushwind-http-binding = { workspace = true }
+rushwind-transport = { workspace = true }
+rushwind-transport-axum = { workspace = true }
+rushwind-bootstrap = { workspace = true }
