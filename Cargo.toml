@@ -20,7 +20,9 @@ rushwind-redact = { path = "crates/rushwind-redact", version = "0.0.1" }
 rushwind-http-binding = { path = "crates/rushwind-http-binding", version = "0.1.0" }
 rushwind-proto-build = { path = "crates/rushwind-proto-build", version = "0.0.1" }
 rushwind-storage-seaorm-support = { path = "crates/rushwind-storage-seaorm-support", version = "0.0.1" }
+rushwind-authn-gate = { path = "crates/rushwind-authn-gate", version = "0.0.1" }
 rushwind-transport-sse = { path = "crates/rushwind-transport-sse", version = "0.0.1" }
+async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 rushwind-transport-axum = { path = "crates/rushwind-transport-axum", version = "0.0.1" }
 rushwind-transport-ws = { path = "crates/rushwind-transport-ws", version = "0.0.1" }
@@ -84,7 +86,6 @@ rushwind-authn-hmac = { path = "crates/rushwind-authn-hmac", version = "0.0.1" }
 rushwind-authn-jwt = { path = "crates/rushwind-authn-jwt", version = "0.0.1" }
 rushwind-authn-noop = { path = "crates/rushwind-authn-noop", version = "0.0.1" }
 rushwind-authn-presharedkey = { path = "crates/rushwind-authn-presharedkey", version = "0.0.1" }
-rushwind-authn-session = { path = "crates/rushwind-authn-session", version = "0.0.1" }
 rushwind-authz = { path = "crates/rushwind-authz", version = "0.0.1" }
 rushwind-authz-acl = { path = "crates/rushwind-authz-acl", version = "0.0.1" }
 rushwind-authz-noop = { path = "crates/rushwind-authz-noop", version = "0.0.1" }

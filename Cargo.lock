@@ -6714,6 +6714,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-authn-gate"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "rushwind-authn",
+ "rushwind-http-binding",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-authn-hmac"
 version = "0.0.1"
 dependencies = [
