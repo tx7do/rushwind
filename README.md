@@ -44,6 +44,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-transport-webtransport` | WebTransport 适配器：wtransport 端点接入生命周期，全套会话链（会话请求时刻的 HTTP 族门链、原子准入、握手截止），`stop()` 为真实释放 |
 | `crates/rushwind-transport-h3` | HTTP/3 适配器：h3/h3-quinn 请求服务接入生命周期，请求时刻门链（拒绝映射为状态响应）与连接级原子准入，`stop()` 为真实释放 |
 | `crates/rushwind-transport-mqtt` | MQTT 消费桥：订阅外部 broker（每订阅 handler 注册 + 规范通配分发），重连退避 + 订阅重建，串行泵入 handler |
+| `crates/rushwind-transport-sse` | SSE 通知传输：`/events` 线契约（CORS 预检、三源 token、401 纯文本错误行、反跨用户流检查、按用户过滤广播流）+ 进程内 Hub + bootstrap 工厂，授权经 `Gate` trait 插拔 |
 
 ### HTTP 面
 
@@ -52,6 +53,8 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-http` | HTTP 边缘：gRPC 对齐的错误信封 `HttpError`——code/reason/message/details，`AuthnError`/`StorageError` 内置转换；请求中间件栈 recovery / request-id / logging / CORS / timeout 与 `HttpEdge` 装配器；`with_authn` / `with_authorization` 把认证鉴权契约接上 axum 路由，`Authenticated` 提取器；feature 门控的 `/healthz`+`/readyz` 与 `/metrics` 挂载，设计见 [docs/http-edge.md](./docs/http-edge.md) |
 | `crates/rushwind-http-binding` | proto-HTTP 线格式契约（由调用方提供描述符池）：表单绑定器（点路径、两种字段名拼写、map/list/oneof 结构、周知叶子白名单）、Content-Type codec 解析、认证前 bind 层、protojson 响应 codec、每路由生命周期尾部、四字段状态错误信封 |
 | `crates/rushwind-gen-http` | 描述符驱动的 proto-HTTP 路由面代码生成器：每 binding 路由表 + 表单绑定计划、(package, reason)→HTTP 状态码错误表、每 service 一个 trait + 空占位实现、public/gated 挂载发射器 |
+| `crates/rushwind-proto-build` | 契约构建引擎（build-dep）：buf 注释闭包（选项字节保真）+ protox 类型面过滤 + prost/pbjson（可选 tonic）+ gen-http face 发射（字节级子闭包切片），部署 build.rs 缩为配置 |
+| `crates/rushwind-redact` | 静态响应脱敏：`(redact.v1)` 选项 fail-closed 编译成计划，序列化前原地改写动态消息（mask/email/固定值/element 嵌套/method_skip），语义锚定 protoc-gen-go-redact 的生成物 |
 
 ### 存储域
 
@@ -60,6 +63,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-storage` | 存储契约：`Repository` trait、三种分页（Page/Offset/Token）、过滤器树、Viewer 五级租户、FieldMask、审计钩子 |
 | `crates/rushwind-storage-memory` | 内存参考引擎：过滤器/排序/游标的语义基准，零依赖 |
 | `crates/rushwind-storage-seaorm` | SeaORM 引擎：SQLite/PostgreSQL/MySQL 三后端同启，三方言 SQL 快照钉死渲染，SQLite 过一致性套件，live 套件跑 CI 容器 |
+| `crates/rushwind-storage-seaorm-support` | 类型化实体服务桥：`PagingRequest` select 装配（query 语法过滤/orderBy/三态切片、按列型绑定）、SeaORM 失败→信封、实体时间↔proto Timestamp |
 | `crates/rushwind-storage-mongodb` | MongoDB 引擎：FilterExpr→BSON 翻译离线单测，LIKE 族编译为转义正则，live 套件跑 CI 容器 |
 | `crates/rushwind-storage-elasticsearch` | Elasticsearch 引擎：REST + refresh-on-write，`.keyword` 精确匹配，bulk 原子批写 |
 | `crates/rushwind-storage-opensearch` | OpenSearch 引擎：ES 线格式薄复用（wire 兼容） |
@@ -86,6 +90,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-authn-noop` | Noop 引擎：全放行、铸造空凭证 |
 | `crates/rushwind-authn-presharedkey` | 预共享 key 引擎：集合成员校验、铸造为随机抽取 |
 | `crates/rushwind-authn-session` | 会话引擎：不透明会话 ID + 可插拔 SessionStore |
+| `crates/rushwind-authn-gate` | 门会话阶段：`AccessTokenChecker` 契约（Redis 白名单/黑名单）与 authenticate-then-check 阶段头，trace-id 解析、未验签 bearer 嗅探；信封渲染留部署侧错误表 |
 | `crates/rushwind-authz` | 鉴权契约：`Engine` trait（单裁决 + 三批量过滤）、Subject/Action/Resource/Project 模型、策略 JSON 互通，见 [docs/security-authn-authz.md](./docs/security-authn-authz.md) |
 | `crates/rushwind-authz-acl` | ACL 引擎：有序 allow/deny 规则 + 通配匹配，默认拒绝、拒绝优先 |
 | `crates/rushwind-authz-rbac` | RBAC 引擎：角色→权限、用户→角色双表，传递继承带环检测 |
@@ -198,6 +203,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-ai-openai` | OpenAI 兼容引擎：reqwest 上的 chat / 流式 / embeddings，通吃 OpenAI、Qwen、Ollama |
 | `crates/rushwind-oss` | 对象存储契约：S3 兼容存储上的 put/get/delete |
 | `crates/rushwind-oss-s3` | S3 引擎：reqwest 上的 SigV4 签名 REST，覆盖 AWS S3 与 MinIO |
+| `crates/rushwind-oss-local` | 本地盘引擎：每 bucket 一实例、目录随 put 物化、缺失读 NotFound、删除幂等、键穿越拒绝 |
 
 ### 装配与测试
 
