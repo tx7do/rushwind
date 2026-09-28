@@ -7607,7 +7607,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rushwind-storage",
- "syn 2.0.119",
+ "syn 3.0.5",
 ]
 
 [[package]]
