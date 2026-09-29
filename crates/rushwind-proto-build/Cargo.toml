@@ -1,6 +1,6 @@
 [package]
 name = "rushwind-proto-build"
-description = "The contract build engine behind the deployment proto crates: the buf-built annotated closure (custom-option bytes preserved — protox's serializer drops them), the protox types face filtered to data-carrying files, prost+pbjson (and optionally tonic) type generation, and the rushwind-gen-http face emission with byte-level sub-closure slicing. A deployment build.rs shrinks to its config."
+description = "The contract build engine behind the deployment proto crates: one buf compile of the api workspace yields both the raw annotated closure (custom-option bytes preserved — a Rust-side serializer would drop them) and, by filtered decode, the prost+pbjson (and optionally tonic) types; plus the rushwind-gen-http face emission with byte-level sub-closure slicing. A deployment build.rs shrinks to its config."
 version.workspace = true
 edition.workspace = true
 rust-version = "1.81"
@@ -14,7 +14,7 @@ tonic = ["dep:tonic-prost-build"]
 
 [dependencies]
 prost = { workspace = true }
-protox = { workspace = true }
+prost-types = { workspace = true }
 prost-build = { workspace = true }
 pbjson-build = { workspace = true }
 rushwind-gen-http = { path = "../rushwind-gen-http", version = "0.1.0" }

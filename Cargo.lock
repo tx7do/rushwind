@@ -7304,7 +7304,7 @@ dependencies = [
  "pbjson-build",
  "prost 0.14.4",
  "prost-build 0.14.4",
- "protox",
+ "prost-types 0.14.4",
  "rushwind-gen-http",
  "tonic-prost-build",
 ]
