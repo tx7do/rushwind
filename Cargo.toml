@@ -164,7 +164,7 @@ serde_json = "1"
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 getrandom = "0.3"
 
 # SeaORM backs the storage adapter: dynamic statement building (sea_query),
