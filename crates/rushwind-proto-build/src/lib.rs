@@ -206,7 +206,8 @@ pub fn run(build: Build) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!(
-        "[proto-build] annotated closure: {annotated_size} bytes (buf build); types set: {} files (annotation declarations dropped)",
+        "[proto-build] annotated closure: {annotated_size} bytes (buf build); \
+         types set: {} files (annotation declarations dropped)",
         types_fds.file.len()
     );
 
