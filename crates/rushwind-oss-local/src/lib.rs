@@ -32,7 +32,10 @@ impl LocalStorage {
             return Err(StorageError::EmptyObjectKey);
         }
         let relative = Path::new(key);
-        if relative.is_absolute() || relative.components().any(|c| c == std::path::Component::ParentDir)
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
         {
             return Err(StorageError::Failed(format!(
                 "object key escapes the bucket root: {key}"
@@ -62,22 +65,20 @@ impl ObjectStorage for LocalStorage {
         })
     }
 
-    fn get<'a>(&'a self, key: &'a str) -> rushwind_oss::BoxFuture<'a, Result<Vec<u8>, StorageError>> {
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> rushwind_oss::BoxFuture<'a, Result<Vec<u8>, StorageError>> {
         Box::pin(async move {
             let path = self.resolve(key)?;
-            tokio::fs::read(&path)
-                .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::NotFound => StorageError::NotFound,
-                    _ => StorageError::Failed(format!("storage read: {e}")),
-                })
+            tokio::fs::read(&path).await.map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => StorageError::NotFound,
+                _ => StorageError::Failed(format!("storage read: {e}")),
+            })
         })
     }
 
-    fn delete<'a>(
-        &'a self,
-        key: &'a str,
-    ) -> rushwind_oss::BoxFuture<'a, Result<(), StorageError>> {
+    fn delete<'a>(&'a self, key: &'a str) -> rushwind_oss::BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             let path = self.resolve(key)?;
             match tokio::fs::remove_file(&path).await {

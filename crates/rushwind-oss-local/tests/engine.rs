@@ -11,8 +11,8 @@ struct Scratch(std::path::PathBuf);
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir()
-            .join(format!("rushwind-oss-local-{}-{tag}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rushwind-oss-local-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }
@@ -34,7 +34,11 @@ async fn round_trip_materializes_directories() {
     let store = LocalStorage::new(scratch.path().to_path_buf());
 
     store
-        .put("uploads/deep/dir/object.bin", b"payload".as_slice(), Some("text/plain"))
+        .put(
+            "uploads/deep/dir/object.bin",
+            b"payload".as_slice(),
+            Some("text/plain"),
+        )
         .await
         .unwrap();
     let read = store.get("uploads/deep/dir/object.bin").await.unwrap();
