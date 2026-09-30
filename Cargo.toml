@@ -165,7 +165,7 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 jsonwebtoken = "9"
-getrandom = "0.3"
+getrandom = "0.4"
 
 # SeaORM backs the storage adapter: dynamic statement building (sea_query),
 # connection pooling and transactions. All three SQL backends ship enabled —
