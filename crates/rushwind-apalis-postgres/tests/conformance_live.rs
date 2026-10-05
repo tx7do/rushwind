@@ -159,14 +159,22 @@ async fn status_of(storage: &mut PostgresStorage<Email>, task_id: &TaskId) -> (S
     (state, attempts)
 }
 
+// sqlx 0.9 gatekeeps dynamic SQL behind `SqlSafeStr`; the suite only ever
+// reads these two columns, so each gets its own static statement instead of
+// a formatted one.
 async fn text_column(
     storage: &PostgresStorage<Email>,
     task_id: &TaskId,
     column: &str,
 ) -> Option<String> {
-    let query =
-        format!("SELECT {column} FROM rushwind_apalis_jobs WHERE task_id = $1 AND queue = $2");
-    let row = sqlx::query(&query)
+    let sql = match column {
+        "last_error" => {
+            "SELECT last_error FROM rushwind_apalis_jobs WHERE task_id = $1 AND queue = $2"
+        }
+        "lock_by" => "SELECT lock_by FROM rushwind_apalis_jobs WHERE task_id = $1 AND queue = $2",
+        other => panic!("unsupported column {other}"),
+    };
+    let row = sqlx::query(sql)
         .bind(task_id.to_string())
         .bind(storage.queue())
         .fetch_one(storage.pool())
