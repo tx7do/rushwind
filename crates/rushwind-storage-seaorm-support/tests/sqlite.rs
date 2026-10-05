@@ -3,7 +3,7 @@
 //! filter binding by column kind, the unknown-order guard, no_paging.
 
 use sea_orm::entity::prelude::*;
-use sea_orm::{Database, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Select};
+use sea_orm::{Database, DatabaseConnection, EntityTrait, QueryFilter, Select};
 
 use rushwind_storage_seaorm_support::paging::{fetch_paged, Params, Sorting};
 
