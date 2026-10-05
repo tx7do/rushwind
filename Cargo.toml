@@ -164,9 +164,13 @@ serde_json = "1"
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
-# jsonwebtoken 11 split its ciphers into opt-in providers; the pure-Rust
-# rust_crypto stack keeps every lane (and dev boxes) free of a C toolchain.
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# jsonwebtoken 11 split its ciphers into opt-in providers. The aws_lc_rs
+# stack, not rust_crypto: the pure-Rust option pulls the rsa crate, whose
+# Marvin-Attack advisory (RUSTSEC-2023-0071) ships with no patched release
+# and would either sit ignored in deny.toml or in the graph. aws-lc-rs is
+# already in the tree under rustls on every lane, so the C build costs
+# nothing new, and the whole workspace lands on one crypto stack.
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 getrandom = "0.4"
 
 # SeaORM backs the storage adapter: dynamic statement building (sea_query),
