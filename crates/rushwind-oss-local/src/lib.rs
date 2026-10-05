@@ -38,7 +38,10 @@ impl LocalStorage {
         }
         let relative = Path::new(key);
         if relative.components().any(|c| {
-            !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)
+            !matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
         }) {
             return Err(StorageError::Failed(format!(
                 "object key escapes the bucket root: {key}"
