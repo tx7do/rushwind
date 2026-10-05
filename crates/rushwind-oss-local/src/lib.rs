@@ -4,9 +4,10 @@
 //! and missing files reading as [`StorageError::NotFound`].
 //!
 //! The key is the path under the bucket root, sanitized against
-//! traversal (`..` segments and absolute forms are rejected before the
-//! filesystem sees them — the deployments filter their upload inputs,
-//! the engine does not trust that alone). The content type is accepted
+//! traversal (`..` segments, rooted (`/x`, `\x`) and Windows
+//! drive/UNC-prefixed forms are rejected before the filesystem sees
+//! them — the deployments filter their upload inputs, the engine does
+//! not trust that alone). The content type is accepted
 //! and ignored: a filesystem stores no content-type metadata.
 
 use std::path::{Path, PathBuf};
@@ -25,18 +26,20 @@ impl LocalStorage {
         Self { root: root.into() }
     }
 
-    /// The filesystem path for an object key, sanitized: absolute and
-    /// `..`-carrying keys are rejected up front.
+    /// The filesystem path for an object key, sanitized: only plain
+    /// relative segments survive. A leading `/` is rooted-but-not-
+    /// absolute on Windows (`is_absolute` is false there, yet
+    /// `Path::join` replaces the buffer with it), a drive/UNC prefix
+    /// replaces it outright, and a `..` segment walks out — each is
+    /// refused before the filesystem sees them.
     fn resolve(&self, key: &str) -> Result<PathBuf, StorageError> {
         if key.is_empty() {
             return Err(StorageError::EmptyObjectKey);
         }
         let relative = Path::new(key);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-        {
+        if relative.components().any(|c| {
+            !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)
+        }) {
             return Err(StorageError::Failed(format!(
                 "object key escapes the bucket root: {key}"
             )));

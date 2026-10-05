@@ -82,7 +82,20 @@ async fn delete_is_idempotent() {
 async fn traversal_and_empty_keys_are_refused() {
     let scratch = Scratch::new("traversal");
     let store = LocalStorage::new(scratch.path().to_path_buf());
+    // Hostile on every platform: `..` walks out, a leading `/` is
+    // rooted on both (and `Path::join` replaces the buffer with it).
     for bad in ["../escape", "a/../../b", "/absolute"] {
+        let err = store.put(bad, b"x".as_slice(), None).await.unwrap_err();
+        assert!(
+            matches!(err, rushwind_oss::StorageError::Failed(_)),
+            "{bad}: {err:?}"
+        );
+        assert!(store.get(bad).await.is_err(), "{bad}");
+    }
+    // Windows-only spellings: a drive-relative or UNC prefix replaces
+    // the join buffer just the same (on Unix these are plain names).
+    #[cfg(windows)]
+    for bad in ["C:evil", "\\\\srv\\share\\obj"] {
         let err = store.put(bad, b"x".as_slice(), None).await.unwrap_err();
         assert!(
             matches!(err, rushwind_oss::StorageError::Failed(_)),
