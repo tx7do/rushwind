@@ -91,7 +91,9 @@ pub(crate) fn condition_json(
         Op::Lt => range(None, first_bound(false)),
         Op::Lte => range(None, first_bound(true)),
         Op::In => {
-            json!({ "terms": { field_borrow: condition.values.iter().map(scalar).collect::<Vec<_>>() } })
+            json!({
+                "terms": { field_borrow: condition.values.iter().map(scalar).collect::<Vec<_>>() }
+            })
         }
         Op::NotIn => json!({ "bool": { "must_not": [
             { "terms": { field_borrow: condition.values.iter().map(scalar).collect::<Vec<_>>() } }

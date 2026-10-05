@@ -33,6 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = prost_build::Config::new();
     config
         .file_descriptor_set_path(&descriptor_path)
+        // Generate from protox's descriptor set verbatim — without this,
+        // prost-build would invoke protoc on the request files (and
+        // overwrite the descriptor set with protoc's own output),
+        // dragging a system protoc into the build for nothing.
+        .skip_protoc_run()
         .compile_well_known_types()
         .extern_path(".google.protobuf", "::pbjson_types");
     config.compile_protos(&[query_proto.as_path()], &[proto_root.as_path()])?;

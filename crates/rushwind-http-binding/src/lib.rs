@@ -20,7 +20,10 @@
 //! Response side:
 //!
 //! * [`codec`] — the protojson response codec with the reference's
-//!   `EmitUnpopulated` semantics.
+//!   `EmitUnpopulated` semantics, plus the static-redaction hook: a
+//!   caller-supplied [`rushwind_redact::RedactPlan`] (built from the
+//!   same pool's `(redact.v1)` options) mutates the response before
+//!   encoding, the port of the reference's redacted server wrappers.
 //! * [`glue`] — the lifecycle tail after the middleware chain: path
 //!   variables, static conversion, the typed service call, response
 //!   serialization, and the reply-header merge.

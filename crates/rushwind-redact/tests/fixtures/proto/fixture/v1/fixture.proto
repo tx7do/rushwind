@@ -1,0 +1,68 @@
+// The fixture corpus — mirrors the reference deployment's three
+// annotated files (identity/user.proto, admin/i_user.proto,
+// authentication/authentication.proto) with the same option shapes, so
+// the plan/apply semantics are pinned against real usage.
+syntax = "proto3";
+
+package fixture.v1;
+
+import "redact/v1/redact.proto";
+import "google/protobuf/empty.proto";
+
+message User {
+  string username = 1;
+
+  optional string email = 2 [
+    (redact.value).email = { keep_local_first: 2 }
+  ];
+
+  optional string mobile = 3 [
+    (redact.value).mask = { keep_first: 3 keep_last: 4 }
+  ];
+
+  // Per-element transform on a repeated scalar.
+  repeated string logins = 4 [
+    (redact.value).element = { item: { mask { keep_first: 2 keep_last: 2 } } }
+  ];
+
+  // Whole-container clear.
+  repeated string audit_notes = 5 [
+    (redact.value).element = { empty: true }
+  ];
+}
+
+message ListUsersResponse {
+  repeated User items = 1 [
+    (redact.value).element = { nested: true }
+  ];
+
+  // The map form of the same nested recursion.
+  map<string, User> roster = 2 [
+    (redact.value).element = { nested: true }
+  ];
+
+  uint64 total = 3;
+}
+
+message LoginRequest {
+  string username = 1;
+
+  optional string password = 2 [
+    (redact.value).string = ""
+  ];
+}
+
+message LoginResponse {
+  string access_token = 1;
+}
+
+service AuthService {
+  rpc Login(LoginRequest) returns (LoginResponse);
+}
+
+service UserService {
+  rpc List(google.protobuf.Empty) returns (ListUsersResponse);
+  rpc Update(User) returns (google.protobuf.Empty) {
+    option (redact.method_skip) = true;
+  }
+}

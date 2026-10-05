@@ -159,10 +159,14 @@ pub(crate) fn condition_to_doc(condition: &Condition) -> Result<Document, Storag
         Op::Lt => doc! { field: { "$lt": value_to_bson(&first()) } },
         Op::Lte => doc! { field: { "$lte": value_to_bson(&first()) } },
         Op::In => {
-            doc! { field: { "$in": condition.values.iter().map(value_to_bson).collect::<Vec<_>>() } }
+            doc! {
+                field: { "$in": condition.values.iter().map(value_to_bson).collect::<Vec<_>>() }
+            }
         }
         Op::NotIn => {
-            doc! { field: { "$nin": condition.values.iter().map(value_to_bson).collect::<Vec<_>>() } }
+            doc! {
+                field: { "$nin": condition.values.iter().map(value_to_bson).collect::<Vec<_>>() }
+            }
         }
         Op::IsNull => doc! { field: Bson::Null },
         Op::IsNotNull => doc! { field: { "$ne": Bson::Null } },
@@ -173,7 +177,11 @@ pub(crate) fn condition_to_doc(condition: &Condition) -> Result<Document, Storag
         Op::NotBetween => doc! {
             "$or": [
                 { field: { "$lt": value_to_bson(&first()) } },
-                { field: { "$gt": value_to_bson(&condition.values.get(1).cloned().unwrap_or(Null)) } },
+                {
+                    field: {
+                        "$gt": value_to_bson(&condition.values.get(1).cloned().unwrap_or(Null))
+                    }
+                },
             ]
         },
         Op::Like => doc! { field: { "$regex": like_regex(condition)? } },

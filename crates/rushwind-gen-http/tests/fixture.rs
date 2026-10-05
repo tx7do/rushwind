@@ -34,10 +34,18 @@ service FixtureService {
 "#;
 
 fn compile_fixture() -> Vec<u8> {
-    let tmp =
-        std::env::temp_dir().join(format!("rushwind-gen-fixture-{}.proto", std::process::id()));
+    // Unique per invocation: the fixture tests run in parallel.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = std::env::temp_dir().join(format!(
+        "rushwind-gen-fixture-{}-{seq}.proto",
+        std::process::id()
+    ));
     std::fs::write(&tmp, FIXTURE).unwrap();
-    let out = std::env::temp_dir().join(format!("rushwind-gen-fixture-{}.bin", std::process::id()));
+    let out = std::env::temp_dir().join(format!(
+        "rushwind-gen-fixture-{}-{seq}.bin",
+        std::process::id()
+    ));
     let third_party = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/third_party");
     let status = Command::new("protoc")
         .arg("--include_imports")
@@ -60,14 +68,35 @@ fn compile_fixture() -> Vec<u8> {
 }
 
 /// The fixture deployment's knobs: contract types under a fictional
-/// module path, the pool reached through a fictional accessor, and the
-/// List operation whitelisted (Get stays gated).
+/// module path, the pool reached through a fictional accessor, the
+/// List operation whitelisted (Get stays gated), and the redaction
+/// plan reached through a fictional accessor.
 fn config() -> CodegenConfig<'static> {
     CodegenConfig {
         proto_module_path: "fixture_proto::proto",
         pool_expr: "fixture_proto::pool()",
         auth_free: &[("fixture.v1.FixtureService", "List")],
+        redact_plan_expr: Some("fixture_proto::redact_plan()"),
     }
+}
+
+#[test]
+fn no_redact_plan_emits_a_literal_none() {
+    let bytes = compile_fixture();
+    let cfg = CodegenConfig {
+        proto_module_path: "fixture_proto::proto",
+        pool_expr: "fixture_proto::pool()",
+        auth_free: &[],
+        redact_plan_expr: None,
+    };
+    let src = generate_from_bytes(&bytes, &cfg).unwrap();
+    let handles = src.matches("rushwind_http_binding::glue::handle(").count();
+    assert!(handles > 0, "handle calls emitted");
+    assert_eq!(
+        src.matches("\n                    None,\n").count(),
+        handles,
+        "every call site threads a literal None"
+    );
 }
 
 #[test]
@@ -141,6 +170,10 @@ fn fixture_route_error_table_trait_and_config_threading() {
     assert!(
         src.contains("                    fixture_proto::pool(),"),
         "pool expression threaded"
+    );
+    assert!(
+        src.contains("                    Some(fixture_proto::redact_plan()),"),
+        "redaction plan threaded"
     );
     assert!(
         src.contains("                let wire = rushwind_http_binding::wire::RouteWire {"),

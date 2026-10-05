@@ -1,0 +1,22 @@
+[package]
+name = "rushwind-authn-gate"
+description = "The auth gate's session stage — the AccessTokenChecker contract (Redis whitelist exact-compare + blacklist existence) and the authenticate-then-check-session head both deployment auth crates ran by copy-paste, plus the trace-id resolution and the unverified-bearer claim sniff the stages feed. The failure envelope rendering stays deployment-side: the reason → HTTP status anchor is each deployment's own error tables."
+version.workspace = true
+edition.workspace = true
+rust-version = "1.81"
+license = "MIT"
+repository = "https://github.com/tx7do/rushwind"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+axum = { version = "0.8", default-features = false }
+base64 = "0.22"
+serde_json = "1"
+rushwind-authn = { workspace = true }
+rushwind-http-binding = { workspace = true }

@@ -193,7 +193,10 @@ fn enum_parse_failures_name_the_field_and_the_text() {
     record.insert("status", "archived");
     let err = Article::from_record(&record).expect_err("archived is not a Status");
     assert!(
-        matches!(err, StorageError::InvalidQuery(ref m) if m.contains("status") && m.contains("archived")),
+        matches!(
+            err,
+            StorageError::InvalidQuery(ref m) if m.contains("status") && m.contains("archived")
+        ),
         "{err}"
     );
 
@@ -311,7 +314,10 @@ fn custom_conversion_errors_surface_as_invalid_query() {
     // The `with` module owns its message — it cannot know the field
     // name, so the module's own words are the contract here.
     assert!(
-        matches!(err, StorageError::InvalidQuery(ref m) if m.contains("unix seconds") && m.contains("text")),
+        matches!(
+            err,
+            StorageError::InvalidQuery(ref m) if m.contains("unix seconds") && m.contains("text")
+        ),
         "{err}"
     );
 }

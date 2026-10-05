@@ -1,0 +1,22 @@
+[package]
+name = "rushwind-storage-seaorm-support"
+description = "The typed-entity service bridge over SeaORM: the PagingRequest select assembly (the rust-utils query filter syntax, the orderBy spellings, the page/offset/none slicing, schema-typed filter binding), the SeaORM failure → status-envelope mapping, and the entity-time ↔ proto-Timestamp conversions — the layer the reference deployments' repositories and mappers shared by copy-paste, extracted once."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sea-orm = { workspace = true }
+rushwind-http-binding = { workspace = true }
+rust-utils = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+pbjson-types = { workspace = true }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

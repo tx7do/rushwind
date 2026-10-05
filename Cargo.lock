@@ -6585,6 +6585,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-authn-gate"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "rushwind-authn",
+ "rushwind-http-binding",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-authn-hmac"
 version = "0.0.1"
 dependencies = [
@@ -6614,7 +6627,7 @@ dependencies = [
 name = "rushwind-authn-presharedkey"
 version = "0.0.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-authn",
 ]
 
@@ -6622,7 +6635,7 @@ dependencies = [
 name = "rushwind-authn-session"
 version = "0.0.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-authn",
  "serde_json",
 ]
@@ -6665,7 +6678,7 @@ name = "rushwind-bootstrap"
 version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-ai",
  "rushwind-authn",
  "rushwind-authn-apikey",
@@ -6714,7 +6727,7 @@ name = "rushwind-broker-kafka"
 version = "0.0.1"
 dependencies = [
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-broker",
  "samsa",
  "serde",
@@ -6727,7 +6740,7 @@ dependencies = [
 name = "rushwind-broker-mqtt"
 version = "0.0.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rumqttc",
  "rushwind-broker",
  "rushwind-transport",
@@ -6856,7 +6869,7 @@ dependencies = [
 name = "rushwind-circuitbreaker-sres"
 version = "0.0.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-circuitbreaker",
  "rushwind-transport",
  "serde",
@@ -7063,7 +7076,7 @@ version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-authn",
  "rushwind-authz",
  "rushwind-health",
@@ -7088,6 +7101,7 @@ dependencies = [
  "prost 0.14.4",
  "prost-reflect",
  "rushwind-authn",
+ "rushwind-redact",
  "serde_json",
 ]
 
@@ -7134,6 +7148,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-oss-local"
+version = "0.0.1"
+dependencies = [
+ "rushwind-oss",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-oss-s3"
 version = "0.0.1"
 dependencies = [
@@ -7144,6 +7166,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "rushwind-proto-build"
+version = "0.0.1"
+dependencies = [
+ "pbjson-build",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
+ "prost-types 0.14.4",
+ "rushwind-gen-http",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -7170,6 +7204,13 @@ dependencies = [
  "rushwind-ratelimit",
  "rushwind-transport",
  "tokio",
+]
+
+[[package]]
+name = "rushwind-redact"
+version = "0.0.1"
+dependencies = [
+ "prost-reflect",
 ]
 
 [[package]]
@@ -7261,7 +7302,7 @@ name = "rushwind-registry-servicecomb"
 version = "0.0.1"
 dependencies = [
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "reqwest 0.12.28",
  "rushwind-registry",
  "rushwind-transport",
@@ -7287,7 +7328,7 @@ dependencies = [
 name = "rushwind-retry"
 version = "0.0.1"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rushwind-transport",
  "tokio",
 ]
@@ -7520,6 +7561,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-storage-seaorm-support"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "pbjson-types",
+ "rushwind-http-binding",
+ "rust-utils",
+ "sea-orm",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-storage-soft-delete"
 version = "0.0.1"
 dependencies = [
@@ -7652,6 +7706,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-transport-sse"
+version = "0.0.1"
+dependencies = [
+ "axum 0.8.9",
+ "futures",
+ "rushwind-bootstrap",
+ "rushwind-http-binding",
+ "rushwind-transport",
+ "rushwind-transport-axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "rushwind-transport-webtransport"
 version = "0.0.1"
 dependencies = [
@@ -7683,6 +7754,14 @@ checksum = "3e0698206bcb8882bf2a9ecb4c1e7785db57ff052297085a6efd4fe42302068a"
 dependencies = [
  "cfg-if",
  "ordered-multimap",
+]
+
+[[package]]
+name = "rust-utils"
+version = "0.1.0"
+source = "git+https://github.com/tx7do/rust-utils?rev=8c24baf4e6ab419621a299a5f18e349562382fca#8c24baf4e6ab419621a299a5f18e349562382fca"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
