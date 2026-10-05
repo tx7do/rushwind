@@ -452,18 +452,21 @@ jobs:
       # several conventional monitoring/exporter ports (9100 among them,
       # like 9200 — which is why opensearch maps to 9201), and publishing
       # onto an occupied port makes docker run fail with exit 125.
-      # Image from quay.io, not Docker Hub: the Hub denies anonymous
-      # pulls of minio/minio from the runner networks outright, while
-      # quay serves the same image publicly (as it does for the etcd
-      # lane).
+      # Image bitnamilegacy, not minio's own registries: upstream pulled
+      # every public image — Docker Hub first, then quay (anonymous pulls
+      # now answer "unauthorized" on both) — when it went source-available
+      # in mid-2025; Bitnami's legacy stream still serves the last public
+      # release (DEVELOPMENT.2025-05-24) anonymously. No `server /data`
+      # arguments: the Bitnami entrypoint already starts the server on
+      # its default port, and appended args land on its wrapper script.
       - name: Start minio
         run: |
           for i in $(seq 1 5); do
-            if err=$(docker pull quay.io/minio/minio:latest 2>&1); then break; fi
+            if err=$(docker pull docker.io/bitnamilegacy/minio:latest 2>&1); then break; fi
             echo "::error::minio pull attempt $i failed: $(echo "$err" | tr '\n' ' ')"
             sleep 20
           done
-          if ! err=$(docker run -d --name minio -p 9140:9000 -e MINIO_ROOT_USER=rushwind -e MINIO_ROOT_PASSWORD=rushwind-secret quay.io/minio/minio:latest server /data 2>&1); then
+          if ! err=$(docker run -d --name minio -p 9140:9000 -e MINIO_ROOT_USER=rushwind -e MINIO_ROOT_PASSWORD=rushwind-secret docker.io/bitnamilegacy/minio:latest 2>&1); then
             echo "::error::minio container failed to start: $(echo "$err" | tr '\n' ' ')"
             exit 1
           fi
