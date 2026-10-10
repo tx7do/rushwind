@@ -212,7 +212,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 # engine: gRPC (tonic) and HTTP (proto) transports both enabled.
 opentelemetry = "0.32"
 opentelemetry_sdk = "0.32"
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto"] }
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic", "http-proto"] }
 
 # Directory watching for the config file engine: the parent-dir watch
 # survives the atomic rename editors save through.
