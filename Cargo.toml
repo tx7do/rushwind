@@ -210,7 +210,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 
 # OpenTelemetry API, SDK, and the OTLP exporter behind the metrics otel
 # engine: gRPC (tonic) and HTTP (proto) transports both enabled.
-opentelemetry = "0.32"
+opentelemetry = "0.33"
 opentelemetry_sdk = "0.32"
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto"] }
 
