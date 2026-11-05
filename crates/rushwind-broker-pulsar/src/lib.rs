@@ -20,7 +20,17 @@
 //! an implicit-acknowledgment engine and [`Event::ack`] is a no-op.
 //!
 //! The consumer ends on `unsubscribe` or on the stream's own end —
-//! a closed consumer or an error — without a retry loop.
+//! a closed consumer or an error — without a retry loop. A
+//! duplicate-topic subscribe replaces the topic's live flow first
+//! (unsub-old-then-sub-new): the fixed Shared subscription name means
+//! a second consumer on the same topic would otherwise siphon half
+//! the deliveries away from the first handler.
+//!
+//! `disconnect` closes the client and clears the producers; a
+//! subsequent `connect` rebuilds both from the stored address, so a
+//! disconnect never leaves the broker permanently unusable.
+//! Publishing and subscribing while disconnected fail with
+//! [`BrokerError::NotConnected`].
 //!
 //! # Divergences
 //!
@@ -45,6 +55,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -62,9 +73,48 @@ fn pulsar_err(error: pulsar::Error) -> BrokerError {
 }
 
 struct Inner {
+    /// The service URL the client was built from — `connect` needs it
+    /// to rebuild after a `disconnect` closed the client.
+    addr: String,
     client: Mutex<Option<pulsar::Pulsar<pulsar::TokioExecutor>>>,
     producer: Mutex<Option<pulsar::MultiTopicProducer<pulsar::TokioExecutor>>>,
     connected: AtomicBool,
+    /// The live subscription flow per topic. Re-subscribing a topic
+    /// tears the previous flow down first — the fixed Shared
+    /// subscription name would otherwise let the new consumer siphon
+    /// half the deliveries from the old handler (upstream:
+    /// duplicate-topic subscribe left the old consumer consuming).
+    subscriptions: Mutex<HashMap<String, Arc<SubscriptionFlow>>>,
+}
+
+/// The delivery flow of one subscription: the cancellation token and
+/// the pump task, shared between the caller's subscriber handle and
+/// the engine's topic registry so both paths tear the same pump down.
+struct SubscriptionFlow {
+    done: CancellationToken,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl SubscriptionFlow {
+    /// Cancels the pump and waits for it to wind down. Idempotent: a
+    /// second call finds no task and is a no-op.
+    async fn stop(&self) {
+        self.done.cancel();
+        if let Some(task) = self.task.lock().await.take() {
+            let _ = task.await;
+        }
+    }
+
+    /// Best-effort teardown for `Drop`: cancel and abort without
+    /// awaiting.
+    fn abort(&self) {
+        self.done.cancel();
+        if let Ok(mut task) = self.task.try_lock() {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
+    }
 }
 
 /// A Pulsar-backed broker over pulsar-rs.
@@ -81,27 +131,44 @@ pub struct PulsarSettings {
     pub addr: Option<String>,
 }
 
+/// Dials the Pulsar service and returns the client with its
+/// multi-topic producer. Shared by the constructor and
+/// [`Broker::connect`]'s rebuild path.
+async fn establish(
+    addr: &str,
+) -> Result<
+    (
+        pulsar::Pulsar<pulsar::TokioExecutor>,
+        pulsar::MultiTopicProducer<pulsar::TokioExecutor>,
+    ),
+    BrokerError,
+> {
+    let client: pulsar::Pulsar<pulsar::TokioExecutor> =
+        pulsar::Pulsar::builder(addr.to_string(), pulsar::TokioExecutor)
+            .build()
+            .await
+            .map_err(pulsar_err)?;
+    let producer = client.clone().producer().build_multi_topic();
+    Ok((client, producer))
+}
+
+/// The service URL fallback when the caller passes an empty address.
+const DEFAULT_ADDR: &str = "pulsar://127.0.0.1:6650";
+
 impl PulsarBroker {
     /// Connects to the Pulsar service at `addr` (e.g.
     /// `pulsar://127.0.0.1:6650`). An empty address falls back to
     /// the default localhost service.
     pub async fn connect(addr: &str) -> Result<Self, BrokerError> {
-        let addr = if addr.is_empty() {
-            "pulsar://127.0.0.1:6650"
-        } else {
-            addr
-        };
-        let client: pulsar::Pulsar<pulsar::TokioExecutor> =
-            pulsar::Pulsar::builder(addr.to_string(), pulsar::TokioExecutor)
-                .build()
-                .await
-                .map_err(pulsar_err)?;
-        let producer = client.clone().producer().build_multi_topic();
+        let addr = if addr.is_empty() { DEFAULT_ADDR } else { addr };
+        let (client, producer) = establish(addr).await?;
         Ok(Self {
             inner: Arc::new(Inner {
+                addr: addr.to_string(),
                 client: Mutex::new(Some(client)),
                 producer: Mutex::new(Some(producer)),
                 connected: AtomicBool::new(true),
+                subscriptions: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -134,8 +201,23 @@ impl Broker for PulsarBroker {
     }
 
     fn connect(&self) -> BoxFuture<'_, Result<(), BrokerError>> {
-        // The client is live from construction.
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            // The client is live from construction — unless a
+            // disconnect closed it. Rebuild it from the stored address:
+            // a closed client left in place would make the broker
+            // permanently unusable (upstream made Connect recreate the
+            // closed client for the same reason).
+            if self.inner.connected.load(Ordering::SeqCst)
+                && self.inner.client.lock().await.is_some()
+            {
+                return Ok(());
+            }
+            let (client, producer) = establish(&self.inner.addr).await?;
+            *self.inner.client.lock().await = Some(client);
+            *self.inner.producer.lock().await = Some(producer);
+            self.inner.connected.store(true, Ordering::SeqCst);
+            Ok(())
+        })
     }
 
     fn disconnect(&self) -> BoxFuture<'_, Result<(), BrokerError>> {
@@ -203,6 +285,9 @@ impl Broker for PulsarBroker {
                 Some(client) => client,
                 None => return Err(BrokerError::NotConnected),
             };
+            // The consumer is built first: on a failure nothing is
+            // registered and the topic's previous flow stays intact
+            // (failed registration cleanup).
             let consumer: pulsar::consumer::Consumer<Vec<u8>, pulsar::TokioExecutor> = client
                 .consumer()
                 .with_topic(topic.to_string())
@@ -212,8 +297,11 @@ impl Broker for PulsarBroker {
                 .await
                 .map_err(pulsar_err)?;
 
-            let done = CancellationToken::new();
-            let task_done = done.clone();
+            let flow = Arc::new(SubscriptionFlow {
+                done: CancellationToken::new(),
+                task: Mutex::new(None),
+            });
+            let task_done = flow.done.clone();
             let handler = Arc::clone(&handler);
             let task = tokio::spawn(async move {
                 let mut consumer = consumer;
@@ -243,21 +331,38 @@ impl Broker for PulsarBroker {
                     }
                 }
             });
+            *flow.task.lock().await = Some(task);
+
+            // Unsub-old-then-sub-new: the new pump is live, so swap the
+            // registry entry and stop the previous flow — under the
+            // fixed Shared subscription name an old consumer left
+            // running would take a share of the deliveries away from
+            // this handler.
+            let previous = {
+                let mut subscriptions = self.inner.subscriptions.lock().await;
+                subscriptions.insert(topic.to_string(), Arc::clone(&flow))
+            };
+            if let Some(previous) = previous {
+                previous.stop().await;
+            }
+
             Ok(Box::new(PulsarSubscriber {
                 topic: topic.to_string(),
-                done,
-                task: Mutex::new(Some(task)),
+                flow,
+                inner: Arc::clone(&self.inner),
             }) as Box<dyn Subscriber>)
         })
     }
 }
 
-/// The Pulsar subscription handle: the token and task tear the
-/// delivery pump down on unsubscribe or drop.
+/// The Pulsar subscription handle: its flow tears the delivery pump
+/// down on unsubscribe or drop.
 struct PulsarSubscriber {
     topic: String,
-    done: CancellationToken,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    flow: Arc<SubscriptionFlow>,
+    /// The engine's shared state, so an unsubscribe can retire its own
+    /// (still-registered) flow entry from the topic registry.
+    inner: Arc<Inner>,
 }
 
 impl Subscriber for PulsarSubscriber {
@@ -267,10 +372,20 @@ impl Subscriber for PulsarSubscriber {
 
     fn unsubscribe(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
-            self.done.cancel();
-            if let Some(task) = self.task.lock().await.take() {
-                let _ = task.await;
+            // Retire the registry entry only while it still points at
+            // this handle's flow — a re-subscribe has already swapped
+            // in a newer one.
+            {
+                let mut subscriptions = self.inner.subscriptions.lock().await;
+                if subscriptions
+                    .get(&self.topic)
+                    .map(|flow| Arc::ptr_eq(flow, &self.flow))
+                    .unwrap_or(false)
+                {
+                    subscriptions.remove(&self.topic);
+                }
             }
+            self.flow.stop().await;
             Ok(())
         })
     }
@@ -279,11 +394,6 @@ impl Subscriber for PulsarSubscriber {
 impl Drop for PulsarSubscriber {
     fn drop(&mut self) {
         // Best-effort: cancel and abort without awaiting the task.
-        self.done.cancel();
-        if let Ok(mut task) = self.task.try_lock() {
-            if let Some(task) = task.take() {
-                task.abort();
-            }
-        }
+        self.flow.abort();
     }
 }

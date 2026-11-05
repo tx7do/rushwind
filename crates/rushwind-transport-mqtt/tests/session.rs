@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rushwind_core::App;
-use rushwind_transport::{ServerError, StopSignal};
+use rushwind_transport::{Server, ServerError, StopSignal};
 use rushwind_transport_mqtt::MqttBridge;
 use tokio::time::{sleep, timeout};
 
@@ -197,4 +197,102 @@ async fn subscription_without_any_handler_fails_to_build() {
         result.is_err(),
         "a subscription with no reachable handler must fail the build"
     );
+}
+
+/// Restart actually resubscribes: a stop-then-start cycle on the same
+/// bridge re-registers every frozen subscription, so deliveries keep
+/// flowing after the restart (upstream's stop/start hand-off lost the
+/// registration parameters; the bridge freezes them in the state, and
+/// each start rebuilds the connection generation from it).
+#[tokio::test]
+async fn restart_resubscribes_and_delivers_again() {
+    let addr = common::broker();
+    let log: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let handler_log = Arc::clone(&log);
+
+    let bridge = MqttBridge::builder(addr, "rushwind-bridge-restart")
+        .subscribe("restart/#")
+        .session_handler(move |message| {
+            let log = Arc::clone(&handler_log);
+            async move {
+                log.lock().expect("log poisoned").push((
+                    message.topic,
+                    String::from_utf8_lossy(&message.payload).into_owned(),
+                ));
+            }
+        })
+        .build()
+        .expect("bridge must build");
+    let server: Arc<dyn Server> = Arc::new(bridge);
+
+    // First life: delivery works.
+    let first_trigger = StopSignal::new();
+    let run_trigger = first_trigger.clone();
+    let first_run = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move { server.start(run_trigger).await })
+    };
+    sleep(Duration::from_millis(300)).await;
+    common::publish(addr, "publisher-restart-1", "restart/first", b"one").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let delivered = log
+            .lock()
+            .expect("log poisoned")
+            .iter()
+            .any(|(topic, payload)| topic == "restart/first" && payload == "one");
+        if delivered {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first life must deliver"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // Stop, and wait for the pump future to wind down.
+    first_trigger.signal();
+    let outcome = timeout(Duration::from_secs(5), first_run)
+        .await
+        .expect("the first start must finish")
+        .expect("the first start must not panic");
+    assert!(
+        matches!(outcome, Err(ServerError::Cancelled)),
+        "a signalled start returns Cancelled, got {outcome:?}"
+    );
+
+    // Second life on the same bridge: the frozen registration
+    // parameters must re-register on the fresh generation.
+    let second_trigger = StopSignal::new();
+    let run_trigger = second_trigger.clone();
+    let second_run = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move { server.start(run_trigger).await })
+    };
+    sleep(Duration::from_millis(300)).await;
+    common::publish(addr, "publisher-restart-2", "restart/second", b"two").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let delivered = log
+            .lock()
+            .expect("log poisoned")
+            .iter()
+            .any(|(topic, payload)| topic == "restart/second" && payload == "two");
+        if delivered {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the restarted bridge must resubscribe and deliver"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    second_trigger.signal();
+    let outcome = timeout(Duration::from_secs(5), second_run)
+        .await
+        .expect("the second start must finish")
+        .expect("the second start must not panic");
+    assert!(matches!(outcome, Err(ServerError::Cancelled)));
 }

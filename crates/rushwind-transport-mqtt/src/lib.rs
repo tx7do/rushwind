@@ -42,6 +42,16 @@
 //! bridge returns `Cancelled` and the connection drops with the pump
 //! future.
 //!
+//! # Restart
+//!
+//! Registration parameters are frozen in the bridge, and every start
+//! (re)establishes all of them on a fresh connection generation — so
+//! stop-then-start genuinely resubscribes, and there is no registry
+//! to hand off between the two: no lock is ever held across a broker
+//! call, and a lifecycle cancelled mid-registration leaves nothing
+//! behind (the half-built connection drops with the start future and
+//! its subscriptions die with the session).
+
 //! `Server::stop` is a no-op (the connection lives inside the start
 //! future and drops with it — the axum-style rule-1 case of the
 //! architecture document).

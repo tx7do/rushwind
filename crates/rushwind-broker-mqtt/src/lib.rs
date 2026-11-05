@@ -14,9 +14,20 @@
 //! `connect` spawns the event-loop pump; the loop drives rumqttc's
 //! automatic reconnection and, on every successful CONNACK, re-arms
 //! every live subscription, as if resubscribed on connect.
-//! Publishing while
-//! disconnected fails with [`BrokerError::NotConnected`]. A re-`connect` starts a fresh pump
-//! generation; the previous pump exits.
+//! `disconnect` retires the pump generation — without that the
+//! eventloop would re-dial within a second and re-arm every
+//! subscription, resurrecting a broker that was asked to shut down.
+//! Publishing while disconnected fails with
+//! [`BrokerError::NotConnected`]; a subscription registered while
+//! disconnected is deferred and armed on the next `connect`. A
+//! re-`connect` starts a fresh pump generation; the previous pump
+//! exits.
+//!
+//! `Subscriber::unsubscribe` waits for the broker's UNSUBACK before
+//! returning (bounded at ten seconds, mirroring upstream's
+//! token-wait): rumqttc only queues the request, so returning on
+//! enqueue alone would report a teardown the broker has not
+//! confirmed yet.
 //!
 //! # Divergences
 //!
@@ -24,6 +35,10 @@
 //!   ordering is not guaranteed.
 //! - Per-call QoS and retain options are not exposed — publishes
 //!   use the defaults (QoS 1, no retain).
+//! - Re-subscribing a topic replaces the handler in place; the wire
+//!   SUBSCRIBE is re-sent and the broker substitutes the filter's
+//!   subscription (MQTT-3.8.4-3), so no unsubscribe round-trip
+//!   precedes the new subscribe.
 //! - Dropping a [`Subscriber`] removes its filter best-effort; the
 //!   explicit [`Subscriber::unsubscribe`] is the reliable path.
 //!
@@ -36,19 +51,36 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rushwind_broker::{BoxFuture, Broker, BrokerError, Event, Handler, Message, Subscriber};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
+
+/// How long an unsubscribe waits for the broker's UNSUBACK before
+/// failing — the bound upstream's `token.WaitTimeout(10s)` used.
+const UNSUB_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Shared {
     /// The subscriptions' topic filters and their handlers, re-armed
     /// on every reconnect.
     subscriptions: Mutex<HashMap<String, Handler>>,
     connected: Mutex<bool>,
+    /// Topics whose UNSUBSCRIBE is in flight, in wire order. The
+    /// UNSUBACK packet identifies nothing — the pump pops the front,
+    /// which the server's in-order acknowledgment guarantees is the
+    /// right one.
+    pending_unsubs: Mutex<VecDeque<String>>,
+    /// Bumped whenever `pending_unsubs` changes. Unsubscribe waiters
+    /// watch this instead of a `Notify`: a `notify_waiters` fired
+    /// between the pending-check and the await would be lost, while a
+    /// watch keeps the bump pending for the next `changed()` call.
+    unsub_generation: watch::Sender<u64>,
+    /// The live pump generation, shared with the broker so a
+    /// subscriber handle can tell whether its connection still exists.
+    generation: Arc<AtomicU64>,
     /// Wakes the pump when a subscription changes so reconnect
     /// backoffs cannot strand a fresh subscription.
     rearm: Notify,
@@ -96,15 +128,19 @@ impl MqttOptions {
 impl MqttBroker {
     /// Builds the broker; call [`Broker::connect`] to go live.
     pub fn new(options: MqttOptions) -> Self {
+        let generation = Arc::new(AtomicU64::new(0));
         Self {
             mqtt_options: to_rumqtt_options(&options),
             client: Mutex::new(None),
             shared: Arc::new(Shared {
                 subscriptions: Mutex::new(HashMap::new()),
                 connected: Mutex::new(false),
+                pending_unsubs: Mutex::new(VecDeque::new()),
+                unsub_generation: watch::Sender::new(0),
+                generation: Arc::clone(&generation),
                 rearm: Notify::new(),
             }),
-            generation: Arc::new(AtomicU64::new(0)),
+            generation,
             shutdown: Mutex::new(None),
         }
     }
@@ -269,12 +305,29 @@ impl Broker for MqttBroker {
                                             tokio::spawn(handler(event));
                                         }
                                     }
+                                    rumqttc::Event::Incoming(rumqttc::Packet::UnsubAck(_)) => {
+                                        // The UNSUBACK names no topic: pop the
+                                        // in-flight queue's front — the server
+                                        // acknowledges UNSUBSCRIBEs in the order
+                                        // they were sent.
+                                        shared.pending_unsubs.lock().await.pop_front();
+                                        let generation = *shared.unsub_generation.borrow();
+                                        shared.unsub_generation.send_replace(generation + 1);
+                                    }
                                     _ => {}
                                 }
                                 false
                             }
                             Err(_) => {
                                 *shared.connected.lock().await = false;
+                                // The session dies with the connection
+                                // (rumqttc defaults to a clean session), so
+                                // in-flight unsubscribes are moot: release
+                                // their waiters instead of leaving them for
+                                // the confirmation timeout.
+                                shared.pending_unsubs.lock().await.clear();
+                                let generation = *shared.unsub_generation.borrow();
+                                shared.unsub_generation.send_replace(generation + 1);
                                 true
                             }
                         },
@@ -305,13 +358,25 @@ impl Broker for MqttBroker {
     fn disconnect(&self) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
             *self.shared.connected.lock().await = false;
-            if let Some(client) = self.client.lock().await.as_ref() {
-                client
-                    .disconnect()
-                    .await
-                    .map_err(|e| BrokerError::Failed(format!("mqtt disconnect: {e}")))?;
+            // Enqueue the DISCONNECT packet while the pump can still
+            // flush it, then retire the pump generation. Without the
+            // retirement the eventloop would re-dial within a second and
+            // re-arm every subscription on CONNACK, so a broker told to
+            // shut down comes back to life and publish-after-disconnect
+            // starts succeeding again — the same torn-down-then-alive
+            // bug upstream pinned on kafka's writer map. rumqttc has no
+            // disconnect token (the packet is best-effort); the session
+            // dies with the socket either way, clean session being the
+            // default.
+            let enqueued = match self.client.lock().await.as_ref() {
+                Some(client) => client.disconnect().await,
+                None => Ok(()),
+            };
+            self.client.lock().await.take();
+            if let Some(previous) = self.shutdown.lock().await.take() {
+                previous.notify_waiters();
             }
-            Ok(())
+            enqueued.map_err(|e| BrokerError::Failed(format!("mqtt disconnect: {e}")))
         })
     }
 
@@ -351,15 +416,20 @@ impl Broker for MqttBroker {
                 self.client.lock().await.clone(),
                 *self.shared.connected.lock().await,
             ) {
-                client
-                    .subscribe(topic, rumqttc::QoS::AtLeastOnce)
-                    .await
-                    .map_err(|e| BrokerError::Failed(format!("mqtt subscribe {topic}: {e}")))?;
+                if let Err(e) = client.subscribe(topic, rumqttc::QoS::AtLeastOnce).await {
+                    // Failed registration cleanup: the wire subscribe was
+                    // rejected, so an entry left behind would route
+                    // deliveries — and reconnect re-arms — to a handler
+                    // whose subscription never existed.
+                    self.shared.subscriptions.lock().await.remove(topic);
+                    return Err(BrokerError::Failed(format!("mqtt subscribe {topic}: {e}")));
+                }
             }
             self.shared.rearm.notify_waiters();
             Ok(Box::new(MqttSubscriber {
                 topic: topic.to_string(),
                 client: self.client.lock().await.clone(),
+                generation: self.generation.load(Ordering::SeqCst),
                 shared: Arc::clone(&self.shared),
             }) as Box<dyn Subscriber>)
         })
@@ -370,6 +440,10 @@ impl Broker for MqttBroker {
 struct MqttSubscriber {
     topic: String,
     client: Option<rumqttc::AsyncClient>,
+    /// The pump generation this subscription armed on: a re-connect
+    /// replaces the client, and the handle's clone belongs to a
+    /// session the broker no longer holds.
+    generation: u64,
     shared: Arc<Shared>,
 }
 
@@ -381,11 +455,60 @@ impl Subscriber for MqttSubscriber {
     fn unsubscribe(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
             self.shared.subscriptions.lock().await.remove(&self.topic);
+            if self.generation != self.shared.generation.load(Ordering::SeqCst) {
+                // The subscription armed on a retired generation: its
+                // client is gone, and with the clean session the
+                // broker-side subscription died with that connection —
+                // nothing to unsubscribe, and pushing the request into
+                // the stale handle would only fail (publish and
+                // subscribe after disconnect must surface clear errors,
+                // not resurrect stale handles).
+                return Ok(());
+            }
             if let (Some(client), true) = (self.client.clone(), *self.shared.connected.lock().await)
             {
                 client.unsubscribe(&self.topic).await.map_err(|e| {
                     BrokerError::Failed(format!("mqtt unsubscribe {}: {e}", self.topic))
                 })?;
+                // Wait for the broker's UNSUBACK before reporting
+                // success — the client call only queued the request, so
+                // returning on enqueue alone would claim a teardown the
+                // broker has not confirmed (upstream paho waited on the
+                // unsubscribe token for the same reason).
+                self.shared
+                    .pending_unsubs
+                    .lock()
+                    .await
+                    .push_back(self.topic.clone());
+                let mut generation = self.shared.unsub_generation.subscribe();
+                let confirmed = async {
+                    loop {
+                        {
+                            let pending = self.shared.pending_unsubs.lock().await;
+                            if !pending.iter().any(|topic| topic == &self.topic) {
+                                return;
+                            }
+                        }
+                        // The watch buffers every bump, so a confirmation
+                        // landing between the check above and this await
+                        // still resolves immediately.
+                        generation.changed().await.ok();
+                    }
+                };
+                if tokio::time::timeout(UNSUB_CONFIRM_TIMEOUT, confirmed)
+                    .await
+                    .is_err()
+                {
+                    self.shared
+                        .pending_unsubs
+                        .lock()
+                        .await
+                        .retain(|topic| topic != &self.topic);
+                    return Err(BrokerError::Failed(format!(
+                        "mqtt unsubscribe {}: broker confirmation timed out",
+                        self.topic
+                    )));
+                }
             }
             Ok(())
         })
@@ -415,4 +538,125 @@ pub fn event_channel() -> (
         }) as BoxFuture<'static, Result<(), BrokerError>>
     };
     (rx, forward)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn broker() -> MqttBroker {
+        MqttBroker::new(MqttOptions::new("127.0.0.1:1883"))
+    }
+
+    fn sink() -> Handler {
+        let (_rx, forward) = event_channel();
+        Arc::new(forward)
+    }
+
+    /// Publishing without a connection fails with NotConnected — a
+    /// clear error, never a panic on a stale handle.
+    #[tokio::test]
+    async fn publish_before_connect_is_not_connected() {
+        let broker = broker();
+        let result = broker
+            .publish("probe/never", Message::from_payload(vec![]))
+            .await;
+        assert!(
+            matches!(result, Err(BrokerError::NotConnected)),
+            "unconnected publish must fail with NotConnected, got {result:?}"
+        );
+    }
+
+    /// Disconnect is idempotent: a double disconnect — including one
+    /// before any connect — returns without panicking, and publishing
+    /// afterwards still fails with NotConnected.
+    #[tokio::test]
+    async fn disconnect_is_idempotent() {
+        let broker = broker();
+        broker.disconnect().await.expect("first disconnect");
+        broker.disconnect().await.expect("second disconnect");
+        let result = broker
+            .publish("probe/never", Message::from_payload(vec![]))
+            .await;
+        assert!(matches!(result, Err(BrokerError::NotConnected)));
+    }
+
+    /// Subscribing while disconnected defers the wire registration
+    /// (armed on the next connect) and returns a usable handle; the
+    /// handle's unsubscribe tears the deferred registration down
+    /// without any wire traffic and without hanging.
+    #[tokio::test]
+    async fn subscribe_before_connect_defers_and_unsubscribes() {
+        let broker = broker();
+        let mut subscriber = broker
+            .subscribe("probe/deferred", sink())
+            .await
+            .expect("offline subscribe defers the registration");
+        assert_eq!(subscriber.topic(), "probe/deferred");
+        assert_eq!(
+            broker.shared.subscriptions.lock().await.len(),
+            1,
+            "the deferred registration is kept for the next connect"
+        );
+        subscriber
+            .unsubscribe()
+            .await
+            .expect("offline unsubscribe removes the registration");
+        assert!(
+            broker.shared.subscriptions.lock().await.is_empty(),
+            "unsubscribe tears the deferred registration down"
+        );
+    }
+
+    /// Duplicate-topic subscribe replaces the single registration per
+    /// filter instead of stacking a second one: the map has exactly
+    /// one entry and it holds the newest handler. (Upstream paho kept
+    /// one route per topic and its unsub-after-sub ordering deleted
+    /// the NEW route; this engine's in-place replacement leaves no old
+    /// delivery flow to orphan.)
+    #[tokio::test]
+    async fn duplicate_topic_subscribe_replaces_the_handler() {
+        let broker = broker();
+        // Both handles stay alive: dropping a handle removes its
+        // registration best-effort, which would mask the replacement
+        // under test.
+        let _first = broker
+            .subscribe("probe/dup", sink())
+            .await
+            .expect("first subscribe");
+        let _second = broker
+            .subscribe("probe/dup", sink())
+            .await
+            .expect("duplicate subscribe");
+        let subscriptions = broker.shared.subscriptions.lock().await;
+        assert_eq!(
+            subscriptions.len(),
+            1,
+            "one registration per filter, not a stacked pair"
+        );
+        assert!(subscriptions.contains_key("probe/dup"));
+    }
+
+    /// The MQTT topic-filter matching table: literal segments, `+` one
+    /// level, `#` any remaining levels.
+    #[test]
+    fn topic_filter_matching_follows_the_spec() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("a/b/c", "a/b/c", true),
+            ("a/+/c", "a/x/c", true),
+            ("a/+/c", "a/x/y", false),
+            ("a/#", "a/b/c", true),
+            ("a/#", "a", true),
+            ("#", "a/b", true),
+            ("a/b", "a", false),
+            ("a/b", "a/b/c", false),
+        ];
+        for (filter, topic, expected) in cases {
+            assert_eq!(
+                topic_matches(filter, topic),
+                *expected,
+                "filter {filter:?} topic {topic:?}"
+            );
+        }
+    }
 }

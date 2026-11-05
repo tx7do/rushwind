@@ -20,6 +20,13 @@
 //! doubling backoff capped at thirty seconds and replays the
 //! subscriptions.
 //!
+//! `disconnect` tears down orderly: UNSUBSCRIBE frames go out for
+//! every live subscription while the connection can still carry
+//! them, then the DISCONNECT frame, then the connection task exits.
+//! Subscriptions stay registered for the next `connect`, which
+//! replays them after the handshake. `disconnect` is idempotent, and
+//! publishes after it fail with [`BrokerError::NotConnected`].
+//!
 //! # Divergences
 //!
 //! - STOMP frames carry no headers on the default path here; the
@@ -373,7 +380,23 @@ impl Broker for StompBroker {
     fn disconnect(&self) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
             *self.shared.connected.lock().await = false;
-            *self.shared.frames.lock().await = None;
+            // Orderly teardown, upstream's ordering (UNSUBSCRIBE frames
+            // need a live connection — they must go out before the
+            // DISCONNECT, not after it): UNSUBSCRIBE for every live
+            // subscription, the DISCONNECT frame, then drop the frame
+            // sender, whose closure ends the connection task and the
+            // socket. The subscriptions map survives so the next
+            // `connect` replays them after its handshake. A double
+            // disconnect finds no sender and is a no-op.
+            let frames = self.shared.frames.lock().await.clone();
+            if let Some(frames) = frames {
+                for id in self.shared.subscriptions.lock().await.keys() {
+                    let frame = encode_frame("UNSUBSCRIBE", &[("id", id.clone())], &[]);
+                    let _ = frames.send(frame);
+                }
+                let _ = frames.send(encode_frame("DISCONNECT", &[], &[]));
+                *self.shared.frames.lock().await = None;
+            }
             Ok(())
         })
     }
@@ -467,5 +490,79 @@ impl Subscriber for StompSubscriber {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn broker() -> StompBroker {
+        StompBroker::new("127.0.0.1:61613")
+    }
+
+    fn sink() -> Handler {
+        let (tx, _rx) = mpsc::unbounded_channel::<Event>();
+        Arc::new(move |event: Event| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(event);
+                Ok::<(), BrokerError>(())
+            }) as BoxFuture<'static, Result<(), BrokerError>>
+        })
+    }
+
+    /// Publishing without a connection fails with NotConnected — a
+    /// clear error, never a panic on a stale handle.
+    #[tokio::test]
+    async fn publish_before_connect_is_not_connected() {
+        let broker = broker();
+        let result = broker
+            .publish("probe/never", Message::from_payload(vec![]))
+            .await;
+        assert!(
+            matches!(result, Err(BrokerError::NotConnected)),
+            "unconnected publish must fail with NotConnected, got {result:?}"
+        );
+    }
+
+    /// Disconnect is idempotent — including before any connect — and
+    /// afterwards publishes still fail with NotConnected.
+    #[tokio::test]
+    async fn disconnect_is_idempotent() {
+        let broker = broker();
+        broker.disconnect().await.expect("first disconnect");
+        broker.disconnect().await.expect("second disconnect");
+        let result = broker
+            .publish("probe/never", Message::from_payload(vec![]))
+            .await;
+        assert!(matches!(result, Err(BrokerError::NotConnected)));
+    }
+
+    /// Subscribing while disconnected defers the SUBSCRIBE to the next
+    /// connect (the registration survives for the reconnect replay),
+    /// and the handle's unsubscribe tears the deferred registration
+    /// down without hanging.
+    #[tokio::test]
+    async fn subscribe_before_connect_defers_and_unsubscribes() {
+        let broker = broker();
+        let mut subscriber = broker
+            .subscribe("probe/deferred", sink())
+            .await
+            .expect("offline subscribe defers the registration");
+        assert_eq!(subscriber.topic(), "probe/deferred");
+        assert_eq!(
+            broker.shared.subscriptions.lock().await.len(),
+            1,
+            "the deferred registration is kept for the next connect"
+        );
+        subscriber
+            .unsubscribe()
+            .await
+            .expect("offline unsubscribe removes the registration");
+        assert!(
+            broker.shared.subscriptions.lock().await.is_empty(),
+            "unsubscribe tears the deferred registration down"
+        );
     }
 }

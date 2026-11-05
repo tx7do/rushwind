@@ -4,8 +4,8 @@
 //! Each test spins the complete stack — `WsRoute` mounted in a router,
 //! served by `AxumServer` with its shutdown bus registered, driven by
 //! `App::run` — and asserts one slice of the session contract:
-//! gate rejection, admission-cap refusal, and lifecycle-aligned session
-//! teardown.
+//! gate rejection, admission-cap refusal, lifecycle-aligned session
+//! teardown, and teardown covering *every* live session.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -132,6 +132,49 @@ async fn session_echoes_and_dies_with_lifecycle() {
         .await
         .expect("close must arrive");
     assert!(matches!(closed, Some(Err(_)) | None));
+    let outcome = timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run must finish")
+        .expect("run task must not panic");
+    assert!(outcome.is_ok());
+}
+
+/// Upstream review round: `http.Server.Shutdown` leaves hijacked upgraded
+/// sockets open, so the Go server's Stop now closes every session through
+/// the session manager. The Rust counterpart is the session bus raced
+/// against each session task — this pins that the bus closes **every**
+/// live session, not just the first one that observes the signal.
+#[tokio::test]
+async fn stop_closes_every_live_session() {
+    let (route, bus) = WsRoute::new()
+        .gate(Arc::new(AllowAll))
+        .session_handler(echo)
+        .build()
+        .expect("route must build");
+    let (url, trigger, run) = spawn_lifecycle(Router::new().route("/ws", route), bus).await;
+
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let (client, _resp) = timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async(url.as_str()),
+        )
+        .await
+        .expect("connect must complete")
+        .expect("connect must succeed");
+        sessions.push(client);
+    }
+
+    trigger.signal();
+    for (i, mut session) in sessions.into_iter().enumerate() {
+        let closed = timeout(Duration::from_secs(5), session.next())
+            .await
+            .expect("close must arrive");
+        assert!(
+            matches!(closed, Some(Err(_)) | None),
+            "session {i} stayed open past stop"
+        );
+    }
     let outcome = timeout(Duration::from_secs(5), run)
         .await
         .expect("run must finish")

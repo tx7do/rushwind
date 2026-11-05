@@ -149,10 +149,14 @@ fn random_group_id() -> String {
 
 /// Maps a fetched record onto a contract event. Headers don't
 /// survive the samsa fetch path; the key decodes lossily into the
-/// contract's string key.
+/// contract's string key. Kafka records carry no id of their own, so
+/// the key doubles as one — handlers get a stable identifier without
+/// the native id field (upstream mapped Key onto both ID and Key for
+/// the same reason).
 fn to_event(record: samsa::prelude::ConsumeMessage) -> Event {
     let mut message = Message::from_payload(record.value.to_vec());
     message.key = String::from_utf8_lossy(&record.key).into_owned();
+    message.id = message.key.clone();
     message.partition = Some(i64::from(record.partition_index));
     message.offset = Some(record.offset as i64);
     Event::new(record.topic_name, message)
@@ -501,5 +505,50 @@ impl Drop for KafkaSubscriber {
                 task.abort();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fetched record maps onto the contract with the key doubling
+    /// as the message id (kafka records carry no native id), the
+    /// lossy key decode, and the partition/offset surfacing.
+    #[test]
+    fn fetched_record_maps_onto_the_contract() {
+        let record = samsa::prelude::ConsumeMessage {
+            key: samsa::prelude::bytes::Bytes::from_static(b"order-7"),
+            value: samsa::prelude::bytes::Bytes::from_static(b"body"),
+            offset: 41,
+            timestamp: 0,
+            topic_name: "probe".to_string(),
+            partition_index: 2,
+        };
+        let event = to_event(record);
+        assert_eq!(event.topic(), "probe");
+        let message = event.message();
+        assert_eq!(message.payload, b"body".to_vec());
+        assert_eq!(message.key, "order-7");
+        assert_eq!(message.id, "order-7", "the key doubles as the id");
+        assert_eq!(message.partition, Some(2));
+        assert_eq!(message.offset, Some(41));
+    }
+
+    /// A key that is not valid UTF-8 decodes lossily instead of
+    /// failing the delivery.
+    #[test]
+    fn invalid_utf8_key_decodes_lossily() {
+        let record = samsa::prelude::ConsumeMessage {
+            key: samsa::prelude::bytes::Bytes::from_static(&[0xff, b'k']),
+            value: samsa::prelude::bytes::Bytes::from_static(b"body"),
+            offset: 0,
+            timestamp: 0,
+            topic_name: "probe".to_string(),
+            partition_index: 0,
+        };
+        let event = to_event(record);
+        assert_eq!(event.message().key, "\u{fffd}k");
+        assert_eq!(event.message().id, "\u{fffd}k");
     }
 }

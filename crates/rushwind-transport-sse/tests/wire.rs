@@ -1,16 +1,21 @@
 //! The wire-contract tests: the preflight shape, the 401 plain-text
 //! error line, the 403-under-a-401-status-line quirk for the
-//! forbidden/rejected classes, the anti cross-user stream check, and
-//! the per-user stream filtering — the behavior the reference
+//! forbidden/rejected classes, the anti cross-user stream check, the
+//! per-user stream filtering, the fan-out payload identity across
+//! concurrent subscribers, stream survival across empty payloads, the
+//! non-blocking publish bound under a stalled receiver, and the
+//! explicit 404/405 router fallbacks — the behavior the reference
 //! transport pins and the deployments carried verbatim.
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::{Request, StatusCode};
 use futures::StreamExt;
 use rushwind_http_binding::envelope::StatusError;
 use rushwind_transport_sse::{events, events_preflight, Failure, Gate, Hub, SseApp};
+use tokio::time::timeout;
 use tower::ServiceExt;
 
 /// The stub gate: `good` authorizes userId 7, `blocked` answers the
@@ -182,6 +187,147 @@ async fn the_stream_forwards_only_its_own_user() {
     assert!(own.contains("event: notification"), "{own}");
     assert!(own.contains("data: {\"title\":\"hello\"}"), "{own}");
     assert!(own.starts_with("id: "), "{own}");
+}
+
+/// Upstream review round: the Go hub encoded the shared event in place
+/// during dispatch, so stream 2+ received base64-of-base64. The Rust hub
+/// fans out via `tokio::sync::broadcast`, which clones the payload per
+/// receiver and never mutates it in place — this pins that three
+/// concurrent subscribers see byte-identical, single-encoded payloads.
+#[tokio::test]
+async fn fanout_delivers_identical_single_encoded_payloads() {
+    let app = app();
+    let mut bodies = Vec::new();
+    for _ in 0..3 {
+        let res = router(Arc::clone(&app))
+            .oneshot(
+                Request::builder()
+                    .uri("/events?stream=7&token=good")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        bodies.push(res.into_body().into_data_stream());
+    }
+
+    app.hub.publish(7, r#"{"title":"fan"}"#.into());
+
+    let expected = r#"data: {"title":"fan"}"#;
+    for mut body in bodies {
+        let chunk = timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("stream yields within 5s")
+            .expect("stream open")
+            .expect("chunk");
+        let chunk = String::from_utf8_lossy(&chunk).into_owned();
+        let data = chunk
+            .lines()
+            .find(|line| line.starts_with("data: "))
+            .expect("every subscriber sees a data line");
+        assert_eq!(data, expected, "{chunk}");
+    }
+}
+
+/// Upstream review round: the Go send loop broke on an event with no
+/// Data and no Comment, disconnecting clients on legal metadata-only
+/// frames (Retry/ID/Event). The Rust counterpart of such a frame is the
+/// empty payload — the stream loop must skip it and keep the connection
+/// open; only the explicit close sentinel (the hub's sender dropping)
+/// terminates the loop.
+#[tokio::test]
+async fn empty_payload_does_not_kill_the_stream() {
+    let app = app();
+    let res = router(Arc::clone(&app))
+        .oneshot(
+            Request::builder()
+                .uri("/events?stream=7&token=good")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut stream = res.into_body().into_data_stream();
+
+    app.hub.publish(7, String::new());
+
+    // The connection survived the empty payload: a real event published
+    // afterwards still arrives on the same stream.
+    app.hub.publish(7, r#"{"title":"alive"}"#.into());
+    let chunk = timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("stream yields within 5s")
+        .expect("stream must still be open")
+        .expect("chunk");
+    let chunk = String::from_utf8_lossy(&chunk).into_owned();
+    assert!(chunk.contains(r#"data: {"title":"alive"}"#), "{chunk}");
+}
+
+/// Upstream review round: the Go SendMessage channel send could block
+/// forever on a stalled write pump, dragging every broadcaster with it.
+/// The Rust hub's ring is bounded (1024) and `publish` is a non-blocking
+/// send — overflowing it drops for the stalled receiver, it never blocks
+/// the publisher.
+#[tokio::test]
+async fn publish_never_blocks_on_a_stalled_receiver() {
+    let app = app();
+    let res = router(Arc::clone(&app))
+        .oneshot(
+            Request::builder()
+                .uri("/events?stream=7&token=good")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    // Hold the stream open without ever reading it: the subscriber stalls.
+    let _stalled = res.into_body();
+
+    // More events than the ring holds, against the stalled receiver: the
+    // loop must sail through (a blocking fan-out would hang here).
+    let flood = async {
+        for i in 0..4096 {
+            app.hub.publish(7, format!(r#"{{"i":{i}}}"#));
+        }
+    };
+    timeout(Duration::from_secs(5), flood)
+        .await
+        .expect("publish must never block on a stalled receiver");
+}
+
+/// Upstream review round: the Go mux's NotFound/MethodNotAllowed fell
+/// through to the global default handler, exposing whatever else was
+/// registered on the shared mux. The Rust factory mounts the events
+/// route on a fresh per-server router, whose built-in fallbacks answer
+/// unknown paths with 404 and known-path-wrong-method with 405 — nothing
+/// leaks into other registered services.
+#[tokio::test]
+async fn unknown_paths_and_wrong_methods_answer_explicit_fallbacks() {
+    let not_found = router(app())
+        .oneshot(
+            Request::builder()
+                .uri("/nope")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+
+    let not_allowed = router(app())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/events")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_allowed.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 async fn text(res: axum::response::Response) -> String {
