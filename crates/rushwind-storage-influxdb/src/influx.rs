@@ -3,15 +3,25 @@
 
 use rushwind_storage::{Record, Value};
 
-/// Escapes a measurement or tag value for line protocol (commas, spaces,
-/// equals signs).
+/// Escapes a measurement, tag value or field key for line protocol
+/// (commas, spaces, equals signs, and — critically — line breaks).
+///
+/// A raw `\n` or `\r` inside any token would terminate the point mid-line
+/// and let the remainder be parsed as a second, attacker-chosen point
+/// under the writer's credentials; the escapes keep one physical line per
+/// point.
 pub fn escape_line_token(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        if matches!(ch, ',' | ' ' | '=') {
-            out.push('\\');
+        match ch {
+            ',' | ' ' | '=' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
         }
-        out.push(ch);
     }
     out
 }
@@ -19,6 +29,18 @@ pub fn escape_line_token(text: &str) -> String {
 /// Escapes a string inside an InfluxQL single-quoted literal.
 pub fn escape_query_string(text: &str) -> String {
     text.replace('\\', "\\\\").replace('\'', "''")
+}
+
+/// Escapes a text field value inside a line-protocol quoted string: the
+/// parser honors `\\`, `\"` and `\n`/`\r` escapes inside the quotes, so
+/// the backslash goes first and a literal line break becomes its
+/// two-character escape — a raw newline would terminate the point and
+/// append a second, attacker-chosen point under the writer's credentials.
+fn escape_field_string(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// The line-protocol point for a materialized row: the primary key is a
@@ -57,7 +79,7 @@ pub fn line(measurement: &str, row: &Record) -> String {
             Value::Text(s) => format!(
                 "{}=\"{}\"",
                 escape_line_token(column),
-                s.replace('\\', "\\\\").replace('"', "\\\"")
+                escape_field_string(s)
             ),
         };
         fields.push(field);
@@ -119,6 +141,43 @@ mod tests {
             .set("age", 1i64);
         let line = line("my table", &row);
         assert_eq!(line, "my\\ table,id=1 age=1i,name=\"a b,c=d\" 0");
+    }
+
+    #[test]
+    fn text_values_cannot_smuggle_a_second_line() {
+        // A tenant-controlled text value carrying a raw newline used to
+        // terminate the point and append a forged second point under the
+        // writer's credentials; the escape keeps exactly one physical line.
+        let row = Record::new()
+            .set("id", 1i64)
+            .set("name", "legit\nage=9i fake=\"pwned\" m2 b")
+            .set("age", 1i64);
+        let line = line("widgets", &row);
+        assert!(
+            !line.contains('\n') && !line.contains('\r'),
+            "a text value must never break the point into two lines: {line:?}"
+        );
+        assert_eq!(
+            line,
+            "widgets,id=1 age=1i,\
+             name=\"legit\\nage=9i fake=\\\"pwned\\\" m2 b\" 0"
+        );
+    }
+
+    #[test]
+    fn line_tokens_cannot_smuggle_a_second_line() {
+        // Measurement names, tag values and field keys ride the same rule:
+        // no raw line break may reach the wire.
+        assert_eq!(escape_line_token("a\nb\rc"), "a\\nb\\rc");
+        let row = Record::new()
+            .set("id", Value::Text("x\ny".into()))
+            .set("age", 1i64);
+        let line = line("wea\napons", &row);
+        assert!(
+            !line.contains('\n'),
+            "a token must never break the point into two lines: {line:?}"
+        );
+        assert_eq!(line, "wea\\napons,id=x\\ny age=1i 0");
     }
 
     #[test]

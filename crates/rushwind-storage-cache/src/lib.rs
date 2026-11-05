@@ -8,10 +8,12 @@
 //!
 //! The two tenancy-critical decisions:
 //!
-//! - **Cache keys include the viewer's scope.** `Viewer::own(1)` and
-//!   `Viewer::own(2)` never share an entry, so the cache can never leak a
-//!   row across tenants — the decorator stays transparent to the
-//!   conformance suite's viewer semantics.
+//! - **Cache keys include the viewer's scope, on both axes.** `Viewer::own(1)`
+//!   and `Viewer::own(2)` never share an entry, and neither do two viewers
+//!   with the same data range but different [`Tenancy`] ids — the tenant
+//!   axis is part of the key, so the cache can never leak a row across
+//!   tenants (the decorator stays transparent to the conformance suite's
+//!   viewer and tenancy semantics).
 //! - **Invalidation bumps a per-key generation.** A load that started
 //!   before a write committed must not repopulate the cache with a stale
 //!   row after the write invalidated — the generation check drops it.
@@ -34,7 +36,7 @@ use tokio::sync::oneshot;
 
 use rushwind_storage::{
     DataRange, FilterExpr, ListQuery, Page, QueryCtx, Record, RepoFuture, Repository, StorageError,
-    Value,
+    Tenancy, Value,
 };
 
 /// The default time-to-live for a cached row.
@@ -62,8 +64,13 @@ struct CacheKey {
     id: i64,
 }
 
+/// The viewer shape a cache entry is bound to — every field the read
+/// scope depends on. The tenant axis rides along: two viewers can carry
+/// identical ranges, actors, and subjects yet address different tenants,
+/// and folding them into one key would serve tenant 5's rows to tenant 6.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ScopeKey {
+    tenancy: Tenancy,
     range: DataRange,
     actor: Option<i64>,
     unit: Option<i64>,
@@ -73,6 +80,7 @@ struct ScopeKey {
 impl ScopeKey {
     fn of(viewer: &rushwind_storage::Viewer) -> Self {
         Self {
+            tenancy: viewer.tenancy,
             range: viewer.range,
             actor: viewer.actor_id,
             unit: viewer.unit_id,

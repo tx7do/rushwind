@@ -8,8 +8,7 @@ use crate::wire::*;
 use rushwind_ai::AiError;
 use rushwind_authn::{AuthClaims, AuthnError};
 use rushwind_authz::{
-    Action, AuthzError, Pairs, PolicyMap, Project, Projects, Resource, RoleMap, Subject,
-    Subjects,
+    Action, AuthzError, Pairs, PolicyMap, Project, Projects, Resource, RoleMap, Subject, Subjects,
 };
 use rushwind_registry::{BoxFuture, RegistryError, Watcher};
 use rushwind_transport::Instance;
@@ -89,7 +88,7 @@ registry:
   settings: {}
 servers:
   - kind: http
-bind: 127.0.0.1:0
+    bind: 127.0.0.1:0
 "#;
 
 const NO_IDENTITY: &str = r#"
@@ -98,7 +97,7 @@ registry:
   settings: {}
 servers:
   - kind: http
-bind: 127.0.0.1:0
+    bind: 127.0.0.1:0
 "#;
 
 /// The registry section parses.
@@ -274,9 +273,7 @@ impl rushwind_broker::Broker for MockBroker {
     fn name(&self) -> &'static str {
         "mock"
     }
-    fn connect(
-        &self,
-    ) -> rushwind_broker::BoxFuture<'_, Result<(), rushwind_broker::BrokerError>> {
+    fn connect(&self) -> rushwind_broker::BoxFuture<'_, Result<(), rushwind_broker::BrokerError>> {
         Box::pin(async { Ok(()) })
     }
     fn disconnect(
@@ -309,8 +306,7 @@ impl rushwind_cache::Cache for MockCache {
     fn get<'a>(
         &'a self,
         _key: &'a str,
-    ) -> rushwind_cache::BoxFuture<'a, Result<Option<Vec<u8>>, rushwind_cache::CacheError>>
-    {
+    ) -> rushwind_cache::BoxFuture<'a, Result<Option<Vec<u8>>, rushwind_cache::CacheError>> {
         Box::pin(async { Ok(None) })
     }
     fn set<'a>(
@@ -381,8 +377,7 @@ impl rushwind_ratelimit::Limiter for MockLimiter {
     }
     fn wait(
         &self,
-    ) -> rushwind_ratelimit::BoxFuture<'_, Result<(), rushwind_ratelimit::RateLimitError>>
-    {
+    ) -> rushwind_ratelimit::BoxFuture<'_, Result<(), rushwind_ratelimit::RateLimitError>> {
         Box::pin(async { Ok(()) })
     }
     fn close(&self) {}
@@ -439,8 +434,7 @@ impl rushwind_config::Source for MockSource {
     fn load<'a>(
         &'a self,
         key: &'a str,
-    ) -> rushwind_config::BoxFuture<'a, Result<Option<Vec<u8>>, rushwind_config::ConfigError>>
-    {
+    ) -> rushwind_config::BoxFuture<'a, Result<Option<Vec<u8>>, rushwind_config::ConfigError>> {
         let value = self.values.get(key).cloned();
         Box::pin(async move { Ok(value) })
     }
@@ -470,9 +464,9 @@ oss:
   settings: {}
 config_sources:
   - engine: mocksource-empty
-settings: {}
+    settings: {}
   - engine: mocksource-primed
-settings: {}
+    settings: {}
 servers: []
 "#;
 
@@ -596,10 +590,10 @@ async fn unknown_authn_instance_is_an_error() {
     let yaml = r#"
 servers:
   - kind: http
-bind: 127.0.0.1:0
-route_packs:
-  - name: p
-    authn: ghost
+    bind: 127.0.0.1:0
+    route_packs:
+      - name: p
+        authn: ghost
 "#;
     let error = Bootstrap::from_yaml_str(yaml)
         .expect("yaml must parse")
@@ -625,15 +619,15 @@ authz:
   z1: { engine: mockauthz, settings: {} }
 servers:
   - kind: http
-bind: 127.0.0.1:0
-route_packs:
-  - name: p
-    authz:
-      engine: z1
-      action: a
-      resource: r
-      project: fixed
-      project_claim: claim
+    bind: 127.0.0.1:0
+    route_packs:
+      - name: p
+        authz:
+          engine: z1
+          action: a
+          resource: r
+          project: fixed
+          project_claim: claim
 "#;
     let error = Bootstrap::from_yaml_str(yaml)
         .expect("yaml must parse")
@@ -697,6 +691,24 @@ fn edge_wires_accept_both_budget_forms() {
     assert!(absent.timeout.is_none());
 }
 
+/// The storage endpoint's viewer policy parses: `all` is the explicit
+/// all-access opt-in, absence keeps the deny default, and an unknown
+/// value fails the parse loudly.
+#[test]
+fn storage_endpoint_viewer_policy_parses() {
+    let all: StorageEndpointConfig = serde_yaml::from_str("nest: /widgets\napi: crud\nviewer: all")
+        .expect("the all policy must parse");
+    assert_eq!(all.viewer, Some(ViewerPolicy::All));
+
+    let absent: StorageEndpointConfig =
+        serde_yaml::from_str("nest: /widgets\napi: crud").expect("absence must parse");
+    assert_eq!(absent.viewer, None, "no policy means deny by default");
+
+    let unknown =
+        serde_yaml::from_str::<StorageEndpointConfig>("nest: /widgets\napi: crud\nviewer: nobody");
+    assert!(unknown.is_err(), "an unknown policy must fail the parse");
+}
+
 /// Registered cron jobs mount by name on the `cron` server kind,
 /// and the server reports its configured endpoint.
 #[tokio::test]
@@ -704,8 +716,8 @@ async fn cron_jobs_mount_on_cron_servers() {
     let yaml = r#"
 servers:
   - kind: cron
-endpoint: cron://unit
-jobs: [tick]
+    endpoint: cron://unit
+    jobs: [tick]
 "#;
     let bootstrapped = Bootstrap::from_yaml_str(yaml)
         .expect("yaml must parse")
@@ -729,8 +741,8 @@ async fn unknown_cron_job_is_an_error() {
     let yaml = r#"
 servers:
   - kind: cron
-endpoint: cron://unit
-jobs: [ghost]
+    endpoint: cron://unit
+    jobs: [ghost]
 "#;
     let error = Bootstrap::from_yaml_str(yaml)
         .expect("yaml must parse")
@@ -797,8 +809,7 @@ async fn health_section_requires_the_feature() {
 #[cfg(not(feature = "health"))]
 #[tokio::test]
 async fn health_mount_requires_the_feature() {
-    let yaml =
-        "servers:\n  - kind: http\n    bind: 127.0.0.1:0\n    mounts:\n      health: true\n";
+    let yaml = "servers:\n  - kind: http\n    bind: 127.0.0.1:0\n    mounts:\n      health: true\n";
     let error = Bootstrap::from_yaml_str(yaml)
         .expect("yaml must parse")
         .build()
@@ -825,3 +836,4 @@ async fn tracer_section_requires_the_feature() {
         error,
         BootstrapError::Failed(msg) if msg.contains("feature 'trace'")
     ));
+}

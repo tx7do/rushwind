@@ -45,7 +45,9 @@ pub(crate) fn literal(value: &Value) -> String {
     }
 }
 
-fn identifier(name: &str) -> String {
+/// Backquoted identifier, shared with the engine's hand-built WHERE
+/// fragments (the tenant predicate).
+pub(crate) fn identifier(name: &str) -> String {
     format!("`{name}`")
 }
 

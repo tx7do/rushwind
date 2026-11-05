@@ -12,13 +12,22 @@
 //! - **Numeric `_source` fidelity**: dynamic mapping infers `long`/
 //!   `double`/`boolean`, matching the contract's scalar kinds; a column
 //!   holding only `NULL` stays unmapped and simply reads back `NULL`.
-//! - **`upsert` is a plain indexed put** — Elasticsearch documents are
-//!   addressed by id, so put-overwrites-put *is* insert-or-update.
+//! - **There is no server-side visibility**: every read conjoins the
+//!   viewer's scope *and* tenant predicate into the query DSL, and every
+//!   mutation probes through that scoped read first — a document the
+//!   viewer may not see behaves exactly like a missing one.
+//! - **`upsert` is probe-then-write**: the scoped probe decides the face —
+//!   a visible document takes the partial-update face, an invisible (or
+//!   absent) one takes the insert face via `_create/{id}`, so the store
+//!   itself rejects an occupied id with a version conflict instead of
+//!   silently overwriting the occupant.
+//! - **`create` is an indexed create**: `_create/{id}` (op_type=create),
+//!   so an explicit-id create onto an existing document — any tenant's —
+//!   conflicts rather than replacing it.
 //! - **`batch_create` atomicity** comes from the `_bulk` API: one request
 //!   reports per-item outcomes, and the adapter fails the batch if any
-//!   item errored. ClickHouse-style probe-conflicts are unnecessary — the
-//!   explicit `_id` makes duplicates land as overwrites only when callers
-//!   race, which the contract's single-writer suite does not exercise.
+//!   item errored. The bulk items already use the `create` op, so a
+//!   duplicate id lands as an item error, not a silent overwrite.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -29,7 +38,7 @@ use serde_json::{json, Value as Json};
 
 use rushwind_storage::{
     AuditAction, AuditEntry, ColumnKind, FieldMask, FilterExpr, ListQuery, Page, Paging, QueryCtx,
-    Record, RepoFuture, Repository, Schema, StorageError, Value,
+    Record, RepoFuture, Repository, Schema, Scope, StorageError, TenancyDecision, Value, Viewer,
 };
 
 /// A [`Repository`] backed by an Elasticsearch (or OpenSearch) REST
@@ -38,6 +47,43 @@ pub struct ElasticRepo {
     schema: Schema,
     base: String,
     http: reqwest::Client,
+}
+
+/// The tenant-axis rule for one operation: the schema's tenant column
+/// resolved against the viewer's tenancy — the same shape the in-memory
+/// reference engine carries. Resolved once per path, *before* the store is
+/// touched, so an unidentified viewer on a tenant-scoped table fails
+/// closed ([`StorageError::MissingViewer`]) instead of silently losing the
+/// tenant predicate.
+#[derive(Clone, Debug)]
+struct TenantRule {
+    column: String,
+    decision: TenancyDecision,
+}
+
+impl TenantRule {
+    /// The predicate as a query-DSL clause: `Enforce(id)` pins the tenant
+    /// column to exactly `id` — a tenant-scoped document with no tenant
+    /// value is nobody's. `Pass`/`Unscoped` need no clause.
+    fn term(&self) -> Option<Json> {
+        match self.decision {
+            TenancyDecision::Unscoped | TenancyDecision::Pass => None,
+            TenancyDecision::Enforce(id) => {
+                let column = self.column.clone();
+                Some(json!({ "term": { column: id } }))
+            }
+        }
+    }
+
+    /// Force-stamps the tenant column when the viewer is a tenant business
+    /// viewer — a tenant actor cannot address another tenant by writing
+    /// the column itself. Platform and unscoped tables keep the payload's
+    /// own value.
+    fn stamp(&self, row: &mut Record) {
+        if let TenancyDecision::Enforce(id) = self.decision {
+            row.insert(&self.column, Value::Int(id));
+        }
+    }
 }
 
 impl ElasticRepo {
@@ -187,28 +233,85 @@ impl ElasticRepo {
         Json::Object(map)
     }
 
-    fn scope_query(&self, ctx: &QueryCtx) -> Result<Option<Json>, StorageError> {
-        use rushwind_storage::{Scope, Viewer};
-        Ok(
-            match ctx.viewer.scope(Viewer::OWNER_COLUMN, Viewer::UNIT_COLUMN) {
-                Scope::Deny => None,
-                Scope::Unrestricted => Some(json!({ "match_all": {} })),
-                Scope::Scoped(filter) => {
-                    let mapper = |column: &str| self.field_of(column);
-                    Some(query::node_json(filter.node(), &mapper)?)
+    /// The partial-update `doc` for a merge: only the fields the payload
+    /// actually carries — absent fields keep their stored values, an
+    /// explicit `Null` clears — with the primary key excluded (`_id`
+    /// already pins it). The full-row [`Self::source_json`] would null
+    /// every absent column, which is the insert face's job, not a
+    /// merge's.
+    fn partial_doc(&self, row: &Record) -> serde_json::Map<String, Json> {
+        let pk = self.schema.primary_key.clone();
+        let mut doc = serde_json::Map::new();
+        for column in &self.schema.columns {
+            if let Some(value) = row.get(&column.name) {
+                if column.name != pk {
+                    doc.insert(
+                        column.name.clone(),
+                        match value {
+                            Value::Null => Json::Null,
+                            Value::Bool(b) => json!(b),
+                            Value::Int(i) => json!(i),
+                            Value::Real(f) => match serde_json::Number::from_f64(*f) {
+                                Some(number) => Json::Number(number),
+                                None => Json::Null,
+                            },
+                            Value::Text(s) => json!(s),
+                        },
+                    );
                 }
-            },
-        )
+            }
+        }
+        doc
     }
 
-    /// The viewer scope conjoined with the query's own filter; `None`
-    /// means the scope denies everything and the caller short-circuits.
+    /// The tenant-axis rule for this index — the schema's tenant column
+    /// resolved against the viewer, once per operation. Fails closed
+    /// ([`StorageError::MissingViewer`]) when a tenant-scoped index is
+    /// queried by a viewer without tenancy.
+    fn tenant_rule(&self, ctx: &QueryCtx) -> Result<TenantRule, StorageError> {
+        let column = self
+            .schema
+            .tenant_column
+            .clone()
+            .unwrap_or_else(|| Viewer::TENANT_COLUMN.to_owned());
+        let decision = ctx
+            .viewer
+            .tenant_decision(self.schema.tenant_column.as_deref())?;
+        Ok(TenantRule { column, decision })
+    }
+
+    fn scope_query(
+        &self,
+        ctx: &QueryCtx,
+        tenant: &TenantRule,
+    ) -> Result<Option<Json>, StorageError> {
+        let scope = match ctx.viewer.scope(Viewer::OWNER_COLUMN, Viewer::UNIT_COLUMN) {
+            Scope::Deny => return Ok(None),
+            Scope::Unrestricted => json!({ "match_all": {} }),
+            Scope::Scoped(filter) => {
+                let mapper = |column: &str| self.field_of(column);
+                query::node_json(filter.node(), &mapper)?
+            }
+        };
+        // The tenant predicate rides beside the scope filter in the same
+        // bool query: a foreign tenant's document is as invisible as a
+        // foreign owner's, on every read and every mutation probe.
+        Ok(Some(match tenant.term() {
+            Some(term) => json!({ "bool": { "must": [scope, term] } }),
+            None => scope,
+        }))
+    }
+
+    /// The viewer scope (plus the tenant predicate) conjoined with the
+    /// query's own filter; `None` means the scope denies everything and
+    /// the caller short-circuits.
     fn combined_query(
         &self,
         ctx: &QueryCtx,
+        tenant: &TenantRule,
         filter: Option<&FilterExpr>,
     ) -> Result<Option<Json>, StorageError> {
-        let scope = match self.scope_query(ctx)? {
+        let scope = match self.scope_query(ctx, tenant)? {
             Some(scope) => scope,
             None => return Ok(None),
         };
@@ -241,7 +344,12 @@ impl ElasticRepo {
 
     // ---- async implementations ----------------------------------------------
 
-    async fn get_async(&self, ctx: &QueryCtx, id: Value) -> Result<Option<Record>, StorageError> {
+    async fn get_async(
+        &self,
+        ctx: &QueryCtx,
+        tenant: &TenantRule,
+        id: Value,
+    ) -> Result<Option<Record>, StorageError> {
         let id = self.expect_id(&id)?;
         let (status, body) = self
             .call(
@@ -262,8 +370,8 @@ impl ElasticRepo {
         let source = body.get("_source").cloned().unwrap_or(Json::Null);
         let row = self.document_to_record(&id.to_string(), &source)?;
         // The viewer boundary applies to point reads too: re-check the
-        // scope predicate against the stored document.
-        match self.scope_query(ctx)? {
+        // scope and tenant predicates against the stored document.
+        match self.scope_query(ctx, tenant)? {
             None => Ok(None),
             Some(scope) if scope == json!({ "match_all": {} }) => Ok(Some(row)),
             Some(scope) => {
@@ -300,7 +408,8 @@ impl ElasticRepo {
         list_query: &ListQuery,
     ) -> Result<Page<Record>, StorageError> {
         list_query.validate(&self.schema)?;
-        let query = match self.combined_query(ctx, list_query.filter.as_ref())? {
+        let tenant = self.tenant_rule(ctx)?;
+        let query = match self.combined_query(ctx, &tenant, list_query.filter.as_ref())? {
             Some(query) => query,
             None => {
                 return Ok(Page {
@@ -441,7 +550,8 @@ impl ElasticRepo {
         if let Some(filter) = &filter {
             filter.validate(&self.schema)?;
         }
-        let query = match self.combined_query(ctx, filter.as_ref())? {
+        let tenant = self.tenant_rule(ctx)?;
+        let query = match self.combined_query(ctx, &tenant, filter.as_ref())? {
             Some(query) => query,
             None => return Ok(0),
         };
@@ -466,23 +576,37 @@ impl ElasticRepo {
 
     async fn create_async(&self, ctx: &QueryCtx, row: Record) -> Result<Record, StorageError> {
         self.validate_row(&row)?;
+        let tenant = self.tenant_rule(ctx)?;
+        let mut row = row;
+        tenant.stamp(&mut row);
         let pk = self.schema.primary_key.clone();
         let id = match row.get(pk.as_str()) {
             Some(Value::Int(existing)) if *existing > 0 => *existing,
             _ => self.next_id().await?,
         };
         let source = self.source_json(&row);
+        // `_create` (op_type=create), never a plain indexed put: an
+        // explicit-id create onto an existing document — any tenant's —
+        // must conflict, not silently replace the occupant.
         let (status, body) = self
             .call(
                 reqwest::Method::PUT,
-                &format!("/{}/_doc/{}?refresh=true", self.index(), id),
+                &format!("/{}/_create/{}?refresh=true", self.index(), id),
                 Some(source),
             )
             .await?;
-        if !(200..300).contains(&status) {
-            return Err(StorageError::Backend(format!(
-                "elasticsearch create failed ({status}): {body}"
-            )));
+        match status {
+            200..=299 => {}
+            409 => {
+                return Err(StorageError::Conflict(format!(
+                    "primary key {id} already exists"
+                )))
+            }
+            other => {
+                return Err(StorageError::Backend(format!(
+                    "elasticsearch create failed ({other}): {body}"
+                )))
+            }
         }
         let stored = self.materialize(&row, id);
         self.audit(ctx, AuditAction::Create, Some(Value::Int(id)));
@@ -554,13 +678,20 @@ impl ElasticRepo {
         for row in &rows {
             self.validate_row(row)?;
         }
+        let tenant = self.tenant_rule(ctx)?;
         let pk = self.schema.primary_key.clone();
         let mut next_id = self.next_id().await?;
         let mut claimed = std::collections::BTreeSet::new();
         let mut ids = Vec::with_capacity(rows.len());
+        let mut stamped_rows = Vec::with_capacity(rows.len());
         let mut ndjson = String::new();
         for row in &rows {
-            let id = match row.get(pk.as_str()) {
+            // The stamp applies per row, before the source JSON is built —
+            // a forged tenant column in a batch payload loses, same as the
+            // single-item create.
+            let mut stamped = row.clone();
+            tenant.stamp(&mut stamped);
+            let id = match stamped.get(pk.as_str()) {
                 Some(Value::Int(existing)) if *existing > 0 => *existing,
                 _ => {
                     let id = next_id;
@@ -574,7 +705,8 @@ impl ElasticRepo {
                 )));
             }
             ids.push(id);
-            let source = self.source_json(row);
+            let source = self.source_json(&stamped);
+            stamped_rows.push(stamped);
             // `create` (not `index`): an existing id must be an item error,
             // not a silent overwrite — conflict semantics depend on it.
             ndjson.push_str(&format!(
@@ -637,7 +769,7 @@ impl ElasticRepo {
                 ));
             }
         }
-        let stored = rows
+        let stored = stamped_rows
             .into_iter()
             .zip(ids)
             .map(|(row, id)| self.materialize(&row, id))
@@ -653,6 +785,7 @@ impl ElasticRepo {
         patch: Record,
     ) -> Result<Record, StorageError> {
         self.validate_row(&patch)?;
+        let tenant = self.tenant_rule(ctx)?;
         let id = self.expect_id(&id)?;
         let pk = self.schema.primary_key.clone();
         if let Some(new_pk) = patch.get(pk.as_str()) {
@@ -662,31 +795,18 @@ impl ElasticRepo {
                 ));
             }
         }
-        // Visibility probe BEFORE mutating: the scoped get turns
-        // out-of-scope rows into NotFound without touching the store.
-        self.get_async(ctx, Value::Int(id))
+        // Visibility probe BEFORE mutating: the scoped get (scope and
+        // tenant conjoined) turns out-of-scope or foreign-tenant rows into
+        // NotFound without touching the store.
+        self.get_async(ctx, &tenant, Value::Int(id))
             .await?
             .ok_or(StorageError::NotFound)?;
-        let mut doc = serde_json::Map::new();
-        for column in &self.schema.columns {
-            if let Some(value) = patch.get(&column.name) {
-                if column.name != pk {
-                    doc.insert(
-                        column.name.clone(),
-                        match value {
-                            Value::Null => Json::Null,
-                            Value::Bool(b) => json!(b),
-                            Value::Int(i) => json!(i),
-                            Value::Real(f) => match serde_json::Number::from_f64(*f) {
-                                Some(number) => Json::Number(number),
-                                None => Json::Null,
-                            },
-                            Value::Text(s) => json!(s),
-                        },
-                    );
-                }
-            }
-        }
+        // The stamp rides the patch, so the merged document keeps the
+        // probe-confirmed tenant: a tenant actor cannot migrate the row by
+        // patching the tenant column itself.
+        let mut patch = patch;
+        tenant.stamp(&mut patch);
+        let doc = self.partial_doc(&patch);
         let (status, body) = self
             .call(
                 reqwest::Method::POST,
@@ -706,7 +826,7 @@ impl ElasticRepo {
         // The viewer boundary holds for updates too; the re-read through
         // the scoped path turns out-of-scope rows into NotFound.
         let updated = self
-            .get_async(ctx, Value::Int(id))
+            .get_async(ctx, &tenant, Value::Int(id))
             .await?
             .ok_or(StorageError::NotFound)?;
         self.audit(ctx, AuditAction::Update, Some(Value::Int(id)));
@@ -715,6 +835,7 @@ impl ElasticRepo {
 
     async fn upsert_async(&self, ctx: &QueryCtx, row: Record) -> Result<Record, StorageError> {
         self.validate_row(&row)?;
+        let tenant = self.tenant_rule(ctx)?;
         let pk = self.schema.primary_key.clone();
         let id = match row.get(pk.as_str()) {
             Some(Value::Int(existing)) if *existing > 0 => *existing,
@@ -724,30 +845,85 @@ impl ElasticRepo {
                 ))
             }
         };
-        let source = self.source_json(&row);
-        let (status, body) = self
-            .call(
-                reqwest::Method::PUT,
-                &format!("/{}/_doc/{}?refresh=true", self.index(), id),
-                Some(source),
-            )
-            .await?;
-        if !(200..300).contains(&status) {
-            return Err(StorageError::Backend(format!(
-                "elasticsearch upsert failed ({status}): {body}"
-            )));
+        // The stamp applies to both faces before anything is written: the
+        // update face re-pins the probe-confirmed tenant, the insert face
+        // lands with the viewer's own.
+        let mut row = row;
+        tenant.stamp(&mut row);
+        // Visibility probe decides the face: only a document visible
+        // through the scope-and-tenant boundary is updated. An invisible
+        // id is an INSERT — and inserting onto an occupied primary key
+        // must conflict, never silently overwrite the invisible occupant.
+        let visible = self.get_async(ctx, &tenant, Value::Int(id)).await?;
+        if visible.is_some() {
+            // Update face: a partial `_update` merges the payload over the
+            // stored document (absent fields keep their values), the stamp
+            // inside the payload re-pins the tenant column.
+            let doc = self.partial_doc(&row);
+            let (status, body) = self
+                .call(
+                    reqwest::Method::POST,
+                    &format!("/{}/_update/{}?refresh=true", self.index(), id),
+                    Some(json!({ "doc": Json::Object(doc) })),
+                )
+                .await?;
+            match status {
+                200..=299 => {}
+                s if Self::is_missing(s) => return Err(StorageError::NotFound),
+                other => {
+                    return Err(StorageError::Backend(format!(
+                        "elasticsearch upsert failed ({other}): {body}"
+                    )))
+                }
+            }
+            // Re-read through the boundary: the caller gets the merged row
+            // as the store now holds it.
+            let updated = self
+                .get_async(ctx, &tenant, Value::Int(id))
+                .await?
+                .ok_or(StorageError::NotFound)?;
+            self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
+            Ok(updated)
+        } else {
+            // Insert face: `_create/{id}` (op_type=create) — if an
+            // invisible document occupied the id between the probe and now,
+            // the store rejects the write with a version conflict, which
+            // maps to the contract's Conflict. A plain indexed put here
+            // would overwrite any tenant's document.
+            let source = self.source_json(&row);
+            let (status, body) = self
+                .call(
+                    reqwest::Method::PUT,
+                    &format!("/{}/_create/{}?refresh=true", self.index(), id),
+                    Some(source),
+                )
+                .await?;
+            match status {
+                200..=299 => {}
+                409 => {
+                    return Err(StorageError::Conflict(format!(
+                        "primary key {id} already exists"
+                    )))
+                }
+                other => {
+                    return Err(StorageError::Backend(format!(
+                        "elasticsearch upsert failed ({other}): {body}"
+                    )))
+                }
+            }
+            let stored = self.materialize(&row, id);
+            self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
+            Ok(stored)
         }
-        let stored = self.materialize(&row, id);
-        self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
-        Ok(stored)
     }
 
     async fn delete_async(&self, ctx: &QueryCtx, id: Value) -> Result<(), StorageError> {
+        let tenant = self.tenant_rule(ctx)?;
         let id = self.expect_id(&id)?;
         // Probe through the scoped path first: out-of-scope (or missing)
         // rows are NotFound, and ES reports deletes of absent documents as
         // 200 with result=not_found — never trust the status alone.
-        self.get_async(ctx, Value::Int(id))
+        self.get_async(ctx, &tenant, Value::Int(id))
             .await?
             .ok_or(StorageError::NotFound)?;
         let (status, body) = self
@@ -774,7 +950,10 @@ impl Repository for ElasticRepo {
     }
 
     fn get(&self, ctx: QueryCtx, id: Value) -> RepoFuture<'_, Option<Record>> {
-        Box::pin(async move { self.get_async(&ctx, id).await })
+        Box::pin(async move {
+            let tenant = self.tenant_rule(&ctx)?;
+            self.get_async(&ctx, &tenant, id).await
+        })
     }
 
     fn list<'a>(&'a self, ctx: QueryCtx, query: &'a ListQuery) -> RepoFuture<'a, Page<Record>> {
@@ -803,5 +982,163 @@ impl Repository for ElasticRepo {
 
     fn delete(&self, ctx: QueryCtx, id: Value) -> RepoFuture<'_, ()> {
         Box::pin(async move { self.delete_async(&ctx, id).await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Offline coverage of the tenancy translation — the same pure-layer
+    //! unit testing the query module gets: rule resolution (fail-closed),
+    //! the DSL clause the tenant predicate compiles to, and the write-side
+    //! stamp. The wire paths themselves are pinned by the live suite.
+
+    use super::*;
+    use rushwind_storage::{FilterExpr, Op};
+
+    /// A tenant-scoped schema: the suite table plus the conventional
+    /// tenant column, declared as the schema's tenant column.
+    fn tenant_schema() -> Schema {
+        Schema::builder("widgets", "id")
+            .column("name", ColumnKind::Text)
+            .column("age", ColumnKind::Int)
+            .column("owner_id", ColumnKind::Int)
+            .column(Viewer::TENANT_COLUMN, ColumnKind::Int)
+            .tenant_column(Viewer::TENANT_COLUMN)
+            .build()
+            .expect("tenant schema is valid")
+    }
+
+    /// The same table without a tenant column — unscoped.
+    fn plain_schema() -> Schema {
+        Schema::builder("widgets", "id")
+            .column("name", ColumnKind::Text)
+            .column("owner_id", ColumnKind::Int)
+            .build()
+            .expect("plain schema is valid")
+    }
+
+    #[test]
+    fn unidentified_viewer_fails_closed_before_the_store_is_touched() {
+        let repo = ElasticRepo::new("http://localhost:9200", tenant_schema());
+        // Viewer::own carries a data range but no tenancy — exactly the
+        // shape that once dropped the tenant predicate silently.
+        let ctx = QueryCtx::new(Viewer::own(1));
+        let err = repo
+            .tenant_rule(&ctx)
+            .expect_err("an unidentified viewer must fail closed");
+        assert_eq!(err, StorageError::MissingViewer);
+    }
+
+    #[test]
+    fn unscoped_tables_skip_the_tenant_axis() {
+        let repo = ElasticRepo::new("http://localhost:9200", plain_schema());
+        let ctx = QueryCtx::new(Viewer::own(1));
+        let rule = repo.tenant_rule(&ctx).expect("unscoped tables never fail");
+        assert!(rule.term().is_none(), "no tenant column, no tenant clause");
+    }
+
+    #[test]
+    fn tenant_term_conjoins_beside_the_scope_filter() {
+        let repo = ElasticRepo::new("http://localhost:9200", tenant_schema());
+        // A tenant user inside owner 1: both boundaries in one bool query.
+        let ctx = QueryCtx::new(Viewer::tenant_user(5, 1));
+        let rule = repo.tenant_rule(&ctx).expect("resolves");
+        let scope = repo
+            .scope_query(&ctx, &rule)
+            .expect("builds")
+            .expect("not denied");
+        assert_eq!(
+            scope,
+            json!({ "bool": { "must": [
+                { "term": { "owner_id": 1 } },
+                { "term": { "tenant_id": 5 } },
+            ] } })
+        );
+    }
+
+    #[test]
+    fn unrestricted_scope_does_not_short_circuit_the_tenant_term() {
+        let repo = ElasticRepo::new("http://localhost:9200", tenant_schema());
+        // Tenant admin over the whole tenant: the boundary is NOT
+        // match_all — a point read must still re-check the tenant column,
+        // so the clause must be a real bool query.
+        let ctx = QueryCtx::new(Viewer::tenant(5));
+        let rule = repo.tenant_rule(&ctx).expect("resolves");
+        let scope = repo
+            .scope_query(&ctx, &rule)
+            .expect("builds")
+            .expect("not denied");
+        assert_ne!(
+            scope,
+            json!({ "match_all": {} }),
+            "a tenant viewer must never degrade to an unrestricted query"
+        );
+        assert_eq!(
+            scope,
+            json!({ "bool": { "must": [
+                { "match_all": {} },
+                { "term": { "tenant_id": 5 } },
+            ] } })
+        );
+    }
+
+    #[test]
+    fn platform_pass_keeps_the_query_unrestricted() {
+        let repo = ElasticRepo::new("http://localhost:9200", tenant_schema());
+        let ctx = QueryCtx::all_access();
+        let rule = repo.tenant_rule(&ctx).expect("platform passes");
+        let scope = repo
+            .scope_query(&ctx, &rule)
+            .expect("builds")
+            .expect("not denied");
+        assert_eq!(
+            scope,
+            json!({ "match_all": {} }),
+            "Pass injects no predicate anywhere"
+        );
+    }
+
+    #[test]
+    fn the_query_filter_lands_beside_the_boundaries() {
+        let repo = ElasticRepo::new("http://localhost:9200", tenant_schema());
+        let ctx = QueryCtx::new(Viewer::tenant(5));
+        let rule = repo.tenant_rule(&ctx).expect("resolves");
+        let filter = FilterExpr::cond("age", Op::Gt, [Value::Int(10)]);
+        let combined = repo
+            .combined_query(&ctx, &rule, Some(&filter))
+            .expect("builds")
+            .expect("not denied");
+        assert_eq!(
+            combined,
+            json!({ "bool": { "must": [
+                { "bool": { "must": [
+                    { "match_all": {} },
+                    { "term": { "tenant_id": 5 } },
+                ] } },
+                { "range": { "age": { "gt": 10 } } },
+            ] } })
+        );
+    }
+
+    #[test]
+    fn stamp_wins_over_a_forged_payload_and_pass_keeps_it() {
+        // Enforce: the tenant actor cannot address another tenant by
+        // writing the column itself.
+        let enforce = TenantRule {
+            column: Viewer::TENANT_COLUMN.to_owned(),
+            decision: TenancyDecision::Enforce(5),
+        };
+        let mut forged = Record::new().set(Viewer::TENANT_COLUMN, 6i64);
+        enforce.stamp(&mut forged);
+        assert_eq!(forged.get(Viewer::TENANT_COLUMN), Some(&Value::Int(5)));
+
+        // Pass (platform): the payload's own tenant value survives.
+        let pass = TenantRule {
+            column: Viewer::TENANT_COLUMN.to_owned(),
+            decision: TenancyDecision::Pass,
+        };
+        let mut addressed = Record::new().set(Viewer::TENANT_COLUMN, 6i64);
+        pass.stamp(&mut addressed);
+        assert_eq!(addressed.get(Viewer::TENANT_COLUMN), Some(&Value::Int(6)));
     }
 }

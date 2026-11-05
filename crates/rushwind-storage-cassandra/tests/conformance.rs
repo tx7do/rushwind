@@ -13,24 +13,15 @@ use rushwind_storage_cassandra::CassandraRepo;
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
-/// A fresh, empty table for every suite test.
-async fn fresh_repo() -> Arc<dyn Repository> {
+/// Connects to the live cluster and returns a repository bound to `schema`
+/// over a fresh, empty table.
+async fn live_repo(schema: Schema) -> Arc<dyn Repository> {
     let hosts: Vec<String> = std::env::var("CASSANDRA_HOSTS")
         .expect("CASSANDRA_HOSTS must list Cassandra contact points")
         .split(',')
         .map(str::trim)
         .map(str::to_owned)
         .collect();
-    let mut schema = Schema::builder("widgets", "id")
-        .column("name", ColumnKind::Text)
-        .column("age", ColumnKind::Int)
-        .column("score", ColumnKind::Real)
-        .column("owner_id", ColumnKind::Int)
-        .column("unit_id", ColumnKind::Int)
-        .build()
-        .expect("suite schema is valid");
-    schema.table = format!("widgets_live_{}", SEQ.fetch_add(1, Ordering::Relaxed));
-
     let repo = CassandraRepo::connect(&hosts, "rushwind_suite", schema)
         .await
         .expect("connects to Cassandra");
@@ -41,4 +32,25 @@ async fn fresh_repo() -> Arc<dyn Repository> {
     Arc::new(repo)
 }
 
-rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo);
+/// A fresh, empty table for every suite test.
+async fn fresh_repo() -> Arc<dyn Repository> {
+    let mut schema = Schema::builder("widgets", "id")
+        .column("name", ColumnKind::Text)
+        .column("age", ColumnKind::Int)
+        .column("score", ColumnKind::Real)
+        .column("owner_id", ColumnKind::Int)
+        .column("unit_id", ColumnKind::Int)
+        .build()
+        .expect("suite schema is valid");
+    schema.table = format!("widgets_live_{}", SEQ.fetch_add(1, Ordering::Relaxed));
+    live_repo(schema).await
+}
+
+/// A fresh, empty tenant-scoped table for the tenancy suite.
+async fn fresh_tenant_repo() -> Arc<dyn Repository> {
+    let mut schema = rushwind_testkit::storage_conformance::tenant_suite_schema();
+    schema.table = format!("widgets_live_{}", SEQ.fetch_add(1, Ordering::Relaxed));
+    live_repo(schema).await
+}
+
+rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant: crate::fresh_tenant_repo);

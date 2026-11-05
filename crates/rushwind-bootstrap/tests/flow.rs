@@ -15,7 +15,7 @@ use rushwind_authn_noop::NoopAuthenticator;
 use rushwind_authz::Engine as AuthzEngine;
 use rushwind_authz_acl::{AclEngine, AclOptions};
 use rushwind_bootstrap::{Bootstrap, BootstrapError, RouteInput, RouteSurface};
-use rushwind_storage::{ColumnKind, Repository, Schema};
+use rushwind_storage::{ColumnKind, QueryCtx, Record, Repository, Schema};
 use rushwind_storage_memory::MemoryRepo;
 use rushwind_transport::StopSignal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -32,6 +32,7 @@ storage:
 storage_endpoints:
   - nest: /widgets
     api: crud
+    viewer: all
 servers:
   - kind: http
     bind: 127.0.0.1:0
@@ -280,6 +281,81 @@ async fn storage_endpoint_serves_crud_over_http() {
     );
 
     // Lifecycle shutdown returns a clean outcome.
+    trigger.signal();
+    let outcome = timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run must finish")
+        .expect("run task must not panic");
+    assert!(outcome.is_ok());
+}
+
+/// The crud edge's deny default (audit H2): a `storage_endpoints[]`
+/// entry without a `viewer` policy mounts a CrudApi with no viewer —
+/// every request sees nothing. All-access is the explicit `viewer: all`
+/// opt-in FLOW_YAML takes.
+#[tokio::test]
+async fn crud_endpoint_without_viewer_policy_denies_reads() {
+    let yaml = r#"
+app:
+  name: deny-test
+  version: v0.1.0
+  stop_timeout_secs: 1
+storage:
+  engine: memory
+  settings: {}
+storage_endpoints:
+  - nest: /widgets
+    api: crud
+servers:
+  - kind: http
+    bind: 127.0.0.1:0
+"#;
+    let bootstrapped =
+        register_memory_engine(Bootstrap::from_yaml_str(yaml).expect("yaml must parse"))
+            .build()
+            .await
+            .expect("assembly must succeed");
+
+    // Seed directly through the assembled engine: the row exists, the
+    // edge just must not show it.
+    bootstrapped
+        .repository
+        .as_ref()
+        .expect("storage assembled")
+        .create(
+            QueryCtx::all_access(),
+            Record::new().set("name", "bolt").set("id", 1),
+        )
+        .await
+        .expect("seed lands");
+
+    let addr = first_endpoint(&bootstrapped);
+    let trigger = StopSignal::new();
+    let app = Arc::new(bootstrapped.app);
+    let run_trigger = trigger.clone();
+    let run = tokio::spawn(async move { app.run(run_trigger).await });
+    sleep(Duration::from_millis(200)).await;
+
+    let listed = timeout(Duration::from_secs(5), http_get(addr, "/widgets"))
+        .await
+        .expect("list must respond");
+    assert!(
+        listed.contains("200"),
+        "the request itself still serves: {listed}"
+    );
+    assert!(
+        !listed.contains("bolt"),
+        "the deny default lists nothing: {listed}"
+    );
+
+    let row = timeout(Duration::from_secs(5), http_get(addr, "/widgets/1"))
+        .await
+        .expect("get must respond");
+    assert!(
+        row.contains("404"),
+        "the deny default hides every row: {row}"
+    );
+
     trigger.signal();
     let outcome = timeout(Duration::from_secs(5), run)
         .await
@@ -579,6 +655,7 @@ storage:
 storage_endpoints:
   - nest: /widgets
     api: crud
+    viewer: all
     authn: apikey1
 authn:
   apikey1:

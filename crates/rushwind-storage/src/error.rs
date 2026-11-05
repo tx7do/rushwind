@@ -19,6 +19,11 @@ pub enum StorageError {
     /// The write violates a store-side constraint (duplicate key, foreign
     /// key, uniqueness).
     Conflict(String),
+    /// The table is tenant-scoped and the query arrived with no viewer
+    /// identity attached — tenancy enforcement fails closed rather than
+    /// silently dropping the tenant predicate. The port of the reference
+    /// port's missing-viewer error.
+    MissingViewer,
     /// The engine does not support the requested capability.
     Unsupported(String),
     /// The operation exceeded its budget.
@@ -35,6 +40,10 @@ impl fmt::Display for StorageError {
             Self::InvalidQuery(detail) => write!(f, "invalid query: {detail}"),
             Self::Conflict(detail) => write!(f, "conflict: {detail}"),
             Self::Unsupported(detail) => write!(f, "unsupported: {detail}"),
+            Self::MissingViewer => write!(
+                f,
+                "missing viewer identity: the table is tenant-scoped and the query carries no tenant"
+            ),
             Self::Timeout => write!(f, "operation timed out"),
             Self::Backend(detail) => write!(f, "backend failure: {detail}"),
         }

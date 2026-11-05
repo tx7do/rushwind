@@ -23,7 +23,15 @@
 //!
 //! - Enforce the [`QueryCtx::viewer`] scope on **every** path (get, list,
 //!   count, update, upsert, delete); a row outside the viewer's scope is
-//!   indistinguishable from a missing row.
+//!   indistinguishable from a missing row. Writes get no slack: `upsert`
+//!   probes through the scoped read before it touches anything, and a
+//!   visible-in-scope row is the only one an `upsert` may update.
+//! - Resolve the viewer's [`Tenancy`] against the schema's tenant column
+//!   ([`Viewer::tenant_decision`]) on **every** path of a tenant-scoped
+//!   table: conjoin the tenant predicate on reads and mutations,
+//!   force-stamp it on creates, and fail closed with
+//!   [`StorageError::MissingViewer`] when the viewer carries no tenancy —
+//!   never silently drop the predicate.
 //! - Backfill the primary key on [`Repository::create`] and return the full
 //!   stored row from every mutating call.
 //! - Translate [`FilterExpr`] faithfully — including nested `All`/`Any`
@@ -64,4 +72,4 @@ pub use repository::{ListQuery, RepoFuture, Repository};
 pub use schema::{Column, ColumnKind, Schema};
 pub use sorting::{Sort, SortDir, SortField};
 pub use value::Value;
-pub use viewer::{DataRange, Scope, Viewer};
+pub use viewer::{DataRange, Scope, Tenancy, TenancyDecision, Viewer};

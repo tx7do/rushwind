@@ -14,7 +14,9 @@
 //! - List/count fetch the measurement and filter with the contract's
 //!   reference evaluator ([`FilterExpr::matches`](rushwind_storage::FilterExpr::matches)),
 //!   sort with [`Value::compare`](rushwind_storage::Value::compare), and
-//!   page in memory — semantics identical to the other engines.
+//!   page in memory — semantics identical to the other engines. The tenant
+//!   predicate conjoins beside the viewer-scope predicates in that same
+//!   in-memory evaluation, and writes stamp/probe through it.
 //! - Deletes use InfluxQL `DELETE ... WHERE "id" = '…'`.
 
 #![forbid(unsafe_code)]
@@ -31,7 +33,7 @@ pub(crate) mod rushwind_storage_influx_escape {
 
 use rushwind_storage::{
     AuditAction, AuditEntry, FieldMask, FilterExpr, ListQuery, Page, Paging, QueryCtx, Record,
-    RepoFuture, Repository, Schema, StorageError, Value, Viewer,
+    RepoFuture, Repository, Schema, StorageError, TenancyDecision, Value, Viewer,
 };
 
 /// A [`Repository`] backed by an InfluxDB 1.x HTTP endpoint.
@@ -40,6 +42,38 @@ pub struct InfluxRepo {
     base: String,
     database: String,
     http: reqwest::Client,
+}
+
+/// The tenant predicate resolved for one operation: the schema's tenant
+/// column plus the viewer's [`TenancyDecision`] against it.
+#[derive(Clone, Debug)]
+struct TenantRule {
+    column: String,
+    decision: TenancyDecision,
+}
+
+impl TenantRule {
+    /// The predicate as a row test: `Enforce(id)` admits only rows whose
+    /// tenant column carries exactly `id` — a tenant-scoped row with no
+    /// tenant value is nobody's. Conjoined beside the viewer-scope
+    /// predicates in the adapter's in-memory evaluation of the fetched
+    /// series.
+    fn matches(&self, row: &Record) -> bool {
+        match self.decision {
+            TenancyDecision::Unscoped | TenancyDecision::Pass => true,
+            TenancyDecision::Enforce(id) => row.get(&self.column) == Some(&Value::Int(id)),
+        }
+    }
+
+    /// Force-stamps the tenant column when the viewer is a tenant business
+    /// viewer — a tenant actor cannot address another tenant by writing the
+    /// column itself. Platform and unscoped tables keep the payload's own
+    /// value.
+    fn stamp(&self, row: &mut Record) {
+        if let TenancyDecision::Enforce(id) = self.decision {
+            row.insert(&self.column, Value::Int(id));
+        }
+    }
 }
 
 impl InfluxRepo {
@@ -205,10 +239,15 @@ impl InfluxRepo {
         ));
     }
 
-    /// All primary keys currently in the measurement (all-access view).
-    async fn fetch_all_ids(&self, ctx: &QueryCtx) -> Result<Vec<i64>, StorageError> {
+    /// All primary keys currently in the measurement — the raw existence
+    /// probe, deliberately unscoped: an id occupied by a row the caller
+    /// cannot see still counts as occupied, exactly like the reference
+    /// engine's create/upsert collision check.
+    async fn fetch_all_ids(&self) -> Result<Vec<i64>, StorageError> {
+        let ctx = QueryCtx::all_access();
+        let tenant = self.tenant_rule(&ctx)?;
         Ok(self
-            .visible_rows(ctx, None)
+            .visible_rows(&tenant, &ctx, None)
             .await?
             .into_iter()
             .filter_map(|row| row.get(&self.schema.primary_key).and_then(Value::as_i64))
@@ -218,6 +257,24 @@ impl InfluxRepo {
     fn expect_id(&self, id: &Value) -> Result<i64, StorageError> {
         id.as_i64()
             .ok_or_else(|| StorageError::InvalidQuery("the primary key must be an integer".into()))
+    }
+
+    /// The tenant-axis rule for this table — the schema's tenant column
+    /// resolved against the viewer, once per operation. Fails closed
+    /// ([`StorageError::MissingViewer`]) when a tenant-scoped table is
+    /// queried by a viewer without tenancy; every path resolves it before
+    /// any HTTP round-trip, so an unidentified viewer cannot even probe the
+    /// measurement.
+    fn tenant_rule(&self, ctx: &QueryCtx) -> Result<TenantRule, StorageError> {
+        let column = self
+            .schema
+            .tenant_column
+            .clone()
+            .unwrap_or_else(|| Viewer::TENANT_COLUMN.to_owned());
+        let decision = ctx
+            .viewer
+            .tenant_decision(self.schema.tenant_column.as_deref())?;
+        Ok(TenantRule { column, decision })
     }
 
     fn validate_row(&self, row: &Record) -> Result<(), StorageError> {
@@ -235,9 +292,12 @@ impl InfluxRepo {
         Ok(())
     }
 
-    /// The scoped+filtered view of the measurement, contract semantics.
+    /// The tenant-scoped, scope-filtered view of the measurement, contract
+    /// semantics: the tenant predicate conjoins beside the viewer-scope
+    /// predicates, then the query filter.
     async fn visible_rows(
         &self,
+        tenant: &TenantRule,
         ctx: &QueryCtx,
         filter: Option<&FilterExpr>,
     ) -> Result<Vec<Record>, StorageError> {
@@ -245,6 +305,9 @@ impl InfluxRepo {
             .query_records(&influx::select_all(&self.schema.table))
             .await?;
         rows.retain(|row| {
+            if !tenant.matches(row) {
+                return false;
+            }
             let in_scope = match ctx.viewer.scope(Viewer::OWNER_COLUMN, Viewer::UNIT_COLUMN) {
                 rushwind_storage::Scope::Deny => false,
                 rushwind_storage::Scope::Unrestricted => true,
@@ -262,9 +325,11 @@ impl InfluxRepo {
     // ---- async implementations ----------------------------------------------
 
     async fn get_async(&self, ctx: &QueryCtx, id: Value) -> Result<Option<Record>, StorageError> {
+        let tenant = self.tenant_rule(ctx)?;
         let id = self.expect_id(&id)?;
         let mut rows = self
             .visible_rows(
+                &tenant,
                 ctx,
                 Some(&FilterExpr::cond(
                     self.schema.primary_key.as_str(),
@@ -282,7 +347,10 @@ impl InfluxRepo {
         query: &ListQuery,
     ) -> Result<Page<Record>, StorageError> {
         query.validate(&self.schema)?;
-        let mut rows = self.visible_rows(ctx, query.filter.as_ref()).await?;
+        let tenant = self.tenant_rule(ctx)?;
+        let mut rows = self
+            .visible_rows(&tenant, ctx, query.filter.as_ref())
+            .await?;
         let total = rows.len() as u64;
 
         let pk = self.schema.primary_key.clone();
@@ -377,18 +445,31 @@ impl InfluxRepo {
         if let Some(filter) = &filter {
             filter.validate(&self.schema)?;
         }
-        let rows = self.visible_rows(ctx, filter.as_ref()).await?;
+        let tenant = self.tenant_rule(ctx)?;
+        let rows = self.visible_rows(&tenant, ctx, filter.as_ref()).await?;
         Ok(rows.len() as u64)
     }
 
     async fn create_async(&self, ctx: &QueryCtx, row: Record) -> Result<Record, StorageError> {
         self.validate_row(&row)?;
+        let tenant = self.tenant_rule(ctx)?;
         let pk = self.schema.primary_key.clone();
         let id = match row.get(pk.as_str()) {
             Some(Value::Int(existing)) if *existing > 0 => *existing,
             _ => self.next_id().await?,
         };
-        let stored = self.materialize(&row, id);
+        // Raw existence probe before the write: InfluxDB overwrites a
+        // repeated series+timestamp silently, so an id already in the
+        // measurement — any tenant's — must conflict here rather than
+        // clobber the incumbent point (the same check `batch_create`
+        // runs).
+        if self.fetch_all_ids().await?.contains(&id) {
+            return Err(StorageError::Conflict(format!(
+                "primary key {id} already exists"
+            )));
+        }
+        let mut stored = self.materialize(&row, id);
+        tenant.stamp(&mut stored);
         self.write_lines(vec![influx::line(&self.schema.table, &stored)])
             .await?;
         self.audit(ctx, AuditAction::Create, Some(Value::Int(id)));
@@ -403,6 +484,8 @@ impl InfluxRepo {
         for row in &rows {
             self.validate_row(row)?;
         }
+        // The tenant axis resolves before anything touches the store.
+        let tenant = self.tenant_rule(ctx)?;
         let pk = self.schema.primary_key.clone();
         let mut next_id = self.next_id().await?;
         let mut claimed = std::collections::BTreeSet::new();
@@ -422,19 +505,18 @@ impl InfluxRepo {
                     "primary key {id} repeats within the batch"
                 )));
             }
+            // Every line carries the stamp, so no payload can land under a
+            // foreign tenant's column value.
+            let mut full = self.materialize(row, id);
+            tenant.stamp(&mut full);
             ids.push(id);
-            lines.push(influx::line(
-                self.schema.table.as_str(),
-                &self.materialize(row, id),
-            ));
+            lines.push(influx::line(self.schema.table.as_str(), &full));
         }
         // InfluxDB overwrites silently, so duplicates are a pre-check: any
-        // id already in the measurement fails the whole batch up front.
-        let existing: std::collections::BTreeSet<i64> = self
-            .fetch_all_ids(&QueryCtx::all_access())
-            .await?
-            .into_iter()
-            .collect();
+        // id already in the measurement — any tenant's — fails the whole
+        // batch up front.
+        let existing: std::collections::BTreeSet<i64> =
+            self.fetch_all_ids().await?.into_iter().collect();
         if let Some(id) = ids.iter().find(|id| existing.contains(id)) {
             return Err(StorageError::Conflict(format!(
                 "primary key {id} already exists"
@@ -444,7 +526,11 @@ impl InfluxRepo {
         let stored = rows
             .into_iter()
             .zip(ids)
-            .map(|(row, id)| self.materialize(&row, id))
+            .map(|(row, id)| {
+                let mut full = self.materialize(&row, id);
+                tenant.stamp(&mut full);
+                full
+            })
             .collect();
         self.audit(ctx, AuditAction::BatchCreate, None);
         Ok(stored)
@@ -470,6 +556,7 @@ impl InfluxRepo {
         patch: Record,
     ) -> Result<Record, StorageError> {
         self.validate_row(&patch)?;
+        let tenant = self.tenant_rule(ctx)?;
         let id = self.expect_id(&id)?;
         let pk = self.schema.primary_key.clone();
         if let Some(new_pk) = patch.get(pk.as_str()) {
@@ -479,7 +566,8 @@ impl InfluxRepo {
                 ));
             }
         }
-        // Visibility probe before mutating (scoped path).
+        // Visibility probe before mutating (scoped path): out-of-scope and
+        // cross-tenant rows are NotFound before anything is written.
         let mut updated = self
             .get_async(ctx, Value::Int(id))
             .await?
@@ -491,6 +579,9 @@ impl InfluxRepo {
                 }
             }
         }
+        // The patch rides the tenant stamp: a tenant actor cannot migrate
+        // the row into another tenant by patching the column itself.
+        tenant.stamp(&mut updated);
         // InfluxDB overwrites a series in place when the point repeats:
         // rewrite the full merged row at the same series+timestamp.
         self.write_lines(vec![influx::line(self.schema.table.as_str(), &updated)])
@@ -501,6 +592,7 @@ impl InfluxRepo {
 
     async fn upsert_async(&self, ctx: &QueryCtx, row: Record) -> Result<Record, StorageError> {
         self.validate_row(&row)?;
+        let tenant = self.tenant_rule(ctx)?;
         let pk = self.schema.primary_key.clone();
         let id = match row.get(pk.as_str()) {
             Some(Value::Int(existing)) if *existing > 0 => *existing,
@@ -510,16 +602,56 @@ impl InfluxRepo {
                 ))
             }
         };
-        let stored = self.materialize(&row, id);
-        self.write_lines(vec![influx::line(self.schema.table.as_str(), &stored)])
-            .await?;
-        self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
-        Ok(stored)
+        // Scoped probe first — the engine's pk-direct read with the tenant
+        // and scope predicates conjoined: the update face requires the row
+        // to be visible to this viewer.
+        match self.get_async(ctx, Value::Int(id)).await? {
+            Some(current) => {
+                // Update face: the series is the actor's own. Merge the
+                // payload over it (absent payload fields keep their stored
+                // values) and rewrite it in place at the same series+
+                // timestamp. The payload rides the tenant stamp, so a
+                // tenant actor cannot migrate the row into another tenant.
+                let mut updated = current;
+                for (field, value) in row.iter() {
+                    if field != pk {
+                        updated.insert(field, value.clone());
+                    }
+                }
+                tenant.stamp(&mut updated);
+                self.write_lines(vec![influx::line(self.schema.table.as_str(), &updated)])
+                    .await?;
+                self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
+                Ok(updated)
+            }
+            None => {
+                // Insert face: the row is absent **or** occupied by a row
+                // this viewer cannot see — a tenant-scoped row with a
+                // foreign tenant value reads exactly like a missing one.
+                // The raw existence probe arbitrates: an occupied pk is a
+                // Conflict without writing, never a silent overwrite of
+                // the invisible incumbent.
+                if self.fetch_all_ids().await?.contains(&id) {
+                    return Err(StorageError::Conflict(format!(
+                        "primary key {id} already exists"
+                    )));
+                }
+                let mut stored = self.materialize(&row, id);
+                tenant.stamp(&mut stored);
+                self.write_lines(vec![influx::line(self.schema.table.as_str(), &stored)])
+                    .await?;
+                self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
+                Ok(stored)
+            }
+        }
     }
 
     async fn delete_async(&self, ctx: &QueryCtx, id: Value) -> Result<(), StorageError> {
         let id = self.expect_id(&id)?;
-        // Scoped probe first: out-of-scope rows are NotFound.
+        // Fail closed before anything touches the store; the scoped probe
+        // below carries the tenant predicate — out-of-scope and cross-tenant
+        // rows are NotFound.
+        self.tenant_rule(ctx)?;
         self.get_async(ctx, Value::Int(id))
             .await?
             .ok_or(StorageError::NotFound)?;
@@ -560,7 +692,8 @@ impl InfluxRepo {
     /// columns.
     async fn next_id(&self) -> Result<i64, StorageError> {
         let ctx = QueryCtx::all_access();
-        let rows = self.visible_rows(&ctx, None).await?;
+        let tenant = self.tenant_rule(&ctx)?;
+        let rows = self.visible_rows(&tenant, &ctx, None).await?;
         let max = rows
             .iter()
             .filter_map(|row| row.get(&self.schema.primary_key).and_then(Value::as_i64))

@@ -68,6 +68,18 @@
 //! verbatim alongside the [`RouteInput`], and may wrap inner subtrees
 //! further with anything the input carries.
 //!
+//! ## The crud edge's viewer
+//!
+//! The built-in `"crud"` storage endpoint runs **fail closed** by
+//! default: with no `viewer` policy configured, every request sees
+//! nothing (and tenant-scoped tables reject outright with the
+//! contract's missing-viewer error). `storage_endpoints[].viewer: all`
+//! is the explicit all-access opt-in — demos and internal tools; a
+//! multi-tenant deployment leaves it unset and registers its own
+//! `"crud"` api pack instead, one that derives the [`Viewer`] from the
+//! request's authenticated claims. An unknown `viewer` value fails the
+//! parse.
+//!
 //! # Session transports
 //!
 //! Route packs yield a [`RouteSurface`]: the pack's router plus any
@@ -141,7 +153,7 @@ use rushwind_oss::ObjectStorage;
 use rushwind_ratelimit::Limiter;
 use rushwind_registry::{Discovery, Registrar, Registration, RegistrationHandle};
 use rushwind_script::Manager as ScriptManager;
-use rushwind_storage::Repository;
+use rushwind_storage::{Repository, Viewer};
 use rushwind_storage_axum::CrudApi;
 use rushwind_transport::{Instance, Server, ServerError, StopSignal};
 use rushwind_transport_axum::AxumServer;
@@ -159,11 +171,13 @@ use rushwind_metrics_prometheus::PrometheusMetrics;
 use rushwind_tracer::{SdkTracerProvider, TracerProviderBuilder};
 
 mod config;
+#[cfg(test)]
+mod tests;
 mod wire;
 
 pub use config::{
     AppConfig, AuthzRef, BootstrapConfig, EngineConfig, RegistryConfig, RoutePackRef, ScriptConfig,
-    ServerConfig, StorageConfig, StorageEndpointConfig,
+    ServerConfig, StorageConfig, StorageEndpointConfig, ViewerPolicy,
 };
 use wire::*;
 pub use wire::{BindWire, DurationWire};
@@ -393,9 +407,13 @@ type RegistryFactoryFn = Box<
 >;
 
 /// The api-pack closure type: one storage HTTP edge, mounted under a
-/// prefix. The built-in `"crud"` pack (backed by `rushwind-storage-axum`)
-/// ships with the bootstrap; application packs register alongside it.
-type ApiPackFn = Box<dyn Fn(RouteInput) -> Result<Router, BootstrapError> + Send + Sync>;
+/// prefix. The closure receives the endpoint's config (its `settings`
+/// node verbatim, plus the typed `viewer` policy) alongside the shared
+/// assembly input. The built-in `"crud"` pack (backed by
+/// `rushwind-storage-axum`) ships with the bootstrap; application packs
+/// register alongside it.
+type ApiPackFn =
+    Box<dyn Fn(&StorageEndpointConfig, RouteInput) -> Result<Router, BootstrapError> + Send + Sync>;
 
 /// The server-factory closure type, for kinds beyond the built-in
 /// `http` and `cron` (ws, quic, webtransport, h3, mqtt glue registers
@@ -520,12 +538,19 @@ impl Bootstrap {
     }
 
     /// Registers a named storage-endpoint api pack, mountable from
-    /// `storage_endpoints[].api`. The built-in `"crud"` pack serves the
-    /// storage line's HTTP edge; application packs override it by
-    /// registering the same name.
+    /// `storage_endpoints[].api`. The closure receives the endpoint's
+    /// config — its `settings` node verbatim and the typed `viewer`
+    /// policy — alongside the shared assembly input. The built-in
+    /// `"crud"` pack serves the storage line's HTTP edge; application
+    /// packs override it by registering the same name (the usual shape:
+    /// a [`CrudApi`] whose viewer policy derives from the request's
+    /// authenticated claims).
     pub fn api_pack<F>(mut self, name: impl Into<String>, pack: F) -> Self
     where
-        F: Fn(RouteInput) -> Result<Router, BootstrapError> + Send + Sync + 'static,
+        F: Fn(&StorageEndpointConfig, RouteInput) -> Result<Router, BootstrapError>
+            + Send
+            + Sync
+            + 'static,
     {
         self.api_packs.insert(name.into(), Box::new(pack));
         self
@@ -934,7 +959,7 @@ impl Bootstrap {
                 .api_packs
                 .get(&endpoint_config.api)
                 .ok_or_else(|| BootstrapError::UnknownApiPack(endpoint_config.api.clone()))?;
-            let mut edge_router = pack(input.clone())?;
+            let mut edge_router = pack(endpoint_config, input.clone())?;
             edge_router = apply_guards(
                 edge_router,
                 &input,
@@ -1174,11 +1199,30 @@ fn random_instance_id() -> String {
 /// The built-in `"crud"` api pack: the storage line's HTTP edge
 /// (`rushwind-storage-axum`'s [`CrudApi`]) bound to the configured
 /// repository. Expects the schema's column fields as JSON in and out.
-fn crud_api_pack(input: RouteInput) -> Result<Router, BootstrapError> {
+///
+/// The edge runs the endpoint's `viewer` policy: `viewer: all` is the
+/// explicit all-access opt-in (`CrudApi::with_viewer` answering every
+/// request with [`Viewer::all`]); an absent policy keeps the axum
+/// layer's deny default — every request sees nothing, and tenant-scoped
+/// tables reject outright. The deny default replaced the old
+/// all-access-for-everyone behavior (audit H2); a real deployment
+/// overrides this pack with one that derives the viewer from the
+/// request's authenticated claims.
+fn crud_api_pack(
+    endpoint: &StorageEndpointConfig,
+    input: RouteInput,
+) -> Result<Router, BootstrapError> {
     let repo = input.repository.ok_or_else(|| {
         BootstrapError::Failed("crud api pack requires a configured storage".to_string())
     })?;
-    Ok(CrudApi::new(repo).router())
+    let mut api = CrudApi::new(repo);
+    api = match endpoint.viewer {
+        Some(ViewerPolicy::All) => api.with_viewer(Arc::new(|_headers| Viewer::all())),
+        // Absent: the deny default. No policy is mounted, so every
+        // request runs Viewer::default — fail closed.
+        None => api,
+    };
+    Ok(api.router())
 }
 
 /// Applies the configured per-subtree security wraps to one router: the

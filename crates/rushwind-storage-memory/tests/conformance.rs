@@ -13,4 +13,12 @@ async fn fresh_repo() -> Arc<dyn Repository> {
     )
 }
 
-rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo);
+/// A fresh, empty tenant-scoped table for the tenancy suite.
+async fn fresh_tenant_repo() -> Arc<dyn Repository> {
+    Arc::new(
+        MemoryRepo::new(rushwind_testkit::storage_conformance::tenant_suite_schema())
+            .expect("tenant suite schema is valid"),
+    )
+}
+
+rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant: crate::fresh_tenant_repo);

@@ -1,11 +1,12 @@
 //! HTTP end to end over the in-memory engine: CRUD routes, the full
-//! list-query vocabulary, error mapping, and the viewer hook.
+//! list-query vocabulary, error mapping, the viewer hook, the deny
+//! default of an unmounted policy, and the tenancy-payload guard.
 
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use rushwind_storage::{ColumnKind, QueryCtx, Repository, Schema, Viewer};
+use rushwind_storage::{ColumnKind, QueryCtx, Record, Repository, Schema, Viewer};
 use rushwind_storage_axum::CrudApi;
 use rushwind_storage_memory::MemoryRepo;
 use serde_json::{json, Value};
@@ -22,9 +23,25 @@ fn schema() -> Schema {
         .expect("schema is valid")
 }
 
+/// The tenant-scoped twin of [`schema`]: the conventional tenant column,
+/// declared as the schema's tenant column.
+fn tenant_schema() -> Schema {
+    Schema::builder("widgets", "id")
+        .column("name", ColumnKind::Text)
+        .column("owner_id", ColumnKind::Int)
+        .column("tenant_id", ColumnKind::Int)
+        .tenant_column("tenant_id")
+        .build()
+        .expect("schema is valid")
+}
+
 fn app() -> axum::Router {
     let repo = MemoryRepo::new(schema()).expect("schema is valid");
-    CrudApi::new(Arc::new(repo)).router()
+    // All-access is an explicit opt-in since the fail-closed flip: the
+    // deny default would 404 every read these tests exercise.
+    CrudApi::new(Arc::new(repo))
+        .with_viewer(Arc::new(|_headers| Viewer::all()))
+        .router()
 }
 
 async fn send_json(
@@ -307,6 +324,189 @@ async fn viewer_hook_scopes_every_request() {
         page["items"][0]["name"], "owned-by-2",
         "a scoped viewer sees only its own rows at the HTTP edge"
     );
+}
+
+/// The fail-closed default (audit H2): a CrudApi with no viewer policy
+/// denies reads — nothing is listed, every row reads as missing.
+#[tokio::test]
+async fn no_viewer_policy_denies_reads() {
+    let repo = MemoryRepo::new(schema()).expect("schema is valid");
+    repo.create(
+        QueryCtx::all_access(),
+        rushwind_testkit::storage_conformance::widget("seeded", 1, None, 1, 1).set("id", 1),
+    )
+    .await
+    .expect("seed lands");
+    let app = CrudApi::new(Arc::new(repo)).router();
+
+    let (status, page) = send(&app, "GET", "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        page["total"], 0,
+        "no policy, no visibility: the deny default lists nothing"
+    );
+    let (status, _) = send(&app, "GET", "/1").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the deny default hides every row"
+    );
+}
+
+/// On a tenant-scoped table the deny default errors instead of just
+/// coming back empty — the engine's MissingViewer fail-closed verdict,
+/// mapped to a 400 (a malformed request, not a server fault, and not a
+/// 401/403 that would collide with authn/authz semantics).
+#[tokio::test]
+async fn missing_viewer_on_a_tenant_table_is_a_bad_request() {
+    let repo = MemoryRepo::new(tenant_schema()).expect("schema is valid");
+    repo.create(
+        QueryCtx::all_access(),
+        Record::new()
+            .set("name", "t5")
+            .set("owner_id", 1)
+            .set("tenant_id", 5)
+            .set("id", 1),
+    )
+    .await
+    .expect("seed lands");
+    let app = CrudApi::new(Arc::new(repo)).router();
+
+    let (status, body) = send(&app, "GET", "/").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error text")
+            .contains("viewer"),
+        "the MissingViewer verdict rides the error envelope: {body}"
+    );
+}
+
+/// The tenancy-payload guard (audit H3): a tenant viewer forging another
+/// actor's `owner_id` gets a clean 400 before the engine would silently
+/// stamp over it; its own actor id passes.
+#[tokio::test]
+async fn forged_owner_payloads_are_rejected() {
+    let repo = MemoryRepo::new(schema()).expect("schema is valid");
+    let app = CrudApi::new(Arc::new(repo))
+        .with_viewer(Arc::new(|_headers| Viewer::tenant_user(5, 1)))
+        .router();
+
+    let (status, body) =
+        send_json(&app, "POST", "/", json!({"name": "forged", "owner_id": 2})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error text")
+            .contains("owner_id"),
+        "the rejection names the forged column: {body}"
+    );
+
+    let (status, stored) =
+        send_json(&app, "POST", "/", json!({"name": "mine", "owner_id": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "the viewer's own id passes");
+    let id = stored["id"].as_i64().expect("id");
+
+    // And the boundary holds on patches too:
+    let (status, _) = send_json(&app, "PATCH", &format!("/{id}"), json!({"owner_id": 3})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// The guard's unit half: a unit-scoped viewer may address its own
+/// `unit_id` and nothing else.
+#[tokio::test]
+async fn forged_unit_payloads_are_rejected() {
+    let repo = MemoryRepo::new(schema()).expect("schema is valid");
+    let app = CrudApi::new(Arc::new(repo))
+        .with_viewer(Arc::new(|_headers| Viewer::unit(10)))
+        .router();
+
+    let (status, body) =
+        send_json(&app, "POST", "/", json!({"name": "forged", "unit_id": 20})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error text")
+            .contains("unit_id"),
+        "the rejection names the forged column: {body}"
+    );
+
+    let (status, _) = send_json(&app, "POST", "/", json!({"name": "kept", "unit_id": 10})).await;
+    assert_eq!(status, StatusCode::CREATED, "the viewer's own unit passes");
+}
+
+/// The guard's tenant half: a tenant viewer forging the tenant column is
+/// rejected at create, patch, and upsert — the row cannot migrate.
+#[tokio::test]
+async fn tenant_forgery_is_rejected_at_create_patch_and_upsert() {
+    let repo = MemoryRepo::new(tenant_schema()).expect("schema is valid");
+    let app = CrudApi::new(Arc::new(repo))
+        .with_viewer(Arc::new(|_headers| Viewer::tenant(5)))
+        .router();
+
+    let (status, body) =
+        send_json(&app, "POST", "/", json!({"name": "forge", "tenant_id": 6})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error text")
+            .contains("tenant_id"),
+        "the rejection names the forged column: {body}"
+    );
+
+    let (status, stored) =
+        send_json(&app, "POST", "/", json!({"name": "kept", "tenant_id": 5})).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the viewer's own tenant passes"
+    );
+    assert_eq!(stored["tenant_id"], 5);
+    let id = stored["id"].as_i64().expect("id");
+
+    let (status, _) = send_json(&app, "PATCH", &format!("/{id}"), json!({"tenant_id": 6})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send_json(
+        &app,
+        "PUT",
+        &format!("/{id}"),
+        json!({"name": "v2", "tenant_id": 6}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The row never migrated:
+    let (status, row) = send(&app, "GET", &format!("/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row["tenant_id"], 5, "the forged migrations never landed");
+}
+
+/// Platform viewers bypass the guard: they administer every row of every
+/// tenant, addressing owners, units, and tenants explicitly.
+#[tokio::test]
+async fn platform_viewers_bypass_the_payload_guard() {
+    let repo = MemoryRepo::new(tenant_schema()).expect("schema is valid");
+    let app = CrudApi::new(Arc::new(repo))
+        .with_viewer(Arc::new(|_headers| Viewer::all()))
+        .router();
+
+    let (status, stored) = send_json(
+        &app,
+        "POST",
+        "/",
+        json!({"name": "administered", "owner_id": 99, "tenant_id": 7}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "platform may write any row: {stored}"
+    );
+    assert_eq!(stored["tenant_id"], 7, "the explicit tenant survives");
 }
 
 /// Counts create events — the audit sink wired through the HTTP layer.

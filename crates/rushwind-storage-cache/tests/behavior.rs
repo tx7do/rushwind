@@ -309,6 +309,49 @@ async fn different_viewers_never_share_entries() {
 }
 
 #[tokio::test]
+async fn different_tenants_never_share_entries() {
+    // Same data range, same actor — different tenant ids. The tenant axis
+    // is part of the scope key, so the two viewers keep separate cache
+    // namespaces; folding them together would hand one tenant's cached
+    // rows to the other.
+    let inner = Arc::new(CountingInner::new(None));
+    let id = inner.seed("tenanted").await;
+    let cache = cache_over(Arc::clone(&inner));
+
+    let tenant_five = QueryCtx::new(rushwind_storage::Viewer::tenant(5));
+    let tenant_six = QueryCtx::new(rushwind_storage::Viewer::tenant(6));
+
+    let five = cache
+        .get(tenant_five.clone(), Value::Int(id))
+        .await
+        .expect("get succeeds")
+        .expect("an unscoped table shows the row to every tenant viewer");
+    assert_eq!(five.get("name").and_then(Value::as_str), Some("tenanted"));
+    let six = cache
+        .get(tenant_six.clone(), Value::Int(id))
+        .await
+        .expect("get succeeds")
+        .expect("tenant 6 must not inherit tenant 5's cache entry");
+    assert_eq!(six.get("name").and_then(Value::as_str), Some("tenanted"));
+    assert_eq!(
+        inner.get_count(),
+        2,
+        "each tenant id is its own cache namespace"
+    );
+
+    // And the same tenant still hits:
+    cache
+        .get(tenant_five, Value::Int(id))
+        .await
+        .expect("get succeeds");
+    cache
+        .get(tenant_six, Value::Int(id))
+        .await
+        .expect("get succeeds");
+    assert_eq!(inner.get_count(), 2);
+}
+
+#[tokio::test]
 async fn deletes_invalidate_too() {
     let inner = Arc::new(CountingInner::new(None));
     let id = inner.seed("gone").await;

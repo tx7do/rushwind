@@ -5,8 +5,13 @@
 //! anchored regex; the case-insensitive derived family sets the `i` flag)
 //! and is unit-tested entirely offline. This module is the thin collection
 //! glue: find/count/insert/update/delete against
-//! `Collection<Document>`, viewer scopes conjoined into every filter,
-//! token cursors as `{pk: {$gt: last}}` with a one-document peek.
+//! `Collection<Document>`, viewer scope and tenant predicates conjoined
+//! into every filter, token cursors as `{pk: {$gt: last}}` with a
+//! one-document peek. Tenancy follows the in-memory reference engine:
+//! every path filters on the schema's tenant column, tenant writes are
+//! force-stamped, and the upsert probes through the scoped read path so
+//! an occupied-but-invisible primary key conflicts instead of being
+//! silently overwritten.
 //!
 //! Two MongoDB-specific caveats, both deliberate:
 //!
@@ -14,7 +19,8 @@
 //!   store has no rowid alias. Contention on concurrent creates is
 //!   arbitrated by MongoDB's unique-index errors, surfaced as
 //!   [`StorageError::Conflict`]; give the primary key a unique index
-//!   (a production deployment has one) and this is sound.
+//!   (a production deployment has one — [`MongoRepo::ensure_primary_index`])
+//!   and this is sound. The upsert insert face leans on the same index.
 //! - **`batch_create` atomicity** needs replica-set transactions; without
 //!   one, `insert_many` is a single command but not strictly all-or-nothing.
 //!   The live suite documents the difference by running against a
@@ -25,18 +31,75 @@
 
 pub mod translate;
 
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{doc, Bson, Document};
 use mongodb::Collection;
 
 use rushwind_storage::{
     AuditAction, AuditEntry, FieldMask, FilterExpr, ListQuery, Page, Paging, QueryCtx, Record,
-    RepoFuture, Repository, Schema, Scope, StorageError, Value, Viewer,
+    RepoFuture, Repository, Schema, Scope, StorageError, TenancyDecision, Value, Viewer,
 };
 
 /// A [`Repository`] backed by one MongoDB collection.
 pub struct MongoRepo {
     schema: Schema,
     collection: Collection<Document>,
+}
+
+/// The tenant axis resolved for one operation: the schema's tenant column
+/// plus the viewer's [`TenancyDecision`] against it.
+///
+/// Mirrors the in-memory reference engine's `TenantRule`: resolution is
+/// fail-closed — a tenant-scoped table queried by an unidentified viewer
+/// errors with [`StorageError::MissingViewer`] from *every* repository
+/// path, before any storage round trip.
+#[derive(Clone, Debug)]
+enum TenantRule {
+    /// No tenant predicate anywhere: the table declares no tenant column,
+    /// or the viewer is platform/system.
+    Pass,
+    /// Conjoin `column = id` on every path and force-stamp writes with id.
+    Enforce { column: String, id: i64 },
+}
+
+impl TenantRule {
+    /// Resolves the schema's tenant column against the viewer.
+    fn resolve(schema: &Schema, ctx: &QueryCtx) -> Result<Self, StorageError> {
+        Ok(
+            match ctx
+                .viewer
+                .tenant_decision(schema.tenant_column.as_deref())?
+            {
+                TenancyDecision::Unscoped | TenancyDecision::Pass => TenantRule::Pass,
+                TenancyDecision::Enforce(id) => TenantRule::Enforce {
+                    // Enforce only arises when the schema declares the
+                    // column; the fallback keeps the conventional name so
+                    // the stamp cannot silently miss.
+                    column: schema
+                        .tenant_column
+                        .clone()
+                        .unwrap_or_else(|| Viewer::TENANT_COLUMN.to_owned()),
+                    id,
+                },
+            },
+        )
+    }
+
+    /// The predicate document to conjoin with every query's filter, if any.
+    fn predicate(&self) -> Option<Document> {
+        match self {
+            TenantRule::Pass => None,
+            TenantRule::Enforce { column, id } => Some(doc! { column.as_str(): Bson::Int64(*id) }),
+        }
+    }
+
+    /// Force-stamps the tenant column when the viewer is a tenant business
+    /// viewer — a tenant actor cannot address another tenant by writing the
+    /// column itself. Platform and unscoped writes keep the payload value.
+    fn stamp(&self, row: &mut Record) {
+        if let TenantRule::Enforce { column, id } = self {
+            row.insert(column.as_str(), Value::Int(*id));
+        }
+    }
 }
 
 impl MongoRepo {
@@ -108,14 +171,44 @@ impl MongoRepo {
         )
     }
 
-    /// The full predicate for a read: viewer scope conjoined with the
-    /// query's filter, plus the token cursor when paging.
-    fn read_filter(&self, scope: &ScopeDoc, query: &ListQuery) -> Result<Document, StorageError> {
+    /// The predicate for a point operation on one primary key: the key
+    /// itself, conjoined with the viewer's scope predicate and the tenant
+    /// predicate. Callers short-circuit [`ScopeDoc::Deny`] before building
+    /// a filter — a denied viewer never reaches the store at all.
+    fn target_filter(&self, id: i64, scope: &ScopeDoc, tenant: &TenantRule) -> Document {
+        let mut parts = vec![doc! { &self.schema.primary_key: id }];
+        if let ScopeDoc::Pass(scope_doc) = scope {
+            if !scope_doc.is_empty() {
+                parts.push(scope_doc.clone());
+            }
+        }
+        if let Some(predicate) = tenant.predicate() {
+            parts.push(predicate);
+        }
+        match parts.len() {
+            // The primary key alone — kept a bare equality so the pk index
+            // serves the point lookup.
+            1 => parts.pop().expect("the pk predicate is always present"),
+            _ => doc! { "$and": parts },
+        }
+    }
+
+    /// The full predicate for a read: viewer scope and the tenant predicate
+    /// conjoined with the query's filter, plus the token cursor when paging.
+    fn read_filter(
+        &self,
+        scope: &ScopeDoc,
+        tenant: &TenantRule,
+        query: &ListQuery,
+    ) -> Result<Document, StorageError> {
         let mut parts: Vec<Document> = Vec::new();
         if let ScopeDoc::Pass(scope) = scope {
             if !scope.is_empty() {
                 parts.push(scope.clone());
             }
+        }
+        if let Some(predicate) = tenant.predicate() {
+            parts.push(predicate);
         }
         if let Some(filter) = &query.filter {
             parts.push(translate::node_to_doc(filter.node())?);
@@ -215,16 +308,16 @@ impl MongoRepo {
 
     async fn get_async(&self, ctx: &QueryCtx, id: Value) -> Result<Option<Record>, StorageError> {
         let id = self.expect_id(&id)?;
+        // The tenant rule resolves before the denial check: an unidentified
+        // viewer on a tenant-scoped table fails closed even when its range
+        // would have denied anyway — the error is the contract, not an
+        // empty result.
+        let tenant = TenantRule::resolve(&self.schema, ctx)?;
         let scope = self.scope_doc(ctx)?;
         if matches!(scope, ScopeDoc::Deny) {
             return Ok(None);
         }
-        let mut filter = doc! { &self.schema.primary_key: id };
-        if let ScopeDoc::Pass(scope) = &scope {
-            if !scope.is_empty() {
-                filter = doc! { "$and": [filter, scope.clone()] };
-            }
-        }
+        let filter = self.target_filter(id, &scope, &tenant);
         let document = self
             .collection
             .find_one(filter)
@@ -242,6 +335,9 @@ impl MongoRepo {
         query: &ListQuery,
     ) -> Result<Page<Record>, StorageError> {
         query.validate(&self.schema)?;
+        // Tenant first, like the reference engine: the fail-closed error
+        // beats the denial short-circuit.
+        let tenant = TenantRule::resolve(&self.schema, ctx)?;
         let scope = self.scope_doc(ctx)?;
         if matches!(scope, ScopeDoc::Deny) {
             return Ok(Page {
@@ -250,7 +346,7 @@ impl MongoRepo {
                 next_token: None,
             });
         }
-        let filter = self.read_filter(&scope, query)?;
+        let filter = self.read_filter(&scope, &tenant, query)?;
         let pk = self.schema.primary_key.clone();
 
         let total = self
@@ -323,12 +419,14 @@ impl MongoRepo {
         if let Some(filter) = &filter {
             filter.validate(&self.schema)?;
         }
+        let tenant = TenantRule::resolve(&self.schema, ctx)?;
         let scope = self.scope_doc(ctx)?;
         if matches!(scope, ScopeDoc::Deny) {
             return Ok(0);
         }
         let filter = self.read_filter(
             &scope,
+            &tenant,
             &ListQuery {
                 filter,
                 ..ListQuery::default()
@@ -342,6 +440,11 @@ impl MongoRepo {
 
     async fn create_async(&self, ctx: &QueryCtx, row: Record) -> Result<Record, StorageError> {
         self.validate_row(&row)?;
+        let tenant = TenantRule::resolve(&self.schema, ctx)?;
+        // The payload rides the stamp: a tenant actor cannot address another
+        // tenant by writing the column itself.
+        let mut row = row;
+        tenant.stamp(&mut row);
         let pk = self.schema.primary_key.clone();
         let id = match row.get(pk.as_str()) {
             Some(Value::Int(existing)) if *existing > 0 => *existing,
@@ -361,8 +464,13 @@ impl MongoRepo {
         ctx: &QueryCtx,
         rows: Vec<Record>,
     ) -> Result<Vec<Record>, StorageError> {
-        for row in &rows {
+        // The tenant rule resolves up front, like the reference engine, and
+        // every row of the batch rides the stamp.
+        let tenant = TenantRule::resolve(&self.schema, ctx)?;
+        let mut rows = rows;
+        for row in &mut rows {
             self.validate_row(row)?;
+            tenant.stamp(row);
         }
         let pk = self.schema.primary_key.clone();
         let next_id = self.next_id().await?;
@@ -459,16 +567,18 @@ impl MongoRepo {
                 ));
             }
         }
+        // The tenant rule resolves before the denial check — an unidentified
+        // viewer fails closed even when its range would deny anyway — and the
+        // patch rides the stamp: applied after the patch, so a tenant actor
+        // cannot migrate the row into another tenant through it.
+        let tenant = TenantRule::resolve(&self.schema, ctx)?;
+        let mut patch = patch;
+        tenant.stamp(&mut patch);
         let scope = self.scope_doc(ctx)?;
         if matches!(scope, ScopeDoc::Deny) {
             return Err(StorageError::NotFound);
         }
-        let mut filter = doc! { &pk: id };
-        if let ScopeDoc::Pass(scope_doc) = &scope {
-            if !scope_doc.is_empty() {
-                filter = doc! { "$and": [filter, scope_doc.clone()] };
-            }
-        }
+        let filter = self.target_filter(id, &scope, &tenant);
         let mut sets = Document::new();
         for column in &self.schema.columns {
             if let Some(value) = patch.get(&column.name) {
@@ -510,36 +620,69 @@ impl MongoRepo {
                 ))
             }
         };
-        let document = self.materialize(&row, id)?;
-        let filter = doc! { &pk: id };
-        let replaced = self
-            .collection
-            .find_one_and_replace(filter, document)
-            .upsert(true)
-            .return_document(mongodb::options::ReturnDocument::After)
-            .await
-            .map_err(|e| self.map_err(e))?;
-        let Some(document) = replaced else {
-            return Err(StorageError::Backend("upsert produced no document".into()));
-        };
-        let stored = self.document_to_record(&document)?;
-        self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
-        Ok(stored)
+        let tenant = TenantRule::resolve(&self.schema, ctx)?;
+        // Both faces ride the stamp: a tenant actor can neither create into
+        // another tenant nor migrate a row into one through the payload.
+        let mut row = row;
+        tenant.stamp(&mut row);
+        // The probe decides the face through the scoped read path (get conjoins
+        // scope and tenant): only a row *visible in this viewer's scope and
+        // tenant* authorizes the update face. Anything else is
+        // indistinguishable from an absent row, and the insert face turns an
+        // occupied primary key into a Conflict instead of a silent overwrite —
+        // the cross-tenant corruption a pk-only `upsert` filter here allowed.
+        match self.get_async(ctx, Value::Int(id)).await? {
+            Some(_) => {
+                // Update face: a scoped replace — the filter side carries the
+                // primary key, the scope and the tenant, and never upserts.
+                // Wholesale replacement of the matched document is this
+                // engine's pinned upsert shape (the materialized payload is
+                // the stored document).
+                let document = self.materialize(&row, id)?;
+                let scope = self.scope_doc(ctx)?;
+                let filter = self.target_filter(id, &scope, &tenant);
+                let replaced = self
+                    .collection
+                    .find_one_and_replace(filter, document)
+                    .return_document(mongodb::options::ReturnDocument::After)
+                    .await
+                    .map_err(|e| self.map_err(e))?;
+                let Some(document) = replaced else {
+                    // The row left the scope between probe and write.
+                    return Err(StorageError::NotFound);
+                };
+                let stored = self.document_to_record(&document)?;
+                self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
+                Ok(stored)
+            }
+            None => {
+                // Insert face: absent **or** invisible. A plain insert onto
+                // the production unique primary-key index
+                // ([`MongoRepo::ensure_primary_index`]) — the driver's
+                // duplicate-key error maps to [`StorageError::Conflict`], so
+                // an invisible occupant surfaces as a conflict, never an
+                // overwrite. The return value is the stamped row just
+                // written: a scoped read-back would only repeat the probe,
+                // and an unscoped one would leak past the viewer's scope.
+                let document = self.materialize(&row, id)?;
+                self.collection
+                    .insert_one(document)
+                    .await
+                    .map_err(|e| self.map_err(e))?;
+                self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
+                Ok(self.materialized_record(&row, id))
+            }
+        }
     }
 
     async fn delete_async(&self, ctx: &QueryCtx, id: Value) -> Result<(), StorageError> {
         let id = self.expect_id(&id)?;
+        let tenant = TenantRule::resolve(&self.schema, ctx)?;
         let scope = self.scope_doc(ctx)?;
         if matches!(scope, ScopeDoc::Deny) {
             return Err(StorageError::NotFound);
         }
-        let pk = self.schema.primary_key.clone();
-        let mut filter = doc! { &pk: id };
-        if let ScopeDoc::Pass(scope_doc) = &scope {
-            if !scope_doc.is_empty() {
-                filter = doc! { "$and": [filter, scope_doc.clone()] };
-            }
-        }
+        let filter = self.target_filter(id, &scope, &tenant);
         let result = self
             .collection
             .delete_one(filter)

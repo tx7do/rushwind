@@ -15,6 +15,12 @@
 //!   and page in memory. Semantics are identical to the other engines;
 //!   throughput is bounded by the partition — which is exactly how
 //!   Cassandra wants you to model data anyway.
+//! - The tenant axis rides the same client-side style: the tenant
+//!   predicate (like the viewer-scope predicates) is evaluated on the
+//!   fetched rows, pk-direct writes probe through the scoped read first,
+//!   and the ambiguous faces fall back to LWT (`INSERT ... IF NOT
+//!   EXISTS`) so a cross-tenant collision conflicts instead of
+//!   overwriting.
 //! - Writes are native: INSERT is a natural upsert, `BEGIN BATCH` makes
 //!   `batch_create` atomic, DELETE is a tombstone write.
 //!
@@ -37,7 +43,7 @@ use scylla::client::session_builder::SessionBuilder;
 
 use rushwind_storage::{
     AuditAction, AuditEntry, FieldMask, FilterExpr, ListQuery, Page, Paging, QueryCtx, Record,
-    RepoFuture, Repository, Schema, StorageError, Value, Viewer,
+    RepoFuture, Repository, Schema, StorageError, TenancyDecision, Value, Viewer,
 };
 
 /// The partition-key bucket value every row lives under.
@@ -48,6 +54,38 @@ pub struct CassandraRepo {
     schema: Schema,
     session: Session,
     keyspace: String,
+}
+
+/// The tenant predicate resolved for one operation: the schema's tenant
+/// column plus the viewer's [`TenancyDecision`] against it.
+#[derive(Clone, Debug)]
+struct TenantRule {
+    column: String,
+    decision: TenancyDecision,
+}
+
+impl TenantRule {
+    /// The predicate as a row test: `Enforce(id)` admits only rows whose
+    /// tenant column carries exactly `id` — a tenant-scoped row with no
+    /// tenant value is nobody's. Cassandra has no ad-hoc WHERE over a
+    /// non-key column, so — exactly like the DataRange scope — the tenant
+    /// predicate is evaluated client-side on the fetched bucket.
+    fn matches(&self, row: &Record) -> bool {
+        match self.decision {
+            TenancyDecision::Unscoped | TenancyDecision::Pass => true,
+            TenancyDecision::Enforce(id) => row.get(&self.column) == Some(&Value::Int(id)),
+        }
+    }
+
+    /// Force-stamps the tenant column when the viewer is a tenant business
+    /// viewer — a tenant actor cannot address another tenant by writing the
+    /// column itself. Platform and unscoped tables keep the payload's own
+    /// value.
+    fn stamp(&self, row: &mut Record) {
+        if let TenancyDecision::Enforce(id) = self.decision {
+            row.insert(&self.column, Value::Int(id));
+        }
+    }
 }
 
 impl CassandraRepo {
@@ -253,6 +291,43 @@ impl CassandraRepo {
             .ok_or_else(|| StorageError::InvalidQuery("the primary key must be an integer".into()))
     }
 
+    /// The tenant-axis rule for this table — the schema's tenant column
+    /// resolved against the viewer, once per operation. Fails closed
+    /// ([`StorageError::MissingViewer`]) when a tenant-scoped table is
+    /// queried by a viewer without tenancy; every path resolves it before
+    /// any store access, so an unidentified viewer cannot even probe the
+    /// bucket.
+    fn tenant_rule(&self, ctx: &QueryCtx) -> Result<TenantRule, StorageError> {
+        let column = self
+            .schema
+            .tenant_column
+            .clone()
+            .unwrap_or_else(|| Viewer::TENANT_COLUMN.to_owned());
+        let decision = ctx
+            .viewer
+            .tenant_decision(self.schema.tenant_column.as_deref())?;
+        Ok(TenantRule { column, decision })
+    }
+
+    /// Whether a conditional write's result reports `[applied] = true`. The
+    /// LWT verdict rides in the result rows; a result body that fails to
+    /// parse is treated as applied — the write itself still succeeded, and
+    /// only a definite `false` proves a lost condition (matching the create
+    /// path's tolerance).
+    fn lwt_applied(&self, result: scylla::response::query_result::QueryResult) -> bool {
+        result
+            .into_rows_result()
+            .ok()
+            .and_then(|rows| {
+                rows.rows::<(Option<bool>,)>().ok().and_then(|mut rows| {
+                    rows.next()
+                        .and_then(|row| row.ok())
+                        .and_then(|(applied,)| applied)
+                })
+            })
+            .unwrap_or(true)
+    }
+
     /// The insert CQL for a materialized row. `only_if_absent` turns it
     /// into an LWT (`IF NOT EXISTS`).
     fn insert_cql(&self, row: &Record, only_if_absent: bool) -> String {
@@ -275,13 +350,19 @@ impl CassandraRepo {
 
     async fn get_async(&self, ctx: &QueryCtx, id: Value) -> Result<Option<Record>, StorageError> {
         let id = self.expect_id(&id)?;
+        let tenant = self.tenant_rule(ctx)?;
         let rows = self.fetch_bucket().await?;
         let row = rows
             .into_iter()
             .find(|row| row.get(&self.schema.primary_key).and_then(Value::as_i64) == Some(id));
         match row {
             Some(row) => {
-                // The viewer boundary applies to point reads too.
+                // The tenant and viewer boundaries apply to point reads
+                // too; a foreign tenant's row reads exactly like a missing
+                // one.
+                if !tenant.matches(&row) {
+                    return Ok(None);
+                }
                 match ctx.viewer.scope(Viewer::OWNER_COLUMN, Viewer::UNIT_COLUMN) {
                     rushwind_storage::Scope::Deny => Ok(None),
                     rushwind_storage::Scope::Unrestricted => Ok(Some(row)),
@@ -302,6 +383,8 @@ impl CassandraRepo {
         query: &ListQuery,
     ) -> Result<Page<Record>, StorageError> {
         query.validate(&self.schema)?;
+        // The tenant axis resolves before anything touches the store.
+        let tenant = self.tenant_rule(ctx)?;
         // Denied scope: empty without touching the store.
         if matches!(
             ctx.viewer.scope(Viewer::OWNER_COLUMN, Viewer::UNIT_COLUMN),
@@ -315,8 +398,12 @@ impl CassandraRepo {
         }
         let mut rows = self.fetch_bucket().await?;
 
-        // Viewer scope + query filter, evaluated by the contract.
+        // Tenant predicate + viewer scope + query filter, evaluated by the
+        // contract.
         rows.retain(|row| {
+            if !tenant.matches(row) {
+                return false;
+            }
             let in_scope = match ctx.viewer.scope(Viewer::OWNER_COLUMN, Viewer::UNIT_COLUMN) {
                 rushwind_storage::Scope::Deny => false,
                 rushwind_storage::Scope::Unrestricted => true,
@@ -429,8 +516,12 @@ impl CassandraRepo {
         if let Some(filter) = &filter {
             filter.validate(&self.schema)?;
         }
+        let tenant = self.tenant_rule(ctx)?;
         let mut rows = self.fetch_bucket().await?;
         rows.retain(|row| {
+            if !tenant.matches(row) {
+                return false;
+            }
             let in_scope = match ctx.viewer.scope(Viewer::OWNER_COLUMN, Viewer::UNIT_COLUMN) {
                 rushwind_storage::Scope::Deny => false,
                 rushwind_storage::Scope::Unrestricted => true,
@@ -458,29 +549,22 @@ impl CassandraRepo {
 
     async fn create_async(&self, ctx: &QueryCtx, row: Record) -> Result<Record, StorageError> {
         self.validate_row(&row)?;
+        let tenant = self.tenant_rule(ctx)?;
         let pk = self.schema.primary_key.clone();
         let id = match row.get(pk.as_str()) {
             Some(Value::Int(existing)) if *existing > 0 => {
                 // LWT arbitrates explicit-id races; a lost IF NOT EXISTS is
-                // a conflict.
-                let insert = self.insert_cql(&self.materialize(&row, *existing), true);
+                // a conflict. The stamp rides into the conditional insert,
+                // so a tenant actor's forged tenant column never lands.
+                let mut full = self.materialize(&row, *existing);
+                tenant.stamp(&mut full);
+                let insert = self.insert_cql(&full, true);
                 let result = self
                     .session
                     .query_unpaged(insert, ())
                     .await
                     .map_err(|e| self.map_err(e))?;
-                let applied = result
-                    .into_rows_result()
-                    .ok()
-                    .and_then(|rows| {
-                        rows.rows::<(Option<bool>,)>().ok().and_then(|mut rows| {
-                            rows.next()
-                                .and_then(|row| row.ok())
-                                .and_then(|(applied,)| applied)
-                        })
-                    })
-                    .unwrap_or(true);
-                if !applied {
+                if !self.lwt_applied(result) {
                     return Err(StorageError::Conflict(format!(
                         "primary key {} already exists",
                         existing
@@ -490,7 +574,8 @@ impl CassandraRepo {
             }
             _ => self.next_id().await?,
         };
-        let stored = self.materialize(&row, id);
+        let mut stored = self.materialize(&row, id);
+        tenant.stamp(&mut stored);
         if matches!(row.get(pk.as_str()), Some(Value::Int(existing)) if *existing > 0) {
             // already inserted via the LWT branch
         } else {
@@ -512,6 +597,8 @@ impl CassandraRepo {
         for row in &rows {
             self.validate_row(row)?;
         }
+        // The tenant axis resolves before anything touches the store.
+        let tenant = self.tenant_rule(ctx)?;
         let pk = self.schema.primary_key.clone();
         let mut next_id = self.next_id().await?;
         let mut claimed = std::collections::BTreeSet::new();
@@ -531,8 +618,12 @@ impl CassandraRepo {
                     "primary key {id} repeats within the batch"
                 )));
             }
+            // Every batched insert carries the stamp, so no payload can
+            // land under a foreign tenant's column value.
+            let mut full = self.materialize(row, id);
+            tenant.stamp(&mut full);
             ids.push(id);
-            statements.push(self.insert_cql(&self.materialize(row, id), true));
+            statements.push(self.insert_cql(&full, true));
         }
         // A single logged BATCH is atomic across the cluster.
         let batch_cql = format!(
@@ -579,7 +670,11 @@ impl CassandraRepo {
         let stored = rows
             .into_iter()
             .zip(ids)
-            .map(|(row, id)| self.materialize(&row, id))
+            .map(|(row, id)| {
+                let mut full = self.materialize(&row, id);
+                tenant.stamp(&mut full);
+                full
+            })
             .collect();
         self.audit(ctx, AuditAction::BatchCreate, None);
         Ok(stored)
@@ -592,6 +687,7 @@ impl CassandraRepo {
         patch: Record,
     ) -> Result<Record, StorageError> {
         self.validate_row(&patch)?;
+        let tenant = self.tenant_rule(ctx)?;
         let id = self.expect_id(&id)?;
         let pk = self.schema.primary_key.clone();
         if let Some(new_pk) = patch.get(pk.as_str()) {
@@ -601,8 +697,8 @@ impl CassandraRepo {
                 ));
             }
         }
-        // Probe through the scoped path: out-of-scope rows are NotFound
-        // before anything is written.
+        // Probe through the scoped path: out-of-scope and cross-tenant rows
+        // are NotFound before anything is written.
         let current = self
             .get_async(ctx, Value::Int(id))
             .await?
@@ -615,9 +711,18 @@ impl CassandraRepo {
                 }
             }
         }
+        // The patch rides the tenant stamp: a tenant actor cannot migrate
+        // the row into another tenant by patching the column itself.
+        tenant.stamp(&mut updated);
+        // Under enforcement the tenant column keeps its probed value — the
+        // stamp already pinned it on the returned row, and the SET would
+        // only ever rewrite the same number. Platform viewers may migrate
+        // tenants explicitly, so their patch value goes through untouched.
+        let enforce = matches!(tenant.decision, TenancyDecision::Enforce(_));
         let sets: Vec<String> = patch
             .iter()
             .filter(|(field, _)| *field != pk)
+            .filter(|(field, _)| !(enforce && *field == tenant.column))
             .map(|(field, value)| format!("{} = {}", field, cql::literal(Some(value))))
             .collect();
         if !sets.is_empty() {
@@ -640,6 +745,7 @@ impl CassandraRepo {
 
     async fn upsert_async(&self, ctx: &QueryCtx, row: Record) -> Result<Record, StorageError> {
         self.validate_row(&row)?;
+        let tenant = self.tenant_rule(ctx)?;
         let pk = self.schema.primary_key.clone();
         let id = match row.get(pk.as_str()) {
             Some(Value::Int(existing)) if *existing > 0 => *existing,
@@ -649,19 +755,66 @@ impl CassandraRepo {
                 ))
             }
         };
-        let stored = self.materialize(&row, id);
-        let insert = self.insert_cql(&stored, false);
-        self.session
-            .query_unpaged(insert, ())
-            .await
-            .map_err(|e| self.map_err(e))?;
-        self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
-        Ok(stored)
+        // Scoped probe first — the engine's pk-direct read with its
+        // client-side validation: the update face requires the row to be
+        // visible to this viewer.
+        match self.get_async(ctx, Value::Int(id)).await? {
+            Some(current) => {
+                // Update face: the row is the actor's own. Merge the
+                // payload over it (absent payload fields keep their stored
+                // values) and rewrite the row in place — a plain INSERT is
+                // safe because the pk already belongs to this viewer. The
+                // payload rides the tenant stamp, so a tenant actor cannot
+                // migrate the row into another tenant.
+                let mut updated = current;
+                for (field, value) in row.iter() {
+                    if field != pk {
+                        updated.insert(field, value.clone());
+                    }
+                }
+                tenant.stamp(&mut updated);
+                let insert = self.insert_cql(&updated, false);
+                self.session
+                    .query_unpaged(insert, ())
+                    .await
+                    .map_err(|e| self.map_err(e))?;
+                self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
+                Ok(updated)
+            }
+            None => {
+                // Insert face: the row is absent **or** occupied by a row
+                // this viewer cannot see — a tenant-scoped row with a
+                // foreign tenant value reads exactly like a missing one.
+                // IF NOT EXISTS arbitrates both, because the LWT checks the
+                // primary key rather than visibility: a lost condition
+                // means the pk is occupied by an invisible incumbent, and
+                // that is a Conflict — never a silent overwrite of the
+                // occupant's cells.
+                let mut stored = self.materialize(&row, id);
+                tenant.stamp(&mut stored);
+                let insert = self.insert_cql(&stored, true);
+                let result = self
+                    .session
+                    .query_unpaged(insert, ())
+                    .await
+                    .map_err(|e| self.map_err(e))?;
+                if !self.lwt_applied(result) {
+                    return Err(StorageError::Conflict(format!(
+                        "primary key {id} already exists"
+                    )));
+                }
+                self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
+                Ok(stored)
+            }
+        }
     }
 
     async fn delete_async(&self, ctx: &QueryCtx, id: Value) -> Result<(), StorageError> {
         let id = self.expect_id(&id)?;
-        // Scoped probe first: out-of-scope rows are NotFound.
+        // Fail closed before anything touches the store; the scoped probe
+        // below carries the tenant predicate — out-of-scope and cross-tenant
+        // rows are NotFound.
+        self.tenant_rule(ctx)?;
         self.get_async(ctx, Value::Int(id))
             .await?
             .ok_or(StorageError::NotFound)?;

@@ -8,24 +8,19 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use rushwind_storage::{ColumnKind, Repository, Schema};
+use rushwind_storage::{Repository, Schema};
 use rushwind_storage_elasticsearch::ElasticRepo;
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// A fresh, empty index for every suite test — unique per test so the
-/// parallel suite never shares rows.
-async fn fresh_repo() -> Arc<dyn Repository> {
+/// parallel suite never shares rows. The table rename keeps the two suite
+/// schemas (plain and tenant-scoped) on separate indices, same as the
+/// per-test counter keeps tests apart.
+async fn fresh_repo_with(schema: Schema) -> Arc<dyn Repository> {
     let url = std::env::var("ELASTICSEARCH_URL")
         .expect("ELASTICSEARCH_URL must point at a running Elasticsearch");
-    let mut schema = Schema::builder("widgets", "id")
-        .column("name", ColumnKind::Text)
-        .column("age", ColumnKind::Int)
-        .column("score", ColumnKind::Real)
-        .column("owner_id", ColumnKind::Int)
-        .column("unit_id", ColumnKind::Int)
-        .build()
-        .expect("suite schema is valid");
+    let mut schema = schema;
     schema.table = format!("widgets_live_{}", SEQ.fetch_add(1, Ordering::Relaxed));
 
     let repo = ElasticRepo::new(url, schema);
@@ -54,4 +49,14 @@ async fn fresh_repo() -> Arc<dyn Repository> {
     Arc::new(repo)
 }
 
-rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo);
+/// A fresh, empty index bound to the plain suite schema.
+async fn fresh_repo() -> Arc<dyn Repository> {
+    fresh_repo_with(rushwind_testkit::storage_conformance::suite_schema()).await
+}
+
+/// A fresh, empty tenant-scoped index for the tenancy suite.
+async fn fresh_tenant_repo() -> Arc<dyn Repository> {
+    fresh_repo_with(rushwind_testkit::storage_conformance::tenant_suite_schema()).await
+}
+
+rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant: crate::fresh_tenant_repo);

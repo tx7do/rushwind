@@ -265,6 +265,12 @@ impl From<StorageError> for HttpError {
         // it lands on 501 rather than 500.
         match &error {
             StorageError::NotFound => Self::not_found("NOT_FOUND", error.to_string()),
+            StorageError::MissingViewer => {
+                // Tenancy enforcement failed closed: the request carried no
+                // viewer identity against a tenant-scoped table — a caller
+                // misconfiguration, a 4xx and never a 5xx.
+                Self::bad_request("MISSING_VIEWER", error.to_string())
+            }
             StorageError::InvalidQuery(detail) => {
                 Self::bad_request(REASON_INVALID_QUERY, format!("invalid query: {detail}"))
             }

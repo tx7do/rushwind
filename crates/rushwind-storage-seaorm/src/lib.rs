@@ -8,30 +8,31 @@
 //!
 //! Filter trees translate to `sea_query::Condition`s (nested `All`/`Any`
 //! groups become nested `AND`/`OR`); the three paging strategies translate
-//! to `LIMIT/OFFSET` or an id-greater-than cursor; viewer scopes conjoin an
-//! extra predicate or short-circuit to empty. Batch writes run inside a
-//! real transaction. All three SQL backends ship enabled — SQLite (the
-//! conformance-tested, embedded flavor), PostgreSQL and MySQL (`SeaRepo::connect`);
-//! the per-dialect statement rendering is pinned by snapshot tests, and the
-//! live suites run against service containers in CI.
+//! to `LIMIT/OFFSET` or an id-greater-than cursor; viewer scope and tenant
+//! predicates conjoin an extra predicate or short-circuit to empty. Batch
+//! writes run inside a real transaction. All three SQL backends ship
+//! enabled — SQLite (the conformance-tested, embedded flavor), PostgreSQL
+//! and MySQL (`SeaRepo::connect`); the per-dialect statement rendering is
+//! pinned by snapshot tests, and the live suites run against service
+//! containers in CI.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 use sea_orm::sea_query::{
     Alias, ColumnDef, Condition, DeleteStatement, Expr, ExprTrait, Func, InsertStatement,
-    MysqlQueryBuilder, OnConflict, Order, PostgresQueryBuilder, Query, SelectStatement,
-    SqliteQueryBuilder, Table, TableCreateStatement, UpdateStatement, Values,
+    MysqlQueryBuilder, Order, PostgresQueryBuilder, Query, SelectStatement, SqliteQueryBuilder,
+    Table, TableCreateStatement, UpdateStatement, Values,
 };
 use sea_orm::{
-    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr, Statement,
-    TransactionTrait,
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr, RuntimeErr,
+    Statement, TransactionTrait,
 };
 
 use rushwind_storage::{
     AuditAction, AuditEntry, ColumnKind, FieldMask, FilterExpr, FilterNode, ListQuery, Op, Page,
-    Paging, QueryCtx, Record, RepoFuture, Repository, Schema, Scope, SortDir, StorageError, Value,
-    Viewer,
+    Paging, QueryCtx, Record, RepoFuture, Repository, Schema, Scope, SortDir, StorageError,
+    TenancyDecision, Value, Viewer,
 };
 
 /// A [`Repository`] backed by a SeaORM connection pool.
@@ -155,7 +156,25 @@ impl SeaRepo {
         Statement::from_sql_and_values(self.backend(), sql, values.0)
     }
 
+    /// Maps a driver error onto the contract: a unique or primary-key
+    /// violation is [`StorageError::Conflict`] — the upsert insert face
+    /// relies on the table's uniqueness to turn an occupied primary key
+    /// into a conflict instead of a silent overwrite. sqlx classifies the
+    /// error structurally (the violation codes of SQLite, PostgreSQL and
+    /// MySQL alike); the text fallback below catches the same condition in
+    /// shapes that do not ride the sqlx wrapper (transaction and session
+    /// errors). Everything else is [`StorageError::Backend`] — engine-level
+    /// errors such as [`StorageError::MissingViewer`] never enter this
+    /// mapping, so they reach the caller untouched.
     fn map_err(&self, err: DbErr) -> StorageError {
+        if let DbErr::Exec(RuntimeErr::SqlxError(e)) | DbErr::Query(RuntimeErr::SqlxError(e)) = &err
+        {
+            if e.as_database_error()
+                .is_some_and(|db| db.is_unique_violation())
+            {
+                return StorageError::Conflict(err.to_string());
+            }
+        }
         let text = err.to_string();
         if text.contains("UNIQUE constraint")
             || text.contains("Duplicate entry")
@@ -248,17 +267,22 @@ impl SeaRepo {
         projected
     }
 
-    /// The WHERE clause shared by list and count: scope conjoined with the
-    /// query filter.
+    /// The WHERE clause shared by list and count: scope and the tenant
+    /// predicate conjoined with the query filter.
     fn where_sql(
         &self,
         scope: &ScopeSql,
+        tenant: &TenantSql,
         query: &ListQuery,
     ) -> Result<Option<Condition>, StorageError> {
         let mut combined = Condition::all();
         let mut any = false;
         if let ScopeSql::Pass(Some(scope_cond)) = scope {
             combined = combined.add(scope_cond.clone());
+            any = true;
+        }
+        if let Some(predicate) = tenant.predicate() {
+            combined = combined.add(predicate);
             any = true;
         }
         if let Some(filter) = &query.filter {
@@ -295,7 +319,10 @@ impl SeaRepo {
     }
 
     /// Reads a row the engine itself just wrote — no scope re-check, because
-    /// the write already happened inside the caller's scope.
+    /// the write already happened inside the caller's context. Reserved for
+    /// that read-back (`create`/`batch_create`): every other path must go
+    /// through the scoped reads, whose WHERE clause carries the viewer's
+    /// scope and tenant.
     async fn fetch_by_pk_unscoped(&self, id: i64) -> Result<Record, StorageError> {
         let pk = self.schema.primary_key.clone();
         let cols = self.select_columns(&None);
@@ -330,10 +357,34 @@ impl SeaRepo {
         Ok(())
     }
 
+    /// The stored record a write returns: the payload materialized over the
+    /// schema with the primary key filled — the row the engine itself just
+    /// wrote, exactly what the INSERT put in the table. Used by the upsert
+    /// insert face, where a re-read through the scope would only repeat the
+    /// probe (and could legitimately see nothing, the same denial the probe
+    /// saw) while an unscoped read-back would leak past the viewer.
+    fn materialized_record(&self, row: &Record, id: i64) -> Record {
+        let mut full = Record::new();
+        for column in &self.schema.columns {
+            let value = if column.name == self.schema.primary_key {
+                Value::Int(id)
+            } else {
+                row.get(&column.name).cloned().unwrap_or(Value::Null)
+            };
+            full.insert(column.name.as_str(), value);
+        }
+        full
+    }
+
     // ---- async implementations ----------------------------------------------
 
     async fn get_async(&self, ctx: &QueryCtx, id: Value) -> Result<Option<Record>, StorageError> {
         let id = expect_id(&id)?;
+        // The tenant rule resolves before the denial check: an unidentified
+        // viewer on a tenant-scoped table fails closed even when its range
+        // would have denied anyway — the error is the contract, not an
+        // empty result.
+        let tenant = TenantSql::resolve(&self.schema, ctx)?;
         let scope = self.scope_sql(ctx)?;
         if matches!(scope, ScopeSql::Deny) {
             return Ok(None);
@@ -348,6 +399,9 @@ impl SeaRepo {
         let mut cond = Condition::all().add(Expr::col(Alias::new(&pk)).eq(id));
         if let ScopeSql::Pass(Some(scope_cond)) = &scope {
             cond = cond.add(scope_cond.clone());
+        }
+        if let Some(predicate) = tenant.predicate() {
+            cond = cond.add(predicate);
         }
         select.cond_where(cond);
         select.limit(1);
@@ -368,6 +422,9 @@ impl SeaRepo {
         query: &ListQuery,
     ) -> Result<Page<Record>, StorageError> {
         query.validate(&self.schema)?;
+        // Tenant first, like the reference engine: the fail-closed error
+        // beats the denial short-circuit.
+        let tenant = TenantSql::resolve(&self.schema, ctx)?;
         let scope = self.scope_sql(ctx)?;
         if matches!(scope, ScopeSql::Deny) {
             return Ok(Page {
@@ -376,7 +433,7 @@ impl SeaRepo {
                 next_token: None,
             });
         }
-        let where_clause = self.where_sql(&scope, query)?;
+        let where_clause = self.where_sql(&scope, &tenant, query)?;
         let table = Alias::new(&self.schema.table);
         let pk = self.schema.primary_key.clone();
 
@@ -435,12 +492,14 @@ impl SeaRepo {
         if let Some(filter) = &filter {
             filter.validate(&self.schema)?;
         }
+        let tenant = TenantSql::resolve(&self.schema, ctx)?;
         let scope = self.scope_sql(ctx)?;
         if matches!(scope, ScopeSql::Deny) {
             return Ok(0);
         }
         let where_clause = self.where_sql(
             &scope,
+            &tenant,
             &ListQuery {
                 filter,
                 ..ListQuery::default()
@@ -533,6 +592,11 @@ impl SeaRepo {
 
     async fn create_async(&self, ctx: &QueryCtx, row: Record) -> Result<Record, StorageError> {
         self.validate_row(&row)?;
+        let tenant = TenantSql::resolve(&self.schema, ctx)?;
+        // The payload rides the stamp: a tenant actor cannot address another
+        // tenant by writing the column itself.
+        let mut row = row;
+        tenant.stamp(&mut row);
         let id = self.insert_async(&self.db, &row).await?;
         let stored = self.fetch_by_pk_unscoped(id).await?;
         self.audit(ctx, AuditAction::Create, Some(Value::Int(id)));
@@ -544,8 +608,13 @@ impl SeaRepo {
         ctx: &QueryCtx,
         rows: Vec<Record>,
     ) -> Result<Vec<Record>, StorageError> {
-        for row in &rows {
+        // The tenant rule resolves up front, like the reference engine, and
+        // every row of the batch rides the stamp.
+        let tenant = TenantSql::resolve(&self.schema, ctx)?;
+        let mut rows = rows;
+        for row in &mut rows {
             self.validate_row(row)?;
+            tenant.stamp(row);
         }
         let txn = self.db.begin().await.map_err(|e| self.map_err(e))?;
         let mut ids = Vec::with_capacity(rows.len());
@@ -569,6 +638,13 @@ impl SeaRepo {
     ) -> Result<Record, StorageError> {
         self.validate_row(&patch)?;
         let id = expect_id(&id)?;
+        // The tenant rule resolves before the denial check — an unidentified
+        // viewer fails closed even when its range would deny anyway — and the
+        // patch rides the stamp: applied after the patch, so a tenant actor
+        // cannot migrate the row into another tenant through it.
+        let tenant = TenantSql::resolve(&self.schema, ctx)?;
+        let mut patch = patch;
+        tenant.stamp(&mut patch);
         let scope = self.scope_sql(ctx)?;
         if matches!(scope, ScopeSql::Deny) {
             return Err(StorageError::NotFound);
@@ -600,6 +676,9 @@ impl SeaRepo {
             if let ScopeSql::Pass(Some(scope_cond)) = &scope {
                 cond = cond.add(scope_cond.clone());
             }
+            if let Some(predicate) = tenant.predicate() {
+                cond = cond.add(predicate);
+            }
             update.cond_where(cond);
             let exec = self
                 .db
@@ -630,49 +709,84 @@ impl SeaRepo {
                 ))
             }
         };
-        // The conflict branch updates every column the payload carries
-        // except the primary key itself.
-        let update_columns: Vec<Alias> = self
-            .schema
-            .columns
-            .iter()
-            .filter(|c| row.get(&c.name).is_some() && c.name != pk)
-            .map(|c| Alias::new(&c.name))
-            .collect();
-        if update_columns.is_empty() {
-            return Err(StorageError::InvalidQuery(
-                "upsert payload carries no columns beyond the primary key".into(),
-            ));
+        let tenant = TenantSql::resolve(&self.schema, ctx)?;
+        // Both faces ride the stamp: a tenant actor can neither create into
+        // another tenant nor migrate a row into one through the payload.
+        let mut row = row;
+        tenant.stamp(&mut row);
+        // The probe decides the face through the scoped read path (get
+        // conjoins scope and tenant): only a row *visible in this viewer's
+        // scope and tenant* authorizes the update face. Anything else is
+        // indistinguishable from an absent row — and the insert face turns an
+        // occupied primary key into a Conflict instead of a silent overwrite.
+        // The previous ON CONFLICT (pk) DO UPDATE conjoined neither scope nor
+        // tenant, so a tenant viewer could rewrite any row on the table by pk
+        // and get it back unscoped.
+        match self.get_async(ctx, Value::Int(id)).await? {
+            Some(_) => {
+                // Update face: merge the payload's own columns over the
+                // visible row through a scoped UPDATE — the WHERE side
+                // carries the primary key, the scope and the tenant. The
+                // payload already rides the stamp, so the merged row cannot
+                // land in another tenant.
+                let mut update = Query::update();
+                update.table(Alias::new(&self.schema.table));
+                let mut touched = 0;
+                for column in &self.schema.columns {
+                    if column.name == pk {
+                        continue; // the primary key addresses the row, never moves
+                    }
+                    if let Some(value) = row.get(&column.name) {
+                        update.value(Alias::new(&column.name), bind(value));
+                        touched += 1;
+                    }
+                }
+                if touched > 0 {
+                    let mut cond = Condition::all().add(Expr::col(Alias::new(&pk)).eq(id));
+                    if let ScopeSql::Pass(Some(scope_cond)) = &self.scope_sql(ctx)? {
+                        cond = cond.add(scope_cond.clone());
+                    }
+                    if let Some(predicate) = tenant.predicate() {
+                        cond = cond.add(predicate);
+                    }
+                    update.cond_where(cond);
+                    let exec = self
+                        .db
+                        .execute_raw(self.statement(&update))
+                        .await
+                        .map_err(|e| self.map_err(e))?;
+                    if exec.rows_affected() == 0 {
+                        // The row left the scope between probe and write.
+                        return Err(StorageError::NotFound);
+                    }
+                }
+                // The update face returns through a scoped read: the row was
+                // just written inside this viewer's context, and the read
+                // must obey the same boundaries the write did.
+                let stored = self
+                    .get_async(ctx, Value::Int(id))
+                    .await?
+                    .ok_or(StorageError::NotFound)?;
+                self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
+                Ok(stored)
+            }
+            None => {
+                // Insert face: absent **or** invisible. A plain INSERT — no
+                // ON CONFLICT — so an invisible occupant of the primary key
+                // fails on the table's uniqueness and maps to
+                // [`StorageError::Conflict`]: never a silent overwrite. The
+                // return value is the stamped row just written, not an
+                // unscoped read-back of a row this viewer may not see.
+                self.insert_async(&self.db, &row).await?;
+                self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
+                Ok(self.materialized_record(&row, id))
+            }
         }
-        let mut columns: Vec<Alias> = Vec::new();
-        let mut values: Vec<Expr> = Vec::new();
-        for column in &self.schema.columns {
-            let value = row.get(&column.name).cloned().unwrap_or(Value::Null);
-            columns.push(Alias::new(&column.name));
-            values.push(bind(&value));
-        }
-        let mut insert = Query::insert();
-        insert
-            .into_table(Alias::new(&self.schema.table))
-            .columns(columns)
-            .values(values)
-            .map_err(|e| StorageError::InvalidQuery(e.to_string()))?
-            .on_conflict(
-                OnConflict::column(Alias::new(&pk))
-                    .update_columns(update_columns)
-                    .to_owned(),
-            );
-        self.db
-            .execute_raw(self.statement(&insert))
-            .await
-            .map_err(|e| self.map_err(e))?;
-        let stored = self.fetch_by_pk_unscoped(id).await?;
-        self.audit(ctx, AuditAction::Upsert, Some(Value::Int(id)));
-        Ok(stored)
     }
 
     async fn delete_async(&self, ctx: &QueryCtx, id: Value) -> Result<(), StorageError> {
         let id = expect_id(&id)?;
+        let tenant = TenantSql::resolve(&self.schema, ctx)?;
         let scope = self.scope_sql(ctx)?;
         if matches!(scope, ScopeSql::Deny) {
             return Err(StorageError::NotFound);
@@ -683,6 +797,9 @@ impl SeaRepo {
         let mut cond = Condition::all().add(Expr::col(Alias::new(&pk)).eq(id));
         if let ScopeSql::Pass(Some(scope_cond)) = &scope {
             cond = cond.add(scope_cond.clone());
+        }
+        if let Some(predicate) = tenant.predicate() {
+            cond = cond.add(predicate);
         }
         delete.cond_where(cond);
         let exec = self
@@ -743,6 +860,65 @@ enum ScopeSql {
     Deny,
     /// The extra predicate to AND in, if any.
     Pass(Option<Condition>),
+}
+
+/// The tenant axis resolved for one operation: the schema's tenant column
+/// plus the viewer's [`TenancyDecision`] against it.
+///
+/// Mirrors the in-memory reference engine's `TenantRule`: resolution is
+/// fail-closed — a tenant-scoped table queried by an unidentified viewer
+/// errors with [`StorageError::MissingViewer`] from *every* repository
+/// path, before any statement is sent.
+#[derive(Clone, Debug)]
+enum TenantSql {
+    /// No tenant predicate anywhere: the table declares no tenant column,
+    /// or the viewer is platform/system.
+    Pass,
+    /// Conjoin `column = id` on every path and force-stamp writes with id.
+    Enforce { column: String, id: i64 },
+}
+
+impl TenantSql {
+    /// Resolves the schema's tenant column against the viewer.
+    fn resolve(schema: &Schema, ctx: &QueryCtx) -> Result<Self, StorageError> {
+        Ok(
+            match ctx
+                .viewer
+                .tenant_decision(schema.tenant_column.as_deref())?
+            {
+                TenancyDecision::Unscoped | TenancyDecision::Pass => TenantSql::Pass,
+                TenancyDecision::Enforce(id) => TenantSql::Enforce {
+                    // Enforce only arises when the schema declares the
+                    // column; the fallback keeps the conventional name so
+                    // the stamp cannot silently miss.
+                    column: schema
+                        .tenant_column
+                        .clone()
+                        .unwrap_or_else(|| Viewer::TENANT_COLUMN.to_owned()),
+                    id,
+                },
+            },
+        )
+    }
+
+    /// The predicate to AND into every query's WHERE clause, if any.
+    fn predicate(&self) -> Option<Condition> {
+        match self {
+            TenantSql::Pass => None,
+            TenantSql::Enforce { column, id } => {
+                Some(Condition::all().add(Expr::col(Alias::new(column.as_str())).eq(*id)))
+            }
+        }
+    }
+
+    /// Force-stamps the tenant column when the viewer is a tenant business
+    /// viewer — a tenant actor cannot address another tenant by writing the
+    /// column itself. Platform and unscoped writes keep the payload value.
+    fn stamp(&self, row: &mut Record) {
+        if let TenantSql::Enforce { column, id } = self {
+            row.insert(column.as_str(), Value::Int(*id));
+        }
+    }
 }
 
 fn expect_id(id: &Value) -> Result<i64, StorageError> {

@@ -10,8 +10,8 @@
 //! - filters tombstoned rows out of every read (get / list / count /
 //!   exists) and out of [`Repository::update`] targets — a deleted row is
 //!   indistinguishable from a missing one, exactly like viewer scoping,
-//! - offers [`SoftDeleteRepo::restore`] (clear the tombstone) and
-//!   [`SoftDeleteRepo::purge`] (the real delete) as opt-outs, and
+//! - offers [`SoftDeleteRepo::restore_async`] (clear the tombstone) and
+//!   [`SoftDeleteRepo::purge_async`] (the real delete) as opt-outs, and
 //! - lets [`Repository::upsert`] resurrect a tombstoned id with fresh data
 //!   — upsert writes into the visible world.
 //!

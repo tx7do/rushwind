@@ -32,11 +32,24 @@
 //!
 //! # Tenancy
 //!
-//! Without configuration every request runs all-access (demos and
-//! bootstrap). Production tenancy plugs in through
-//! [`CrudApi::with_viewer`]: a function from request headers to a
-//! [`Viewer`], applied on every call — the same scope enforcement the
-//! conformance suite pins, now at the HTTP edge.
+//! The default is **fail closed**: without a viewer policy every request
+//! runs [`Viewer::default`] — nothing is visible, and on a tenant-scoped
+//! table the engine rejects the call outright with
+//! [`StorageError::MissingViewer`] (mapped to 400). Production tenancy
+//! plugs in through [`CrudApi::with_viewer`]: a function from request
+//! headers to a [`Viewer`], applied on every call — the same scope
+//! enforcement the conformance suite pins, now at the HTTP edge. The
+//! usual shapes are one line: all-access (for demos and internal tools)
+//! is the explicit `.with_viewer(Arc::new(|_| Viewer::all()))`, a real
+//! deployment derives the viewer from its authenticated claims.
+//!
+//! On top of the engine's enforcement the edge runs a defense-in-depth
+//! payload guard (`CrudApi::check_payload`): a viewer with a scoped range
+//! or a tenant identity may not address tenancy columns it is not
+//! entitled to (`owner_id`/`unit_id`/the schema's tenant column) — a
+//! forged write answers a clean 400 before the engine would silently
+//! stamp over it. Platform viewers ([`Viewer::all`]/[`Viewer::system`])
+//! bypass the guard: they administer every row.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -54,8 +67,8 @@ use axum::{Json, Router};
 use serde_json::json;
 
 use rushwind_storage::{
-    Auditor, FilterExpr, ListQuery, Paging, QueryCtx, Repository, Sort, SortDir, StorageError,
-    Value, Viewer,
+    Auditor, FilterExpr, ListQuery, Paging, QueryCtx, Record, Repository, Sort, SortDir,
+    StorageError, Tenancy, Value, Viewer,
 };
 use rushwind_storage_proto::wire::list_query_from_json;
 
@@ -71,7 +84,12 @@ pub struct CrudApi {
 }
 
 impl CrudApi {
-    /// Binds the surface to a repository; every request runs all-access.
+    /// Binds the surface to a repository. **Fail closed:** with no viewer
+    /// policy installed every request runs [`Viewer::default`] — nothing
+    /// is visible, writes land invisible on non-tenant tables, and
+    /// tenant-scoped tables reject the call with
+    /// [`StorageError::MissingViewer`]. All-access is an explicit choice:
+    /// `.with_viewer(Arc::new(|_| Viewer::all()))`.
     pub fn new(repo: Arc<dyn Repository>) -> Self {
         Self {
             repo,
@@ -105,16 +123,68 @@ impl CrudApi {
             .with_state(self)
     }
 
-    fn ctx(&self, headers: &HeaderMap) -> QueryCtx {
-        let viewer = self
-            .viewer
+    /// The viewer this request runs under: the installed policy's answer,
+    /// or the fail-closed [`Viewer::default`] when no policy is mounted.
+    fn viewer(&self, headers: &HeaderMap) -> Viewer {
+        self.viewer
             .as_ref()
             .map(|policy| policy(headers))
-            .unwrap_or_else(Viewer::all);
+            .unwrap_or_default()
+    }
+
+    fn ctx(&self, viewer: Viewer) -> QueryCtx {
         match &self.auditor {
             Some(auditor) => QueryCtx::new(viewer).audited(Arc::clone(auditor)),
             None => QueryCtx::new(viewer),
         }
+    }
+
+    /// The defense-in-depth payload guard: a viewer with an actor, a
+    /// unit, or a tenant identity may not address the matching tenancy
+    /// columns with someone else's value — a forged `owner_id`,
+    /// `unit_id`, or tenant column is rejected with
+    /// [`StorageError::InvalidQuery`] (a clean 400) before the engine
+    /// would silently force-stamp over it. Absent and `NULL` payloads
+    /// pass: the engine stamps the defaults underneath. Platform viewers
+    /// ([`Viewer::all`]/[`Viewer::system`], [`Tenancy::Platform`])
+    /// bypass the guard — they administer every row of every tenant.
+    fn check_payload(&self, viewer: &Viewer, row: &Record) -> Result<(), StorageError> {
+        if viewer.tenancy == Tenancy::Platform {
+            return Ok(());
+        }
+        if let Tenancy::Tenant(tenant) = viewer.tenancy {
+            if let Some(column) = self.repo.schema().tenant_column.as_deref() {
+                match row.get(column) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Int(id)) if *id == tenant => {}
+                    Some(other) => {
+                        return Err(StorageError::InvalidQuery(format!(
+                            "the {column:?} payload column must carry the viewer's tenant \
+                             {tenant}, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        match (viewer.actor_id, row.get(Viewer::OWNER_COLUMN)) {
+            (Some(actor), Some(Value::Int(owner))) if *owner != actor => {
+                return Err(StorageError::InvalidQuery(format!(
+                    "the {:?} payload column must carry the viewer's actor {actor}, got {owner}",
+                    Viewer::OWNER_COLUMN
+                )));
+            }
+            _ => {}
+        }
+        match (viewer.unit_id, row.get(Viewer::UNIT_COLUMN)) {
+            (Some(unit), Some(Value::Int(id))) if *id != unit => {
+                return Err(StorageError::InvalidQuery(format!(
+                    "the {:?} payload column must carry the viewer's unit {unit}, got {id}",
+                    Viewer::UNIT_COLUMN
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -129,7 +199,7 @@ async fn list(
         Ok(query) => query,
         Err(error) => return error_response(error),
     };
-    match api.repo.list(api.ctx(&headers), &query).await {
+    match api.repo.list(api.ctx(api.viewer(&headers)), &query).await {
         Ok(page) => {
             let items: Vec<serde_json::Value> =
                 page.items.iter().map(json::record_to_json).collect();
@@ -152,13 +222,19 @@ async fn create(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    let viewer = api.viewer(&headers);
     match json::record_from_json(&body, api.repo.schema()) {
-        Ok(row) => match api.repo.create(api.ctx(&headers), row).await {
-            Ok(stored) => {
-                (StatusCode::CREATED, Json(json::record_to_json(&stored))).into_response()
+        Ok(row) => {
+            if let Err(error) = api.check_payload(&viewer, &row) {
+                return error_response(error);
             }
-            Err(error) => error_response(error),
-        },
+            match api.repo.create(api.ctx(viewer), row).await {
+                Ok(stored) => {
+                    (StatusCode::CREATED, Json(json::record_to_json(&stored))).into_response()
+                }
+                Err(error) => error_response(error),
+            }
+        }
         Err(error) => error_response(error),
     }
 }
@@ -173,7 +249,11 @@ async fn get_one(
             "the id must be an integer".into(),
         ));
     };
-    match api.repo.get(api.ctx(&headers), Value::Int(id)).await {
+    match api
+        .repo
+        .get(api.ctx(api.viewer(&headers)), Value::Int(id))
+        .await
+    {
         Ok(Some(row)) => (StatusCode::OK, Json(json::record_to_json(&row))).into_response(),
         Ok(None) => error_response(StorageError::NotFound),
         Err(error) => error_response(error),
@@ -191,15 +271,21 @@ async fn update(
             "the id must be an integer".into(),
         ));
     };
+    let viewer = api.viewer(&headers);
     match json::record_from_json(&body, api.repo.schema()) {
-        Ok(patch) => match api
-            .repo
-            .update(api.ctx(&headers), Value::Int(id), patch)
-            .await
-        {
-            Ok(stored) => (StatusCode::OK, Json(json::record_to_json(&stored))).into_response(),
-            Err(error) => error_response(error),
-        },
+        Ok(patch) => {
+            if let Err(error) = api.check_payload(&viewer, &patch) {
+                return error_response(error);
+            }
+            match api
+                .repo
+                .update(api.ctx(viewer), Value::Int(id), patch)
+                .await
+            {
+                Ok(stored) => (StatusCode::OK, Json(json::record_to_json(&stored))).into_response(),
+                Err(error) => error_response(error),
+            }
+        }
         Err(error) => error_response(error),
     }
 }
@@ -215,10 +301,14 @@ async fn upsert(
             "the id must be an integer".into(),
         ));
     };
+    let viewer = api.viewer(&headers);
     match json::record_from_json(&body, api.repo.schema()) {
         Ok(mut row) => {
+            if let Err(error) = api.check_payload(&viewer, &row) {
+                return error_response(error);
+            }
             row.insert(api.repo.schema().primary_key.as_str(), Value::Int(id));
-            match api.repo.upsert(api.ctx(&headers), row).await {
+            match api.repo.upsert(api.ctx(viewer), row).await {
                 Ok(stored) => (StatusCode::OK, Json(json::record_to_json(&stored))).into_response(),
                 Err(error) => error_response(error),
             }
@@ -237,7 +327,11 @@ async fn delete_one(
             "the id must be an integer".into(),
         ));
     };
-    match api.repo.delete(api.ctx(&headers), Value::Int(id)).await {
+    match api
+        .repo
+        .delete(api.ctx(api.viewer(&headers)), Value::Int(id))
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error_response(error),
     }
@@ -253,6 +347,11 @@ fn error_response(error: StorageError) -> Response {
     let status = match &error {
         StorageError::NotFound => StatusCode::NOT_FOUND,
         StorageError::InvalidQuery(_) => StatusCode::BAD_REQUEST,
+        // The caller's request carried no tenancy identity against a
+        // tenant-scoped table: a malformed request (4xx), not a server
+        // fault — and deliberately not 401/403, which belong to the
+        // authn/authz layers.
+        StorageError::MissingViewer => StatusCode::BAD_REQUEST,
         StorageError::Conflict(_) => StatusCode::CONFLICT,
         StorageError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
         StorageError::Timeout | StorageError::Backend(_) => StatusCode::INTERNAL_SERVER_ERROR,

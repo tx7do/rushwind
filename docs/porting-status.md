@@ -2,6 +2,37 @@
 
 全部 20 个域的 Rust 实现收口记录。日期：2026-09-14。
 
+## 上游跟进（2026-11-05）
+
+三个上游 Go 仓库（go-crud、kratos-transport、kratos-bootstrap）在移植基线（2026-09-14）之后的提交已逐条盘点并跟进：
+
+**storage 线（go-crud a66fd69..638881f）**
+
+- 多租户隔离修复：审计发现全部引擎的 `upsert`（部分引擎的 `create`）绕过 viewer 作用域——跨租户覆盖写（memory/mongodb/seaorm/es/os/cassandra/clickhouse/influx 全中招）；修复为统一探针语义：先经作用域读探针，可见才更新，不可见即插入面，主键被占一律 `Conflict`，绝不静默覆盖不可见行。influx 另修行协议换行注入（租户可控字符串可伪造第二个点）。
+- 租户轴落地（go-crud `EnforceTenant` 语义移植）：`Viewer` 增 `Tenancy`（Unidentified 缺省 fail-closed → `StorageError::MissingViewer`；Platform 系统后台放行；Tenant(id) 全路径谓词注入 + 写入强制盖章）；`Schema` 增 `tenant_column` opt-in；一致性套件增租户模块（跨租户 get/update/delete NotFound、upsert Conflict 且原行完好、盖章不可迁移、token 分页租户隔离、无身份 fail-closed），宏签名要求 tenant factory——此前 CI 全绿正因套件从未钉住作用域下的 upsert。
+- HTTP 边与装配：`CrudApi` 无 viewer 策略时由 all-access 改为缺省拒绝（fail-closed，`viewer: all` 显式放行）；租户列伪造守卫（作用域 viewer 不得写非本人 owner/unit/tenant 值）；`MissingViewer` → 400。
+- 缓存装饰器 `ScopeKey` 增租户轴（同 actor 异租户不再共条目）。
+- 其余 go-crud 修复经核对为已覆盖或结构不适用：软删无 `deleted_by`（与 531624f 修后语义一致）、分页 limit 已钳制（opensearch 同源缺陷的 Rust 面无恙）、gorm 主键回读/mongodb FindOne 选项/Rust 面结构不同、cassandra 三缺陷（gocql 一致性/大小写折叠/集合解码）为驱动专属、doris 不存在于 Rust 线。
+
+**transport/broker 线（kratos-transport 035b95cc..d5f78b01）**
+
+- broker-redis：健康检查独立连接（同连接 Ping 内部 Receive 会吞 PUBLISH 帧）、心跳 PONG 静默（issue #133）、断开后 publish/subscribe 清晰报错而非 panic、重连地址重推、密码连接、PEL 僵尸消息 XAUTOCLAIM 回收。
+- broker-rabbitmq：订阅模型收敛为「同步 declare+bind + 单一再订阅循环」（中间轮次的回归以最终形态为准）、waitConnection 重建、毒消息 Nack、同主题先退旧再订新。
+- transport-ws：会话注册 + Stop 关闭全部会话、控制帧与数据写串行、pong 续期防心跳误杀、慢消费者发送上限。
+- transport-sse：分派克隆防重复 base64、发布时打时间戳（TTL 不再吞事件）、回放日志封顶、Last-Event-ID 严格大于、退订有界重试、Range 快照、Add 原子化、元数据事件不断连、显式 404。
+- broker-{mqtt,kafka,nats,stomp,pulsar} 与 transport-mqtt：同主题退订次序、毒消息处理、错误隔离、幂等退订、 producers 重连重建、批量间隔零值守卫等。
+- webtransport/h3/quic/axum/cron 经逐条核对为已覆盖或设计不适用：Rust 面以 endpoint 级真释放 + 逐连接 stop 竞速实现关停（强于上游 http3.Server 不可重启补丁的意图），axum 中间件短路是 tower 模型结构保证，cron 无 gRPC keepalive 对应面。
+
+**bootstrap 线（kratos-bootstrap bc2912a..5968de4）**
+
+- 仅 Go tag 注册表更新，无可移植实质。
+
+**明确推迟**（feature 级，非缺陷）：
+
+- 向量检索契约模块（vector/）与 qdrant/milvus/weaviate/neo4j 四引擎：整个向量域未移植，按需立项。
+- JSONB 点路径过滤（638881f 修的 JsonValue 绑定缺陷）：Rust 线尚无 JSON 路径过滤能力（storage-proto 拒绝 json_path、seaorm 无 JSON 翻译），补能力时按其教训以类型化值绑定并测试 CONTAINS 命中与 EQ 精确两案例。
+- 13→8 引擎口径差：上游新增 qdrant/milvus/weaviate/neo4j（向量），cassandra 仓库层补完对应 Rust 面为契约优先设计（scylla 驱动typed 行反序列化天然规避三缺陷）。
+
 ## 已完成域
 
 | 域 | Rust crates | 状态 |

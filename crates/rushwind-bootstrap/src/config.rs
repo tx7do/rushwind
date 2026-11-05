@@ -183,12 +183,33 @@ pub struct StorageEndpointConfig {
     /// Pack-specific settings, passed verbatim.
     #[serde(default)]
     pub settings: serde_json::Value,
+    /// The viewer policy the built-in `"crud"` edge runs under. Absent
+    /// keeps the deny default: every request runs the contract's
+    /// `Viewer::default`, which sees nothing and fails closed on
+    /// tenant-scoped tables. A real deployment leaves this unset and
+    /// installs its own header-to-viewer policy instead — the api pack
+    /// registry accepts one under the `"crud"` name.
+    #[serde(default)]
+    pub viewer: Option<ViewerPolicy>,
     /// The assembled authn instance wrapping this edge, if any.
     #[serde(default)]
     pub authn: Option<String>,
     /// The permission point wrapping this edge, if any.
     #[serde(default)]
     pub authz: Option<AuthzRef>,
+}
+
+/// The viewer policy a storage endpoint's built-in `"crud"` edge can run
+/// under. One variant today — all-access, the explicit opt-in; the
+/// default when the field is absent is deny.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub enum ViewerPolicy {
+    /// Every request runs the contract's `Viewer::all` — platform
+    /// tenancy, whole-table range. For demos and internal tools; a
+    /// multi-tenant deployment derives its viewer from authenticated
+    /// claims instead.
+    #[serde(rename = "all")]
+    All,
 }
 
 /// One server to assemble.

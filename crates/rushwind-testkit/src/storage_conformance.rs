@@ -18,9 +18,10 @@
 //! tokio = { version = "1", features = ["macros", "rt"] }
 //! ```
 //!
-//! Then, in the engine crate's `tests/conformance.rs`, define the factory
-//! at the test-crate root and reference it by crate-rooted path — the suite
-//! expands into a nested module where a bare identifier does not resolve:
+//! Then, in the engine crate's `tests/conformance.rs`, define the two
+//! factories at the test-crate root and reference them by crate-rooted
+//! path — the suite expands into nested modules where a bare identifier
+//! does not resolve:
 //!
 //! ```ignore
 //! use std::sync::Arc;
@@ -30,15 +31,22 @@
 //!     Arc::new(MyEngine::new(rushwind_testkit::storage_conformance::suite_schema()))
 //! }
 //!
-//! rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo);
+//! async fn fresh_tenant_repo() -> Arc<dyn Repository> {
+//!     Arc::new(MyEngine::new(rushwind_testkit::storage_conformance::tenant_suite_schema()))
+//! }
+//!
+//! rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant: crate::fresh_tenant_repo);
 //! ```
 //!
 //! `$factory` must produce a **fresh, empty** repository bound to
-//! [`suite_schema`]; the suite seeds and cleans up through the contract's
-//! own methods. It is awaited, so engines that connect asynchronously
-//! (every real driver) are first-class. A `cargo test` with this suite
-//! green is the definition of a conformant storage engine; CI enforces it
-//! for every adapter crate.
+//! [`suite_schema`], `$tenant_factory` the same bound to
+//! [`tenant_suite_schema`]; the suite seeds and cleans up through the
+//! contract's own methods. It is awaited, so engines that connect
+//! asynchronously (every real driver) are first-class. A `cargo test` with
+//! this suite green is the definition of a conformant storage engine; CI
+//! enforces it for every adapter crate. The tenancy module is the
+//! isolation gate: an engine that lets a cross-tenant upsert, update, or
+//! delete through fails here, not in production.
 
 use std::sync::Mutex;
 
@@ -48,7 +56,9 @@ use crate::rushwind_storage::{AuditEntry, Auditor, ColumnKind, Record, Schema};
 ///
 /// Table `widgets`: an integer primary key `id`, a nullable real `score`
 /// (pins `NULL` semantics), text `name` (pins pattern operators), and the
-/// tenancy columns `owner_id`/`unit_id` (pin viewer scoping).
+/// tenancy columns `owner_id`/`unit_id` (pin viewer scoping). Deliberately
+/// **not** tenant-scoped — the tenant suite runs against
+/// [`tenant_suite_schema`].
 pub fn suite_schema() -> Schema {
     Schema::builder("widgets", "id")
         .column("name", ColumnKind::Text)
@@ -58,6 +68,23 @@ pub fn suite_schema() -> Schema {
         .column("unit_id", ColumnKind::Int)
         .build()
         .expect("suite schema is valid")
+}
+
+/// The tenant-scoped schema the tenancy suite runs against: the standard
+/// table plus the conventional tenant column, declared as the schema's
+/// tenant column.
+pub fn tenant_suite_schema() -> Schema {
+    Schema::builder("widgets", "id")
+        .column("name", ColumnKind::Text)
+        .column("age", ColumnKind::Int)
+        .column("owner_id", ColumnKind::Int)
+        .column(
+            crate::rushwind_storage::Viewer::TENANT_COLUMN,
+            ColumnKind::Int,
+        )
+        .tenant_column(crate::rushwind_storage::Viewer::TENANT_COLUMN)
+        .build()
+        .expect("tenant suite schema is valid")
 }
 
 /// Builds a suite row without an id (the engine assigns the primary key).
@@ -70,6 +97,15 @@ pub fn widget(name: &str, age: i64, score: Option<f64>, owner_id: i64, unit_id: 
         .set("unit_id", unit_id)
 }
 
+/// Builds a tenant-suite row without an id, owned by `tenant_id`.
+pub fn tenant_widget(name: &str, age: i64, owner_id: i64, tenant_id: i64) -> Record {
+    Record::new()
+        .set("name", name)
+        .set("age", age)
+        .set("owner_id", owner_id)
+        .set(crate::rushwind_storage::Viewer::TENANT_COLUMN, tenant_id)
+}
+
 /// Builds a suite row with an explicit primary key.
 pub fn widget_with_id(
     id: i64,
@@ -80,6 +116,29 @@ pub fn widget_with_id(
     unit_id: i64,
 ) -> Record {
     widget(name, age, score, owner_id, unit_id).set("id", id)
+}
+
+/// Builds a tenant-suite row with an explicit primary key.
+pub fn tenant_widget_with_id(
+    id: i64,
+    name: &str,
+    age: i64,
+    owner_id: i64,
+    tenant_id: i64,
+) -> Record {
+    tenant_widget(name, age, owner_id, tenant_id).set("id", id)
+}
+
+/// The five standard tenant rows: three belong to tenant 5, two to
+/// tenant 6. All owner 1 to keep the ownership axis out of the way.
+pub fn tenant_standard_rows() -> Vec<Record> {
+    vec![
+        tenant_widget_with_id(1, "t5-alpha", 5, 1, 5),
+        tenant_widget_with_id(2, "t5-Bravo", 10, 1, 5),
+        tenant_widget_with_id(3, "t5-charlie", 15, 1, 5),
+        tenant_widget_with_id(4, "t6-delta", 20, 1, 6),
+        tenant_widget_with_id(5, "t6-Echo", 25, 1, 6),
+    ]
 }
 
 /// The five standard rows the filter and scope tests seed.
@@ -126,16 +185,17 @@ pub fn action_names(entries: &[AuditEntry]) -> Vec<&'static str> {
 ///
 /// `$factory` must be a **crate-rooted path** to an async function of type
 /// `async fn() -> Arc<dyn Repository>` producing a **fresh, empty**
-/// repository bound to [`suite_schema`]; the suite expands into a nested
-/// module, where a bare identifier from the invoking module does not
-/// resolve.
+/// repository bound to [`suite_schema`]; `$tenant_factory` the same bound
+/// to [`tenant_suite_schema`]. The suite expands into two nested modules —
+/// the base contract suite and the tenancy suite — where bare identifiers
+/// from the invoking module do not resolve.
 ///
 /// Invoke this from the engine crate's integration tests (see the module
 /// documentation for the full wiring, including the required `tokio`
 /// dev-dependency and the `storage` feature).
 #[macro_export]
 macro_rules! rushwind_storage_conformance_suite {
-    ($factory:expr) => {
+    ($factory:expr, tenant: $tenant_factory:expr) => {
         mod rushwind_storage_conformance {
             use std::sync::Arc;
 
@@ -811,6 +871,91 @@ macro_rules! rushwind_storage_conformance_suite {
                 assert_eq!(ids_with(&repo, &user, &query()).await, vec![3, 4, 5]);
             }
 
+            #[tokio::test]
+            async fn count_and_exists_honor_the_scope() {
+                let repo = $factory().await;
+                seed_standard(&repo).await;
+                let own = QueryCtx::new(Viewer::own(1));
+                let n = repo.count(own.clone(), None).await.expect("count succeeds");
+                assert_eq!(n, 2, "viewer 1 owns rows 1 and 2 only");
+                let foreign = repo
+                    .exists(
+                        own.clone(),
+                        Some(FilterExpr::cond(
+                            "name",
+                            Op::Eq,
+                            [Value::Text("charlie".into())],
+                        )),
+                    )
+                    .await
+                    .expect("exists succeeds");
+                assert!(!foreign, "an out-of-scope row satisfies no predicate");
+                let own_row = repo
+                    .exists(
+                        own.clone(),
+                        Some(FilterExpr::cond(
+                            "name",
+                            Op::Eq,
+                            [Value::Text("alpha".into())],
+                        )),
+                    )
+                    .await
+                    .expect("exists succeeds");
+                assert!(own_row);
+            }
+
+            #[tokio::test]
+            async fn create_on_an_occupied_pk_conflicts() {
+                let repo = $factory().await;
+                seed_standard(&repo).await;
+                let err = repo
+                    .create(ctx(), widget_with_id(1, "impostor", 0, None, 1, 1))
+                    .await
+                    .expect_err("creating onto an occupied pk must conflict");
+                assert!(
+                    matches!(err, StorageError::Conflict(_)),
+                    "expected Conflict, got: {err}"
+                );
+                let intact = repo
+                    .get(ctx(), Value::Int(1))
+                    .await
+                    .expect("get succeeds")
+                    .expect("row survived the collision");
+                assert_eq!(intact.get("name").and_then(Value::as_str), Some("alpha"));
+            }
+
+            #[tokio::test]
+            async fn upsert_never_touches_an_out_of_scope_row() {
+                let repo = $factory().await;
+                seed_standard(&repo).await;
+                let own = QueryCtx::new(Viewer::own(1));
+                // Row 3 belongs to owner 2: invisible to this viewer. The
+                // upsert must take the insert face — and an insert onto an
+                // occupied pk is a conflict, never a silent overwrite of
+                // the invisible occupant.
+                let err = repo
+                    .upsert(own.clone(), widget_with_id(3, "hijack", 0, None, 1, 1))
+                    .await
+                    .expect_err("upsert onto an out-of-scope occupied pk must fail");
+                assert!(
+                    matches!(err, StorageError::Conflict(_)),
+                    "expected Conflict, got: {err}"
+                );
+                let intact = repo
+                    .get(ctx(), Value::Int(3))
+                    .await
+                    .expect("get succeeds")
+                    .expect("the foreign row survived untouched");
+                assert_eq!(intact.get("name").and_then(Value::as_str), Some("charlie"));
+                assert_eq!(intact.get("age").and_then(Value::as_i64), Some(15));
+                // And the in-scope face still updates:
+                let updated = repo
+                    .upsert(own.clone(), widget_with_id(1, "alpha", 99, None, 1, 1))
+                    .await
+                    .expect("in-scope upsert succeeds");
+                assert_eq!(updated.get("age").and_then(Value::as_i64), Some(99));
+            }
+
             // ---- auditing -------------------------------------------------------
 
             #[tokio::test]
@@ -833,6 +978,298 @@ macro_rules! rushwind_storage_conformance_suite {
 
                 let names = action_names(&auditor.snapshot());
                 assert_eq!(names, vec!["create", "update", "delete"]);
+            }
+        }
+
+        mod rushwind_storage_tenancy {
+            use std::sync::Arc;
+
+            use $crate::rushwind_storage::{
+                ListQuery, Paging, QueryCtx, Record, Repository, StorageError, Value, Viewer,
+            };
+            use $crate::storage_conformance::{
+                tenant_standard_rows, tenant_widget, tenant_widget_with_id,
+            };
+
+            type Repo = Arc<dyn Repository>;
+
+            /// The platform context: sees and writes across every tenant.
+            fn platform() -> QueryCtx {
+                QueryCtx::all_access()
+            }
+
+            /// A tenant business context bound to one tenant id.
+            fn tenant(id: i64) -> QueryCtx {
+                QueryCtx::new(Viewer::tenant(id))
+            }
+
+            /// A viewer whose tenancy nobody attached — the fail-closed
+            /// shape. Ownership `Own(1)` so the *only* axis under test is
+            /// the tenant one.
+            fn bare() -> QueryCtx {
+                QueryCtx::new(Viewer::own(1))
+            }
+
+            async fn seed(repo: &Repo) {
+                repo.batch_create(platform(), tenant_standard_rows())
+                    .await
+                    .expect("platform seeds the tenant rows");
+            }
+
+            fn row(id: i64, name: &str, age: i64, owner: i64, tid: i64) -> Record {
+                tenant_widget_with_id(id, name, age, owner, tid)
+            }
+
+            fn tenant_of(stored: &Record) -> Option<i64> {
+                stored.get(Viewer::TENANT_COLUMN).and_then(Value::as_i64)
+            }
+
+            // ---- writes ----------------------------------------------------------
+
+            #[tokio::test]
+            async fn create_force_stamps_the_tenant() {
+                let repo = $tenant_factory().await;
+                // A tenant actor forging another tenant's column loses to
+                // the stamp:
+                let forged = row(0, "impostor", 1, 1, 6).set(Viewer::TENANT_COLUMN, 6);
+                let stored = repo
+                    .create(tenant(5), forged)
+                    .await
+                    .expect("tenant create succeeds");
+                assert_eq!(
+                    tenant_of(&stored),
+                    Some(5),
+                    "the stamp wins over the payload"
+                );
+                let seen = repo
+                    .get(tenant(6), Value::Int(id_of_value(stored.get("id"))))
+                    .await
+                    .expect("get succeeds");
+                assert!(seen.is_none(), "the stamped row belongs to tenant 5 only");
+            }
+
+            #[tokio::test]
+            async fn platform_create_respects_explicit_tenant() {
+                let repo = $tenant_factory().await;
+                let stored = repo
+                    .create(platform(), row(0, "for-tenant-6", 1, 1, 6))
+                    .await
+                    .expect("platform create succeeds");
+                assert_eq!(tenant_of(&stored), Some(6));
+                let seen = repo
+                    .get(tenant(6), Value::Int(id_of_value(stored.get("id"))))
+                    .await
+                    .expect("get succeeds");
+                assert!(seen.is_some(), "tenant 6 sees the row addressed to it");
+            }
+
+            #[tokio::test]
+            async fn batch_create_stamps_every_row() {
+                let repo = $tenant_factory().await;
+                let forged = vec![row(0, "a", 1, 1, 9), row(0, "b", 2, 1, 9)];
+                let stored = repo
+                    .batch_create(tenant(5), forged)
+                    .await
+                    .expect("batch create succeeds");
+                assert_eq!(stored.len(), 2, "every input row lands");
+                for one in &stored {
+                    assert_eq!(tenant_of(one), Some(5), "the stamp applies to every row");
+                }
+            }
+
+            #[tokio::test]
+            async fn tenant_cannot_migrate_a_row_by_patching_the_tenant_column() {
+                let repo = $tenant_factory().await;
+                seed(&repo).await;
+                let updated = repo
+                    .update(
+                        tenant(5),
+                        Value::Int(1),
+                        Record::new().set(Viewer::TENANT_COLUMN, 6),
+                    )
+                    .await
+                    .expect("in-tenant update succeeds");
+                assert_eq!(
+                    tenant_of(&updated),
+                    Some(5),
+                    "the stamp overrides a tenant-migrating patch"
+                );
+            }
+
+            // ---- reads -----------------------------------------------------------
+
+            #[tokio::test]
+            async fn list_and_count_are_tenant_scoped() {
+                let repo = $tenant_factory().await;
+                seed(&repo).await;
+                let page = repo
+                    .list(tenant(5), &ListQuery::default())
+                    .await
+                    .expect("list succeeds");
+                let t5: Vec<i64> = page
+                    .items
+                    .iter()
+                    .map(|r| id_of_value(r.get("id")))
+                    .collect();
+                assert_eq!(t5, vec![1, 2, 3]);
+                assert_eq!(page.total, 3);
+                let n = repo.count(tenant(6), None).await.expect("count succeeds");
+                assert_eq!(n, 2);
+                let all = repo
+                    .count(platform(), None)
+                    .await
+                    .expect("platform count succeeds");
+                assert_eq!(all, 5);
+            }
+
+            #[tokio::test]
+            async fn cross_tenant_get_is_not_found() {
+                let repo = $tenant_factory().await;
+                seed(&repo).await;
+                let seen = repo
+                    .get(tenant(5), Value::Int(4))
+                    .await
+                    .expect("get succeeds");
+                assert!(
+                    seen.is_none(),
+                    "a foreign row is indistinguishable from missing"
+                );
+            }
+
+            #[tokio::test]
+            async fn cross_tenant_update_and_delete_are_not_found() {
+                let repo = $tenant_factory().await;
+                seed(&repo).await;
+                let err = repo
+                    .update(tenant(5), Value::Int(4), Record::new().set("age", 0))
+                    .await
+                    .expect_err("cross-tenant update must fail");
+                assert_eq!(err, StorageError::NotFound);
+                let err = repo
+                    .delete(tenant(5), Value::Int(4))
+                    .await
+                    .expect_err("cross-tenant delete must fail");
+                assert_eq!(err, StorageError::NotFound);
+                let intact = repo
+                    .get(platform(), Value::Int(4))
+                    .await
+                    .expect("get succeeds")
+                    .expect("the foreign row survived untouched");
+                assert_eq!(intact.get("age").and_then(Value::as_i64), Some(20));
+            }
+
+            #[tokio::test]
+            async fn cross_tenant_upsert_conflicts_and_leaves_the_foreign_row_intact() {
+                let repo = $tenant_factory().await;
+                seed(&repo).await;
+                // Row 4 belongs to tenant 6. Tenant 5 upserts onto it —
+                // the update face requires visibility, the insert face
+                // hits an occupied pk: a conflict that mutates nothing.
+                let err = repo
+                    .upsert(tenant(5), row(4, "hijack", 0, 5, 5))
+                    .await
+                    .expect_err("cross-tenant upsert must fail");
+                assert!(
+                    matches!(err, StorageError::Conflict(_)),
+                    "expected Conflict, got: {err}"
+                );
+                let intact = repo
+                    .get(platform(), Value::Int(4))
+                    .await
+                    .expect("get succeeds")
+                    .expect("the foreign row survived");
+                assert_eq!(intact.get("name").and_then(Value::as_str), Some("t6-delta"));
+                assert_eq!(tenant_of(&intact), Some(6));
+                assert_eq!(intact.get("age").and_then(Value::as_i64), Some(20));
+                // The in-tenant face still updates:
+                let updated = repo
+                    .upsert(tenant(5), row(1, "t5-alpha", 99, 1, 5))
+                    .await
+                    .expect("in-tenant upsert succeeds");
+                assert_eq!(updated.get("age").and_then(Value::as_i64), Some(99));
+                assert_eq!(tenant_of(&updated), Some(5));
+            }
+
+            #[tokio::test]
+            async fn token_paging_is_tenant_scoped() {
+                let repo = $tenant_factory().await;
+                seed(&repo).await;
+                let mut seen = Vec::new();
+                let mut token = String::new();
+                loop {
+                    let q = ListQuery {
+                        paging: Paging::Token {
+                            token: std::mem::take(&mut token),
+                            limit: 2,
+                        },
+                        ..ListQuery::default()
+                    };
+                    let page = repo.list(tenant(5), &q).await.expect("token page succeeds");
+                    let ids: Vec<i64> = page
+                        .items
+                        .iter()
+                        .map(|r| id_of_value(r.get("id")))
+                        .collect();
+                    seen.extend(ids);
+                    match page.next_token {
+                        Some(next) => token = next,
+                        None => break,
+                    }
+                }
+                assert_eq!(seen, vec![1, 2, 3], "token streaming sees one tenant only");
+            }
+
+            // ---- fail-closed -----------------------------------------------------
+
+            #[tokio::test]
+            async fn unidentified_viewer_fails_closed_on_every_path() {
+                let repo = $tenant_factory().await;
+                seed(&repo).await;
+                // A viewer whose tenancy nobody attached must *error* on a
+                // tenant-scoped table — never silently pass with the tenant
+                // predicate dropped, never just see an empty table.
+                macro_rules! fail_closed {
+                    ($what:literal, $call:expr) => {
+                        match $call {
+                            Err(StorageError::MissingViewer) => {}
+                            other => panic!(
+                                "{} must fail closed with MissingViewer, got: {:?}",
+                                $what, other
+                            ),
+                        }
+                    };
+                }
+                fail_closed!("get", repo.get(bare(), Value::Int(1)).await);
+                fail_closed!("list", repo.list(bare(), &ListQuery::default()).await);
+                fail_closed!("count", repo.count(bare(), None).await);
+                fail_closed!(
+                    "create",
+                    repo.create(bare(), tenant_widget("x", 1, 1, 5)).await
+                );
+                fail_closed!(
+                    "batch_create",
+                    repo.batch_create(bare(), vec![tenant_widget("x", 1, 1, 5)])
+                        .await
+                );
+                fail_closed!(
+                    "update",
+                    repo.update(bare(), Value::Int(1), Record::new().set("age", 2))
+                        .await
+                );
+                fail_closed!("upsert", repo.upsert(bare(), row(1, "x", 1, 1, 5)).await);
+                fail_closed!("delete", repo.delete(bare(), Value::Int(1)).await);
+                // And the row is still intact afterwards:
+                let intact = repo
+                    .get(platform(), Value::Int(1))
+                    .await
+                    .expect("get succeeds")
+                    .expect("row survived");
+                assert_eq!(tenant_of(&intact), Some(5));
+            }
+
+            /// Reads the integer id out of a stored row.
+            fn id_of_value(v: Option<&Value>) -> i64 {
+                v.and_then(Value::as_i64).expect("int id")
             }
         }
     };

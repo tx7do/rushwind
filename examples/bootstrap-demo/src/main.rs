@@ -7,6 +7,12 @@
 //! reached the route pack; `POST/GET /widgets` is the storage line's
 //! working CRUD edge.
 //!
+//! The crud edge is **deny by default**: without a viewer policy every
+//! request sees nothing. The demo opts into `viewer: all` explicitly —
+//! a real deployment does NOT do this; it registers its own `"crud"`
+//! api pack that derives a `Viewer` from the request's authenticated
+//! claims (see `Bootstrap::api_pack` and `CrudApi::with_viewer`).
+//!
 //! Try it: `cargo run -p bootstrap-demo`, then
 //! `curl http://<printed-endpoint>/health` and `/wired`, then Ctrl+C.
 //!
@@ -32,6 +38,10 @@ storage:
 storage_endpoints:
   - nest: /widgets
     api: crud
+    # Deny by default without this line — the demo is all-access on
+    # purpose. A real deployment omits `viewer` and derives the Viewer
+    # from authn claims via its own api pack (Bootstrap::api_pack).
+    viewer: all
 servers:
   - kind: http
     bind: 127.0.0.1:0
