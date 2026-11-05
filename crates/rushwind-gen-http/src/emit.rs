@@ -200,6 +200,22 @@ pub(crate) fn emit_routes(out: &mut String, routes: &[RouteData], shadow: &[bool
         let _ = writeln!(out, "        pub {}: {},", f.0, f.1);
     }
     let _ = writeln!(out, "    }}");
+    // AIP-136 "verb on resource" 探测：任一路径段在 `}` 之后还有剩余字符
+    // （如 `/bi-dashboards/{id}:copy`）。matchit（axum 0.8 的路由树）拒绝
+    // 这类混合段，mount 时据此跳过注册——绑定保留在 ROUTES 供文档与
+    // 差分清单，服务照常装配。
+    let _ = writeln!(
+        out,
+        "    pub fn is_verb_on_resource(path: &str) -> bool {{"
+    );
+    let _ = writeln!(
+        out,
+        "        path.split('/').any(|seg| match seg.find('}}') {{"
+    );
+    let _ = writeln!(out, "            Some(i) => i + 1 < seg.len(),");
+    let _ = writeln!(out, "            None => false,");
+    let _ = writeln!(out, "        }})");
+    let _ = writeln!(out, "    }}");
     let _ = writeln!(out, "    pub static ROUTES: &[RouteSpec] = &[");
     for (idx, r) in routes.iter().enumerate() {
         let _ = writeln!(out, "        RouteSpec {{");
@@ -527,6 +543,14 @@ pub mod mounts {{"
         let _ = writeln!(
             out,
             "        let mr = wrap(axum::routing::on(m, h), &bind_wire, {gated});"
+        );
+        // matchit (axum 0.8) 拒绝"参数后跟字面量"的混合段（AIP-136 的
+        // `{id}:copy` custom-method 形态）；该绑定保持 ROUTES 记录与
+        // trait 面，但不进 axum 路由树——服务照常装配，路由本身待
+        // wire 层原生支持后恢复注册。
+        let _ = writeln!(
+            out,
+            "        if super::routes::is_verb_on_resource(spec.path) {{ return r; }}"
         );
         let _ = writeln!(out, "        r.route(spec.path, mr)");
         let _ = writeln!(out, "    }}");
