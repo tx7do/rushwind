@@ -14,14 +14,19 @@
 - 缓存装饰器 `ScopeKey` 增租户轴（同 actor 异租户不再共条目）。
 - 其余 go-crud 修复经核对为已覆盖或结构不适用：软删无 `deleted_by`（与 531624f 修后语义一致）、分页 limit 已钳制（opensearch 同源缺陷的 Rust 面无恙）、gorm 主键回读/mongodb FindOne 选项/Rust 面结构不同、cassandra 三缺陷（gocql 一致性/大小写折叠/集合解码）为驱动专属、doris 不存在于 Rust 线。
 
-**transport/broker 线（kratos-transport 035b95cc..d5f78b01）**
+**transport/broker 线（kratos-transport 035b95cc..d5f78b01，逐条 PORTED / 核对不适用）**
 
-- broker-redis：健康检查独立连接（同连接 Ping 内部 Receive 会吞 PUBLISH 帧）、心跳 PONG 静默（issue #133）、断开后 publish/subscribe 清晰报错而非 panic、重连地址重推、密码连接、PEL 僵尸消息 XAUTOCLAIM 回收。
-- broker-rabbitmq：订阅模型收敛为「同步 declare+bind + 单一再订阅循环」（中间轮次的回归以最终形态为准）、waitConnection 重建、毒消息 Nack、同主题先退旧再订新。
-- transport-ws：会话注册 + Stop 关闭全部会话、控制帧与数据写串行、pong 续期防心跳误杀、慢消费者发送上限。
-- transport-sse：分派克隆防重复 base64、发布时打时间戳（TTL 不再吞事件）、回放日志封顶、Last-Event-ID 严格大于、退订有界重试、Range 快照、Add 原子化、元数据事件不断连、显式 404。
-- broker-{mqtt,kafka,nats,stomp,pulsar} 与 transport-mqtt：同主题退订次序、毒消息处理、错误隔离、幂等退订、 producers 重连重建、批量间隔零值守卫等。
+- broker-redis：**移植**——断开后 publish/subscribe 以 NotConnected 拒绝（原先惰性重拨反而成功）、断开幂等 + 订阅清理、密码连接（PR #132，serde 向后兼容）、同主题订阅登记表（旧流先退，ptr_eq 身份校验防陈旧句柄误删）。**核对不适用**——健康检查独立连接（本引擎无健康检查路径）、PONG 静默（无任何日志面）、重连地址重推（无 pool/addr 分裂）、stream AutoAck/XAUTOCLAIM（无消费组流，明示非目标）。
+- broker-rabbitmq：**移植**——消费模型收敛为上游最终形态（同步 declare+bind + 单一再订阅循环 + 指数退避重拨，永不双消费者）、断开幂等 + 重连闭环、同主题登记表、失败登记不残留。**核对不适用**——毒消息 Nack（载荷透传无引擎侧解码、auto-ack 为文档化设计）。
+- transport-ws / transport-sse：十六项上游缺陷**全部核对不适用**——Rust 形态不同（sse 为有界 broadcast ring、退订即 receiver drop、无共享可变事件、无回放日志；ws 为极简路由构建器，无会话管理器/心跳/客户端），但补了五个防回归钉子测试（多流分发载荷逐字节一致、慢消费者不阻塞发布、Stop 关闭全部会话、空载荷不断流、显式 404/405）。
+- broker-mqtt：**移植**——断开真正停泵（原先 1 秒内自动复活并重挂订阅）、退订等 UNSUBACK（泵配对 FIFO，10 秒上限）、失败登记清理、陈旧句柄守卫。**核对不适用**——同主题先退旧再订新（处理器原子替换，按 MQTT 规范同过滤器服务端自替换）。
+- broker-nats：**移植**——真断开 + 地址存储 + Connect 重建（原先 disconnect 为空操作）、flush 失败登记清理。
+- broker-stomp：**移植**——断开次序 UNSUBSCRIBE→DISCONNECT（帧序依赖活连接）、重连重放订阅。
+- broker-pulsar：**移植**——Connect 重建 client（原先断开后永久不可用）、同主题流登记表（原先双消费者分流丢消息）。
+- broker-kafka：**移植**——key→id 映射。**核对不适用**——writer nil map（disconnect 清空而非置 nil）、批量间隔零值（无批量模式）、同主题（ additive 设计无覆盖面）。
+- transport-mqtt：**移植**——重启真重订阅端到端钉子（嵌入式 broker 验证）；注册表锁/僵尸窗口等骨架缺陷在 Rust 面无对应结构。
 - webtransport/h3/quic/axum/cron 经逐条核对为已覆盖或设计不适用：Rust 面以 endpoint 级真释放 + 逐连接 stop 竞速实现关停（强于上游 http3.Server 不可重启补丁的意图），axum 中间件短路是 tower 模型结构保证，cron 无 gRPC keepalive 对应面。
+- **遗留契约缺口**：上游毒消息路由（ErrorHandler + 非自动确认 Nack）需要 `rushwind-broker` 契约先有 error-handler hook 与 ack 策略选项才能移植；当前各引擎已保证 handler 错误不杀订阅。
 
 **bootstrap 线（kratos-bootstrap bc2912a..5968de4）**
 

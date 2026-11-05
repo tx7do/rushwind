@@ -109,6 +109,15 @@ impl MongoRepo {
     }
 
     /// Connects to MongoDB and binds a repository to `database`.`schema.table`.
+    ///
+    /// The unique primary-key index is ensured here, not left as a
+    /// deployment side-step: the engine's conflict semantics (a duplicate
+    /// id surfacing as [`StorageError::Conflict`] from `create`, the
+    /// upsert insert face, and `batch_create`'s atomicity) are defined
+    /// against it, so a repository built through `connect` cannot silently
+    /// run without it. Idempotent. Repositories built through
+    /// [`MongoRepo::new`] — a collection the caller already holds — must
+    /// call [`MongoRepo::ensure_primary_index`] themselves.
     pub async fn connect(uri: &str, database: &str, schema: Schema) -> Result<Self, StorageError> {
         let client = mongodb::Client::with_uri_str(uri)
             .await
@@ -116,7 +125,9 @@ impl MongoRepo {
         let collection = client
             .database(database)
             .collection::<Document>(&schema.table);
-        Ok(Self::new(collection, schema))
+        let repo = Self::new(collection, schema);
+        repo.ensure_primary_index().await?;
+        Ok(repo)
     }
 
     /// Drops the backing collection — the inverse of a fresh deployment,

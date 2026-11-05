@@ -309,22 +309,14 @@ impl CassandraRepo {
         Ok(TenantRule { column, decision })
     }
 
-    /// Whether a conditional write's result reports `[applied] = true`. The
-    /// LWT verdict rides in the result rows; a result body that fails to
-    /// parse is treated as applied — the write itself still succeeded, and
-    /// only a definite `false` proves a lost condition (matching the create
-    /// path's tolerance).
+    /// Whether a conditional write's result reports `[applied] = true`.
+    /// Delegates to [`CassandraRepo::lwt_rows_applied`] — the shared
+    /// dynamic parser both the single-row and batch conditional paths
+    /// resolve through, so the two cannot drift apart again.
     fn lwt_applied(&self, result: scylla::response::query_result::QueryResult) -> bool {
         result
             .into_rows_result()
-            .ok()
-            .and_then(|rows| {
-                rows.rows::<(Option<bool>,)>().ok().and_then(|mut rows| {
-                    rows.next()
-                        .and_then(|row| row.ok())
-                        .and_then(|(applied,)| applied)
-                })
-            })
+            .map(lwt_rows_applied)
             .unwrap_or(true)
     }
 
@@ -640,27 +632,11 @@ impl CassandraRepo {
             .await
             .map_err(|e| self.map_err(e))?;
         // A conditional BATCH that was not applied returns result rows
-        // whose first column ([applied]) is false - the rows also carry the
-        // conflicting current values, so parse dynamically instead of
-        // expecting a one-column tuple.
+        // whose first column ([applied]) is false — the same dynamic parse
+        // the single-row LWT verdict uses, via the shared helper.
         let all_applied = result
             .into_rows_result()
-            .ok()
-            .and_then(|rows| {
-                rows.rows().ok().map(|mut all| {
-                    all.by_ref().all(|row| {
-                        row.map(|row: scylla::value::Row| {
-                            row.columns
-                                .first()
-                                .map(|first| {
-                                    !matches!(first, Some(scylla::value::CqlValue::Boolean(false)))
-                                })
-                                .unwrap_or(true)
-                        })
-                        .unwrap_or(true)
-                    })
-                })
-            })
+            .map(lwt_rows_applied)
             .unwrap_or(true);
         if !all_applied {
             return Err(StorageError::Conflict(
@@ -869,5 +845,27 @@ impl Repository for CassandraRepo {
 
     fn delete(&self, ctx: QueryCtx, id: Value) -> RepoFuture<'_, ()> {
         Box::pin(async move { self.delete_async(&ctx, id).await })
+    }
+}
+
+/// The conditional-write verdict over an LWT result's rows: only a definite
+/// first-column `Boolean(false)` proves a lost condition. A lost LWT returns
+/// `[applied] = false` **plus** the conflicting current values — a
+/// multi-column row the scylla driver refuses to decode into a fixed
+/// one-column tuple — so the rows are parsed dynamically; anything
+/// unparseable still counts as applied (the write itself succeeded, and the
+/// create/upsert/batch callers only reject on a definite loss).
+fn lwt_rows_applied(rows: scylla::response::query_result::QueryRowsResult) -> bool {
+    match rows.rows() {
+        Ok(mut all) => all.all(|row| {
+            row.map(|row: scylla::value::Row| {
+                row.columns
+                    .first()
+                    .map(|first| !matches!(first, Some(scylla::value::CqlValue::Boolean(false))))
+                    .unwrap_or(true)
+            })
+            .unwrap_or(true)
+        }),
+        Err(_) => true,
     }
 }

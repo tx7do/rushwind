@@ -431,6 +431,7 @@ impl Broker for MqttBroker {
                 client: self.client.lock().await.clone(),
                 generation: self.generation.load(Ordering::SeqCst),
                 shared: Arc::clone(&self.shared),
+                handler: Arc::clone(&handler),
             }) as Box<dyn Subscriber>)
         })
     }
@@ -445,6 +446,27 @@ struct MqttSubscriber {
     /// session the broker no longer holds.
     generation: u64,
     shared: Arc<Shared>,
+    /// This handle's own handler — the identity the teardown checks
+    /// against the registry, so a stale handle cannot strip the
+    /// replacement that re-subscribed the same filter.
+    handler: Handler,
+}
+
+impl MqttSubscriber {
+    /// Whether this handle still owns the topic's registry entry — a
+    /// duplicate subscribe replaces the entry, and a stale handle's
+    /// teardown (explicit or on drop) must then touch nothing: removing
+    /// the entry would orphan the replacement's deliveries, and the wire
+    /// UNSUBSCRIBE would kill the live filter at the broker.
+    async fn owns_registration(&self) -> bool {
+        self.shared
+            .subscriptions
+            .lock()
+            .await
+            .get(&self.topic)
+            .map(|current| Arc::ptr_eq(current, &self.handler))
+            .unwrap_or(false)
+    }
 }
 
 impl Subscriber for MqttSubscriber {
@@ -454,6 +476,9 @@ impl Subscriber for MqttSubscriber {
 
     fn unsubscribe(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
+            if !self.owns_registration().await {
+                return Ok(());
+            }
             self.shared.subscriptions.lock().await.remove(&self.topic);
             if self.generation != self.shared.generation.load(Ordering::SeqCst) {
                 // The subscription armed on a retired generation: its
@@ -517,8 +542,13 @@ impl Subscriber for MqttSubscriber {
 
 impl Drop for MqttSubscriber {
     fn drop(&mut self) {
+        // Same ownership rule as `unsubscribe`: only the handle whose
+        // handler is still the registry's current entry may remove it — a
+        // stale handle's drop must not strip a replacement's registration.
         if let Ok(mut subscriptions) = self.shared.subscriptions.try_lock() {
-            subscriptions.remove(&self.topic);
+            subscriptions.retain(|topic, current| {
+                !(topic == &self.topic && Arc::ptr_eq(current, &self.handler))
+            });
         }
     }
 }
@@ -635,6 +665,58 @@ mod tests {
             "one registration per filter, not a stacked pair"
         );
         assert!(subscriptions.contains_key("probe/dup"));
+    }
+
+    /// A stale handle's teardown must not strip the replacement: after a
+    /// duplicate subscribe, the first handle's explicit unsubscribe and
+    /// its drop both leave the second handler registered — otherwise the
+    /// topic's deliveries silently stop (the stale-handle hazard the
+    /// sibling engines guard with the same ptr-eq identity check).
+    #[tokio::test]
+    async fn stale_handle_teardown_preserves_the_replacement() {
+        let broker = broker();
+        let mut first = broker
+            .subscribe("probe/stale", sink())
+            .await
+            .expect("first subscribe");
+        let mut second = broker
+            .subscribe("probe/stale", sink())
+            .await
+            .expect("replacement subscribe");
+
+        first
+            .unsubscribe()
+            .await
+            .expect("stale unsubscribe reports success");
+        {
+            let subscriptions = broker.shared.subscriptions.lock().await;
+            assert!(
+                subscriptions.contains_key("probe/stale"),
+                "a stale unsubscribe must not strip the replacement"
+            );
+        }
+
+        drop(first);
+        {
+            let subscriptions = broker.shared.subscriptions.lock().await;
+            assert!(
+                subscriptions.contains_key("probe/stale"),
+                "a stale handle's drop must not strip the replacement either"
+            );
+        }
+
+        // The replacement is the owner: its teardown does clean up.
+        second
+            .unsubscribe()
+            .await
+            .expect("owner unsubscribe succeeds");
+        {
+            let subscriptions = broker.shared.subscriptions.lock().await;
+            assert!(
+                !subscriptions.contains_key("probe/stale"),
+                "the owning handle's unsubscribe removes the registration"
+            );
+        }
     }
 
     /// The MQTT topic-filter matching table: literal segments, `+` one
