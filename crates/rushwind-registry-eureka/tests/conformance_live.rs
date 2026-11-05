@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use rushwind_registry::{Discovery, Registrar, Registration, Watcher};
+use rushwind_registry::{Discovery, Registrar, Registration};
 use rushwind_registry_eureka::EurekaRegistry;
 use rushwind_transport::Instance;
 
