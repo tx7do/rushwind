@@ -101,7 +101,7 @@
 
 三条硬性义务（套件强制）：
 
-1. **Viewer 作用域是权限边界**：所有路径（get/list/count/update/upsert/delete）必须施加作用域；越界的行与不存在的行**不可区分**（`get` 返回 `Ok(None)`，写返回 `NotFound`）。
+1. **Viewer 双轴作用域是权限边界**：所有路径（get/list/count/update/upsert/delete）必须施加两根正交的作用域轴——**数据范围轴**（`DataRange`：ALL/UNIT/USER/OWN/NONE）与**租户轴**（`Tenancy`：`Unidentified` 对租户表一律 `MissingViewer` 报错 fail-closed、`Platform` 放行、`Tenant(id)` 全路径谓词注入且写入强制盖章）；越界的行与不存在的行**不可区分**（`get` 返回 `Ok(None)`，写返回 `NotFound`）。写路径无豁免：`upsert` 先经作用域读探针，可见才更新、不可见即插入面，主键被占一律 `Conflict`——绝不静默覆盖不可见行（跨租户覆盖正是这套探针要堵死的洞）。
 2. **create 回填主键**，所有写操作返回完整存储行。
 3. **过滤器翻译必须忠实**（含嵌套组），或以 `InvalidQuery` 拒绝——校验先于引擎触达。
 
@@ -137,15 +137,15 @@
 
 SQL 三方言的语句渲染由快照测试逐字钉死（占位符风格 `$n` vs `?`、LIMIT/OFFSET 绑定、ILIKE 折叠），live 容器套件验证的是连接、事务与真实服务器的方言行为——两层互相兜底。MongoDB 的 `LIKE` 族编译为转义加锚定的正则（SQL 通配符语义），元字符绝不逃逸成通配；生成主键用 `max(pk)+1`（文档库没有 rowid 别名），`batch_create` 的严格原子性需要副本集事务，单机部署下是单命令尽力语义——两处都在引擎文档里言明。内存引擎的存在不是多余的样例——它让「同一过滤器树、多引擎、逐行一致」成为套件可执行的断言，而非文档承诺。
 
-横切层以装饰器表达：`rushwind-storage-cache` 把 Cache-Aside + SingleFlight 模式包成任意 `Repository` 之上的透明层。两条租户攸关的设计决策——**缓存键含 viewer 作用域**（`own(1)` 与 `own(2)` 永不共享条目，缓存无法跨租户泄漏），以及**失效即递增 per-key generation**（写事务落地前已出发的加载不得用旧行回填缓存）——各有一条行为测试钉死；装饰器本身还须整套通过 27 例一致性套件，证明其透明性。
+横切层以装饰器表达：`rushwind-storage-cache` 把 Cache-Aside + SingleFlight 模式包成任意 `Repository` 之上的透明层。两条租户攸关的设计决策——**缓存键含 viewer 全部作用域轴**（数据范围 + 租户轴：`own(1)` 与 `own(2)` 永不共享条目，同 actor 异租户同样不共享，缓存无法跨租户泄漏），以及**失效即递增 per-key generation**（写事务落地前已出发的加载不得用旧行回填缓存）——各有一条行为测试钉死；装饰器本身还须整套通过 40 例一致性套件（30 例契约 + 10 例租户），证明其透明性。
 
-同一手法延伸到软删除：`rushwind-storage-soft-delete` 把经典 ORM 的软删语义做成引擎无关的装饰器——表声明一个 `deleted_at` 整数列，`delete` 变为墓碑写入，所有读路径（get/list/count/update 目标）过滤墓碑，`restore`/`purge`/`list_deleted` 显式 opting out；`upsert` 写入可见世界（墓碑 id 以新数据复活）。审计话语权归装饰器：delete 审计为 `Delete`（尽管底层是 `Update`），落库写走无审计 sink 的静默上下文。装饰器本身过全套 27 例透明性套件 + 9 例行为测试。
+同一手法延伸到软删除：`rushwind-storage-soft-delete` 把经典 ORM 的软删语义做成引擎无关的装饰器——表声明一个 `deleted_at` 整数列，`delete` 变为墓碑写入，所有读路径（get/list/count/update 目标）过滤墓碑，`restore`/`purge`/`list_deleted` 显式 opting out；`upsert` 写入可见世界（墓碑 id 以新数据复活）。审计话语权归装饰器：delete 审计为 `Delete`（尽管底层是 `Update`），落库写走无审计 sink 的静默上下文。装饰器本身过全套 40 例透明性套件（30 契约 + 10 租户）+ 9 例行为测试。
 
 DTO↔Entity 映射落在 `rushwind-storage-macros`：契约 crate 定义 `ToRecord`/`FromRecord` 一对 trait，derive 宏为受支持的标量模型（`String`/`i64`/`f64`/`bool` 及其 `Option`）生成实现——`None` ↔ `NULL`，缺失或错型字段即 `InvalidQuery`。映射在编译期完成，全程无需运行时反射。
 
 最后两块积木各归其位。树形查询不进契约、也不进引擎——`rushwind-storage-tree` 把整棵树的词汇表（`children`/`roots`/`ancestors`/`subtree`/`is_ancestor`）表达为契约级查询的组合：约定一个 `parent_id` 整数列，children/roots 是过滤列表，subtree 是逐层广度扫描，环损坏报 `InvalidQuery` 而非死循环，悬空父 id 如根截止。代价是深子树每层一次 list——SQL 引擎日后可用递归 CTE 出专用快路径，而任何引擎（含装饰器栈）第一天就能用。可观测性同理不绑栈：`rushwind-storage-observe` 只发 `tracing` span（`rushwind.storage`，带 `table`/`op`/`outcome`），导出到 OpenTelemetry 是 subscriber 侧（tracing-opentelemetry）的选型——观测栈是用户的底板，RushWind 只递积木。
 
-最后一块积木把整条线接到线上：`rushwind-storage-axum` 把任意 `Repository` 挂成 CRUD 路由（GET/POST/PATCH/PUT/DELETE），列表查询的两种线上语法在 HTTP 边界双入口——`?q={protojson}` 原样收下 protojson 请求文档，散参数则面向临时调用方（`filter` 走 AIP 文本、`sort=field:dir`、`fields` 掩码、三种分页参数）。写路径的 JSON body 经 schema 校验（未知列、类型错位即 400），错误taxonomy映射为状态码（NotFound→404、InvalidQuery→400、Conflict→409、Unsupported→501）。租户在边界收口：`with_viewer` 把请求头解析为 `Viewer`，作用域强制仍然由引擎在每次调用时执行——HTTP 层只负责把身份变成作用域，从不越权放行。
+最后一块积木把整条线接到线上：`rushwind-storage-axum` 把任意 `Repository` 挂成 CRUD 路由（GET/POST/PATCH/PUT/DELETE），列表查询的两种线上语法在 HTTP 边界双入口——`?q={protojson}` 原样收下 protojson 请求文档，散参数则面向临时调用方（`filter` 走 AIP 文本、`sort=field:dir`、`fields` 掩码、三种分页参数）。写路径的 JSON body 经 schema 校验（未知列、类型错位即 400），错误taxonomy映射为状态码（NotFound→404、InvalidQuery→400、Conflict→409、Unsupported→501、MissingViewer→400）。租户在边界收口，且**缺省拒绝**：未安装 viewer 策略的 `CrudApi` 以 `Viewer::default()`（NONE 范围 + 无租户身份）执行一切请求——忘了装策略的后果是请求被拒而非数据裸奔，全访问是 `with_viewer(|_| Viewer::all())` 的显式选择；已装策略时，载荷里伪造的租户列/`owner_id`/`unit_id`（与 viewer 身份不符的值）在触达引擎前即 400 拒绝（引擎底层的强制盖章是其后的第二道闸）。作用域强制仍然由引擎在每次调用时执行——HTTP 层只负责把身份变成作用域，从不越权放行。
 
 ## 生命周期设计决策
 
@@ -188,4 +188,19 @@ DTO↔Entity 映射落在 `rushwind-storage-macros`：契约 crate 定义 `ToRec
 | `paging_and_sorting_violations_are_rejected` | page 0、Token+自定义排序、垃圾游标 → `InvalidQuery` |
 | `field_mask_projects_returned_rows` | 掩码行只含掩码列，无掩码行全列 |
 | `viewer_*` 四件 | ALL/NONE 边界、OWN 隔离（读不到、写不动、原行无损）、UNIT/USER 范围 |
+| `count_and_exists_honor_the_scope` | 计数与 exists 同受作用域约束（越界行不满足任何谓词） |
+| `create_on_an_occupied_pk_conflicts` | 显式主键撞已占行即 `Conflict`，原行无损 |
+| `upsert_never_touches_an_out_of_scope_row` | 探针语义：不可见行走插入面，被占即冲突，绝不覆盖不可见行 |
 | `audit_entries_flow_to_the_sink` | create/update/delete 产生 `AuditEntry`（读审计是引擎策略，不钉死） |
+
+**租户模块**（每个引擎的 tenant factory 对 `tenant_suite_schema` 再跑一遍）：
+
+| 场景 | 钉住的语义 |
+|:---|:---|
+| `create_force_stamps_the_tenant` / `batch_create_stamps_every_row` | 租户角色伪造租户列无效，盖章覆盖每一行 |
+| `platform_create_respects_explicit_tenant` | 平台视图可显式指定租户（代租户建行） |
+| `tenant_cannot_migrate_a_row_by_patching_the_tenant_column` | patch 租户列无法把行迁入他租户 |
+| `list_and_count_are_tenant_scoped` / `token_paging_is_tenant_scoped` | 列表/计数/token 流只见本租户 |
+| `cross_tenant_get_is_not_found` / `cross_tenant_update_and_delete_are_not_found` | 跨租户读/改/删 ≡ 不存在（防存在性泄露），原行无损 |
+| `cross_tenant_upsert_conflicts_and_leaves_the_foreign_row_intact` | 跨租户 upsert 冲突且原行完好——CI 此前全绿正因缺这道钉子 |
+| `unidentified_viewer_fails_closed_on_every_path` | 无身份 viewer 在租户表上全路径 `MissingViewer` 报错，绝不静默放行 |

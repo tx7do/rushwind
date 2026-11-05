@@ -1064,6 +1064,50 @@ macro_rules! rushwind_storage_conformance_suite {
             }
 
             #[tokio::test]
+            async fn a_tenantless_row_is_nobodys() {
+                let repo = $tenant_factory().await;
+                seed(&repo).await;
+                // A tenant-scoped row whose tenant column carries no value
+                // is nobody's: NULL matches no tenant predicate, so only
+                // the platform view reaches it. A tenant actor cannot see,
+                // count, or adopt it — the stamp's other half.
+                let stored = repo
+                    .create(
+                        platform(),
+                        Record::new()
+                            .set("name", "tenantless")
+                            .set("age", 1)
+                            .set("owner_id", 1),
+                    )
+                    .await
+                    .expect("platform create succeeds");
+                assert_eq!(
+                    tenant_of(&stored),
+                    None,
+                    "no payload value means the tenant column stays NULL"
+                );
+                let id = id_of_value(stored.get("id"));
+                let seen = repo
+                    .get(tenant(5), Value::Int(id))
+                    .await
+                    .expect("get succeeds");
+                assert!(
+                    seen.is_none(),
+                    "a NULL-tenant row is invisible to every tenant"
+                );
+                let n = repo.count(tenant(5), None).await.expect("count succeeds");
+                assert_eq!(
+                    n, 3,
+                    "the tenantless row adds nothing to any tenant's count"
+                );
+                let all = repo
+                    .count(platform(), None)
+                    .await
+                    .expect("platform count succeeds");
+                assert_eq!(all, 6, "only the platform view reaches it");
+            }
+
+            #[tokio::test]
             async fn batch_create_stamps_every_row() {
                 let repo = $tenant_factory().await;
                 let forged = vec![row(0, "a", 1, 1, 9), row(0, "b", 2, 1, 9)];
