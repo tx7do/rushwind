@@ -414,10 +414,10 @@ impl SseState {
             match self.response.chunk().await {
                 Ok(Some(bytes)) => {
                     self.buffer.extend_from_slice(&bytes);
-                    self.drain_lines();
+                    self.drain_complete_lines();
                 }
                 Ok(None) => {
-                    self.drain_lines();
+                    self.flush_partial_line();
                     self.done = true;
                 }
                 Err(e) => return Err(AiError::Request(format!("stream: {e}"))),
@@ -426,12 +426,22 @@ impl SseState {
     }
 
     /// Splits complete `data:` lines out of the buffer into
-    /// `pending`; a final unterminated line flushes too.
-    fn drain_lines(&mut self) {
+    /// `pending`. A line split across chunk boundaries stays buffered
+    /// until its `\n` arrives — flushing the partial bytes per chunk
+    /// would parse half a JSON payload as a whole line (a fabricated
+    /// decode error in the stream, and a lost `[DONE]` terminator when
+    /// that line is the split one).
+    fn drain_complete_lines(&mut self) {
         while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
             let line: Vec<u8> = self.buffer.drain(..=position).collect();
             self.parse_line(&line[..line.len() - 1]);
         }
+    }
+
+    /// The end-of-stream flush: after EOF the remaining unterminated
+    /// bytes are the final line (a peer that closes without a trailing
+    /// newline).
+    fn flush_partial_line(&mut self) {
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
             self.parse_line(&line);

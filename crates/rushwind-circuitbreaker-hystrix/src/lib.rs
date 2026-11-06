@@ -37,6 +37,12 @@ struct HystrixState {
     state: ContractState,
     opened_at: Instant,
     half_open_in: bool,
+    /// When the in-flight half-open trial was admitted. A trial whose
+    /// outcome never arrives (the caller dropped the future, panicked
+    /// between `allow` and `mark`, or forgot the mark) is reclaimed
+    /// after one sleep window, or the breaker stays stuck in half-open
+    /// rejecting everything forever.
+    half_open_at: Option<Instant>,
     closed: bool,
 }
 
@@ -101,6 +107,7 @@ impl HystrixBreaker {
                 state: ContractState::Closed,
                 opened_at: Instant::now(),
                 half_open_in: false,
+                half_open_at: None,
                 closed: false,
             }),
             error_threshold: options.error_threshold,
@@ -160,15 +167,27 @@ impl HystrixBreaker {
                 if now.duration_since(state.opened_at) >= self.sleep_window {
                     state.state = ContractState::HalfOpen;
                     state.half_open_in = true;
+                    state.half_open_at = Some(now);
                 } else {
                     return Err(CircuitError::Open);
                 }
             }
             ContractState::HalfOpen => {
                 if state.half_open_in {
-                    return Err(CircuitError::Open);
+                    // One trial at a time — unless the trial in flight
+                    // is lost: after a full sleep window without a mark,
+                    // reclaim the slot so the breaker can keep serving
+                    // trials instead of rejecting everything forever.
+                    let trial_lost = state
+                        .half_open_at
+                        .map(|at| now.duration_since(at) >= self.sleep_window)
+                        .unwrap_or(true);
+                    if !trial_lost {
+                        return Err(CircuitError::Open);
+                    }
                 }
                 state.half_open_in = true;
+                state.half_open_at = Some(now);
             }
             ContractState::Closed => {}
         }
@@ -262,6 +281,7 @@ impl CircuitBreaker for HystrixBreaker {
             // Trial succeeded — recover.
             state.state = ContractState::Closed;
             state.half_open_in = false;
+            state.half_open_at = None;
             Self::reset_buckets_locked(&mut state);
             return;
         }
@@ -282,6 +302,7 @@ impl CircuitBreaker for HystrixBreaker {
             state.state = ContractState::Open;
             state.opened_at = Instant::now();
             state.half_open_in = false;
+            state.half_open_at = None;
             return;
         }
 

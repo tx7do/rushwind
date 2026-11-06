@@ -61,8 +61,9 @@ struct Shared {
     /// destination is rebuilt from the topic.
     subscriptions: Mutex<HashMap<String, (String, Handler)>>,
     /// The frame sender of the live connection; `None` while
-    /// disconnected.
-    frames: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    /// disconnected. Bounded so a stalled broker applies backpressure to
+    /// publishers instead of letting the queue grow without limit.
+    frames: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     connected: Mutex<bool>,
     /// Monotonic subscription ids.
     next_subscription_id: AtomicU64,
@@ -113,9 +114,44 @@ pub struct StompSettings {
     pub addr: String,
 }
 
+/// The in-memory queue depth for outbound frames. A publisher blocks
+/// once the connection task falls this far behind — the backpressure
+/// that keeps a stalled broker from turning publishes into unbounded
+/// memory growth.
+const FRAME_CHANNEL_CAPACITY: usize = 1024;
+
+/// The largest accepted frame body, inbound or outbound: the hard
+/// ceiling `content-length` is trusted against and the NUL-scan fallback
+/// bails out at. The reference STOMP servers default to megabyte-scale
+/// messages; this sits well above that while refusing the
+/// attacker-chosen `content-length: 999999999999` allocation.
+const MAX_FRAME_BODY: usize = 16 * 1024 * 1024;
+
 /// Encodes one STOMP frame: command, headers, optional body and the
-/// terminating NUL.
-fn encode_frame(command: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+/// terminating NUL. Header names and values are validated first — a
+/// `\n` would terminate the header line early and a NUL would end the
+/// whole frame, either letting a crafted header value (an untrusted
+/// topic in a `destination`, for instance) inject structure into the
+/// wire. STOMP 1.2 escaping is not implemented, so the delimiters are
+/// refused rather than rewritten.
+fn encode_frame(
+    command: &str,
+    headers: &[(&str, String)],
+    body: &[u8],
+) -> Result<Vec<u8>, BrokerError> {
+    let poisoned = headers
+        .iter()
+        .any(|(name, value)| name.contains(['\n', '\0']) || value.contains(['\n', '\0']));
+    if poisoned {
+        return Err(BrokerError::Failed(
+            "stomp header carries a frame delimiter (newline or NUL)".to_string(),
+        ));
+    }
+    if body.len() > MAX_FRAME_BODY {
+        return Err(BrokerError::Failed(
+            "stomp frame body too large".to_string(),
+        ));
+    }
     let mut frame = Vec::new();
     frame.extend_from_slice(command.as_bytes());
     frame.push(b'\n');
@@ -128,7 +164,7 @@ fn encode_frame(command: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u
     frame.push(b'\n');
     frame.extend_from_slice(body);
     frame.push(0);
-    frame
+    Ok(frame)
 }
 
 /// A parsed inbound frame: the command, its headers, and the body.
@@ -177,6 +213,14 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> Result<Frame, BrokerError> {
         .and_then(|(_, value)| value.parse::<usize>().ok())
     {
         Some(length) => {
+            // The length header is peer-chosen: refuse to pre-allocate
+            // beyond the ceiling instead of trusting it with a
+            // gigabyte-scale `resize`.
+            if length > MAX_FRAME_BODY {
+                return Err(BrokerError::Failed(
+                    "stomp frame body too large".to_string(),
+                ));
+            }
             body.resize(length, 0);
             reader
                 .read_exact(&mut body)
@@ -196,6 +240,13 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> Result<Frame, BrokerError> {
                 break;
             }
             body.push(byte[0]);
+            // The length-less fallback reads to the NUL, so it is the
+            // same untrusted growth path — bounded at the same ceiling.
+            if body.len() > MAX_FRAME_BODY {
+                return Err(BrokerError::Failed(
+                    "stomp frame body too large".to_string(),
+                ));
+            }
         },
     }
     Ok(Frame {
@@ -220,7 +271,7 @@ async fn connection_loop(
     shared: Arc<Shared>,
     shutdown: Arc<Notify>,
     generation: u64,
-    mut frames_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut frames_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut backoff_secs = 1u64;
     loop {
@@ -234,14 +285,23 @@ async fn connection_loop(
             continue;
         };
         let (mut reader, mut writer) = stream.into_split();
-        let connect_frame = encode_frame(
+        let connect_frame = match encode_frame(
             "CONNECT",
             &[
                 ("accept-version", "1.2".to_string()),
                 ("host", "/".to_string()),
             ],
             &[],
-        );
+        ) {
+            Ok(frame) => frame,
+            // The handshake headers are literals; this arm is unreachable
+            // and kept only for the Result-carrying encoder.
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(30);
+                continue;
+            }
+        };
         if write_frame(&mut writer, &connect_frame).await.is_err() {
             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
             backoff_secs = (backoff_secs * 2).min(30);
@@ -260,7 +320,7 @@ async fn connection_loop(
         {
             let subscriptions = shared.subscriptions.lock().await.clone();
             for (id, (topic, _handler)) in &subscriptions {
-                let frame = encode_frame(
+                if let Ok(frame) = encode_frame(
                     "SUBSCRIBE",
                     &[
                         ("id", id.clone()),
@@ -268,24 +328,25 @@ async fn connection_loop(
                         ("ack", "auto".to_string()),
                     ],
                     &[],
-                );
-                let _ = write_frame(&mut writer, &frame).await;
+                ) {
+                    let _ = write_frame(&mut writer, &frame).await;
+                }
             }
             *shared.connected.lock().await = true;
         }
 
         loop {
             if shared.generation.load(Ordering::SeqCst) != generation {
-                let _ = write_frame(&mut writer, &encode_frame("DISCONNECT", &[], &[])).await;
+                if let Ok(frame) = encode_frame("DISCONNECT", &[], &[]) {
+                    let _ = write_frame(&mut writer, &frame).await;
+                }
                 return;
             }
             let broken = tokio::select! {
                 _ = shutdown.notified() => {
-                    let _ = write_frame(
-                        &mut writer,
-                        &encode_frame("DISCONNECT", &[], &[]),
-                    )
-                    .await;
+                    if let Ok(frame) = encode_frame("DISCONNECT", &[], &[]) {
+                        let _ = write_frame(&mut writer, &frame).await;
+                    }
                     return;
                 }
                 frame = frames_rx.recv() => match frame {
@@ -357,7 +418,7 @@ impl Broker for StompBroker {
             let shutdown = Arc::new(Notify::new());
             *self.shutdown.lock().await = Some(Arc::clone(&shutdown));
 
-            let (frames_tx, frames_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (frames_tx, frames_rx) = mpsc::channel::<Vec<u8>>(FRAME_CHANNEL_CAPACITY);
             *self.shared.frames.lock().await = Some(frames_tx.clone());
 
             let shared = Arc::clone(&self.shared);
@@ -391,10 +452,13 @@ impl Broker for StompBroker {
             let frames = self.shared.frames.lock().await.clone();
             if let Some(frames) = frames {
                 for id in self.shared.subscriptions.lock().await.keys() {
-                    let frame = encode_frame("UNSUBSCRIBE", &[("id", id.clone())], &[]);
-                    let _ = frames.send(frame);
+                    if let Ok(frame) = encode_frame("UNSUBSCRIBE", &[("id", id.clone())], &[]) {
+                        let _ = frames.send(frame).await;
+                    }
                 }
-                let _ = frames.send(encode_frame("DISCONNECT", &[], &[]));
+                if let Ok(frame) = encode_frame("DISCONNECT", &[], &[]) {
+                    let _ = frames.send(frame).await;
+                }
                 *self.shared.frames.lock().await = None;
             }
             Ok(())
@@ -420,8 +484,14 @@ impl Broker for StompBroker {
                     ("content-length", message.payload.len().to_string()),
                 ],
                 &message.payload,
-            );
-            frames.send(frame).map_err(|_| BrokerError::NotConnected)
+            )?;
+            // Bounded channel: this await is the backpressure point — a
+            // stalled broker holds publishers here instead of letting
+            // the queue (and the process memory) grow without limit.
+            frames
+                .send(frame)
+                .await
+                .map_err(|_| BrokerError::NotConnected)
         })
     }
 
@@ -438,21 +508,25 @@ impl Broker for StompBroker {
                     .fetch_add(1, Ordering::SeqCst)
             );
             let destination = format!("/topic/{topic}");
+            // The frame is encoded (and its header validation runs)
+            // before anything is registered: a topic carrying a frame
+            // delimiter is refused without ever entering the replay
+            // table.
+            let frame = encode_frame(
+                "SUBSCRIBE",
+                &[
+                    ("id", subscription_id.clone()),
+                    ("destination", destination.clone()),
+                    ("ack", "auto".to_string()),
+                ],
+                &[],
+            )?;
             self.shared.subscriptions.lock().await.insert(
                 subscription_id.clone(),
                 (topic.to_string(), Arc::clone(&handler)),
             );
             if let Some(frames) = self.shared.frames.lock().await.clone() {
-                let frame = encode_frame(
-                    "SUBSCRIBE",
-                    &[
-                        ("id", subscription_id.clone()),
-                        ("destination", destination.clone()),
-                        ("ack", "auto".to_string()),
-                    ],
-                    &[],
-                );
-                let _ = frames.send(frame);
+                let _ = frames.send(frame).await;
             }
             Ok(Box::new(StompSubscriber {
                 shared: Arc::clone(&self.shared),
@@ -484,9 +558,11 @@ impl Subscriber for StompSubscriber {
                 .await
                 .remove(&self.subscription_id);
             if let Some(frames) = self.shared.frames.lock().await.clone() {
-                let frame =
-                    encode_frame("UNSUBSCRIBE", &[("id", self.subscription_id.clone())], &[]);
-                let _ = frames.send(frame);
+                if let Ok(frame) =
+                    encode_frame("UNSUBSCRIBE", &[("id", self.subscription_id.clone())], &[])
+                {
+                    let _ = frames.send(frame).await;
+                }
             }
             Ok(())
         })

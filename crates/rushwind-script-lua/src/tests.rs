@@ -127,7 +127,7 @@ async fn the_sandbox_allow_list_shrinks_the_libraries() {
 }
 
 #[tokio::test]
-async fn the_default_library_set_is_full() {
+async fn the_default_library_set_is_the_minimal_safe_set() {
     let engine = engine().await;
     engine
         .load_string("s", "function hasio() return io ~= nil end")
@@ -138,8 +138,9 @@ async fn the_default_library_set_is_full() {
         engine
             .call_function("hasio", &[])
             .await
-            .expect("io is present"),
-        ScriptValue::Bool(true)
+            .expect("io is absent"),
+        ScriptValue::Bool(false),
+        "the default sandbox must not open io"
     );
 }
 
@@ -257,4 +258,43 @@ async fn probes_offer_the_full_capability_set() {
     assert!(engine.clone().as_runtime_hook_registrar().is_some());
     assert!(engine.clone().as_sync_executor().is_some());
     assert!(engine.as_quota_controller().is_some());
+}
+
+#[tokio::test]
+async fn the_default_sandbox_opens_no_io_os_or_package() {
+    let engine = engine().await;
+    engine
+        .load_string(
+            "probe",
+            "function probe() return io == nil and os == nil and package == nil end",
+        )
+        .await
+        .expect("load probe");
+    engine.execute().await.expect("execute defines the global");
+    let verdict = engine.call_function("probe", &[]).await.expect("probe");
+    assert_eq!(
+        verdict,
+        ScriptValue::Bool(true),
+        "default sandbox must not open io/os/package"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_open_libs_call_opts_into_io() {
+    let engine = factory().expect("engine");
+    let sandbox = Arc::clone(&engine)
+        .as_sandbox_configurator()
+        .expect("sandbox capability");
+    sandbox.set_open_libs(&["string", "io"]);
+    engine.init().await.expect("init");
+    engine
+        .load_string("probe", "function probe() return io ~= nil end")
+        .await
+        .expect("load probe");
+    engine.execute().await.expect("execute defines the global");
+    assert_eq!(
+        engine.call_function("probe", &[]).await.expect("probe"),
+        ScriptValue::Bool(true),
+        "an explicit io opt-in must open io"
+    );
 }

@@ -262,19 +262,30 @@ impl Health {
         let mut joins = Vec::with_capacity(snapshot.len());
         for (name, checker) in snapshot {
             let timeout = self.timeout;
-            joins.push(tokio::spawn(async move {
-                let result = tokio::time::timeout(timeout, checker())
-                    .await
-                    .unwrap_or_else(|_| Result::down(format!("checker {name:?} timed out")));
-                (name, result)
-            }));
+            let task_name = name.clone();
+            joins.push((
+                task_name,
+                tokio::spawn(async move {
+                    let result = tokio::time::timeout(timeout, checker())
+                        .await
+                        .unwrap_or_else(|_| Result::down(format!("checker {name:?} timed out")));
+                    (name, result)
+                }),
+            ));
         }
 
         let mut overall = Status::Up;
         let mut checks = BTreeMap::new();
-        for join in joins {
-            let Ok((name, result)) = join.await else {
-                continue;
+        for (name, join) in joins {
+            // A panicked checker is a failed component, not a silent
+            // absence: it reports down, or the aggregate would keep
+            // claiming readiness while the component is gone.
+            let (_, result) = match join.await {
+                Ok(pair) => pair,
+                Err(_) => (
+                    name.clone(),
+                    Result::down(format!("checker {name:?} panicked")),
+                ),
             };
             checks.insert(
                 name.clone(),

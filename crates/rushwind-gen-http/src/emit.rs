@@ -204,10 +204,7 @@ pub(crate) fn emit_routes(out: &mut String, routes: &[RouteData], shadow: &[bool
     // （如 `/bi-dashboards/{id}:copy`）。matchit（axum 0.8 的路由树）拒绝
     // 这类混合段，mount 时据此跳过注册——绑定保留在 ROUTES 供文档与
     // 差分清单，服务照常装配。
-    let _ = writeln!(
-        out,
-        "    pub fn is_verb_on_resource(path: &str) -> bool {{"
-    );
+    let _ = writeln!(out, "    pub fn is_verb_on_resource(path: &str) -> bool {{");
     let _ = writeln!(
         out,
         "        path.split('/').any(|seg| match seg.find('}}') {{"

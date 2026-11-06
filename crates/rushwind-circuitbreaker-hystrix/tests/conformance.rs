@@ -112,3 +112,30 @@ fn half_open_failure_re_opens() {
     assert_eq!(b.state(), rushwind_circuitbreaker::State::Open);
     assert!(b.allow().is_err(), "the re-opened circuit rejects");
 }
+
+/// A half-open trial whose outcome never arrives (the caller dropped
+/// the future, panicked between allow and mark, or forgot the mark) is
+/// reclaimed after one sleep window — the breaker admits a fresh trial
+/// instead of rejecting everything forever.
+#[test]
+fn a_lost_half_open_trial_is_reclaimed() {
+    let b = breaker();
+    // Trip open with failures.
+    for _ in 0..5 {
+        b.allow().expect("allow must succeed");
+        b.mark_failure();
+    }
+    assert_eq!(b.state(), rushwind_circuitbreaker::State::Open);
+
+    // Sleep past the window: half-open, one trial admitted.
+    std::thread::sleep(Duration::from_millis(150));
+    b.allow().expect("trial must be allowed");
+    assert!(b.allow().is_err(), "a second concurrent trial rejects");
+
+    // The trial never reports. Sleep past the sleep window again: the
+    // lost trial is reclaimed and a fresh one admits.
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(b.state(), rushwind_circuitbreaker::State::HalfOpen);
+    b.allow()
+        .expect("the reclaimed slot must admit a fresh trial");
+}

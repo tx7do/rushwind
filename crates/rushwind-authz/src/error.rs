@@ -19,6 +19,10 @@ pub enum AuthzError {
     MissingAuthClaims,
     /// The authz claims are malformed.
     InvalidClaims,
+    /// An installed policy was rejected — a rule whose `effect` is not
+    /// `allow` or `deny` (an effect only ever evaluated as allow would
+    /// silently widen access; the install fails instead).
+    InvalidPolicy,
 }
 
 impl AuthzError {
@@ -32,6 +36,7 @@ impl AuthzError {
         match self {
             Self::MissingAuthClaims => "AUTHZ_MISSING_CLAIMS",
             Self::InvalidClaims => "AUTHZ_INVALID_CLAIMS",
+            Self::InvalidPolicy => "AUTHZ_INVALID_POLICY",
         }
     }
 }
@@ -41,6 +46,7 @@ impl fmt::Display for AuthzError {
         let msg = match self {
             Self::MissingAuthClaims => "context missing authz claims",
             Self::InvalidClaims => "invalid claims",
+            Self::InvalidPolicy => "policy rejected: rule effect must be \"allow\" or \"deny\"",
         };
         write!(f, "{}: {}", self.code(), msg)
     }

@@ -109,6 +109,13 @@ impl CompatCors {
     /// The package's `isOriginAllowed`: empty origin never allowed; an
     /// empty configured list allows everything; otherwise exact match or
     /// a `*` entry.
+    ///
+    /// Note the deliberate divergence from [`crate::cors`]: the
+    /// tower-http path treats an empty origin list as "CORS off", this
+    /// compat layer — mirroring the reference Go package — treats it
+    /// as "allow every origin". A deployment that reads `CorsOptions`'s
+    /// "empty means off" doc and lands on the compat layer gets the
+    /// wide-open semantics; configure an explicit origin list there.
     fn is_origin_allowed(&self, origin: &str) -> bool {
         if origin.is_empty() {
             return false;

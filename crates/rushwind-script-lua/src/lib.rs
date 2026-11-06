@@ -5,9 +5,12 @@
 //!
 //! - The sandbox allow-list: [`set_open_libs`] records library names
 //!   and [`init`] builds the [`mlua::Lua`] instance over exactly that
-//!   set; an empty list is the "full standard set"
-//!   default, rendered as [`StdLib::ALL_SAFE`] because mlua's safe
-//!   constructor refuses the `debug` and `ffi` libraries. The classic
+//!   set; an empty list is the **minimal safe set** default
+//!   ([`default_stdlib`]: coroutine, table, string, math). mlua's
+//!   `ALL_SAFE` is *not* the default — it is safe in the
+//!   memory-safety sense only, and would open `io`, `os`, and
+//!   `package`, handing scripts host filesystem and process access;
+//!   those three are explicit opt-ins. The classic
 //!   library names map onto
 //!   [`mlua::StdLib`] bits (`base` has no mlua counterpart — the base
 //!   library is always present — and `channel` does not exist in Lua
@@ -76,6 +79,16 @@ use rushwind_script::{
 /// The registry name.
 pub const NAME: &str = "lua";
 
+/// The default open-library set: coroutine, table, string, math.
+/// Deliberately narrower than mlua's `ALL_SAFE` — that constant is
+/// "safe" in the memory-safety sense and includes `io`/`os`/`package`,
+/// which would hand every script host filesystem and process access.
+/// Scripts needing those open them through an explicit
+/// [`SandboxConfigurator::set_open_libs`] call.
+fn default_stdlib() -> StdLib {
+    StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::MATH
+}
+
 /// The `lua` engine: [`mlua`] over vendored Lua 5.4.
 pub struct LuaEngine {
     lua: Mutex<Option<Lua>>,
@@ -125,16 +138,17 @@ impl LuaEngine {
 
     /// The classic library names mapped onto [`StdLib`] bits. The
     /// default — no `set_open_libs` call, or an empty list — is the
-    /// full standard safe set, rendered here as
-    /// [`StdLib::ALL_SAFE`]: mlua's safe constructor refuses the
-    /// `debug` and `ffi` libraries that the full set would include,
-    /// so both the default and any explicit `debug` entry open
-    /// without them. `base` is always present in mlua and `channel`
-    /// does not exist in Lua 5.4; a list naming only those opens
-    /// base alone.
+    /// **minimal safe set** ([`default_stdlib`]): coroutine, table,
+    /// string, math. mlua's notion of "safe" (`ALL_SAFE`) is
+    /// memory-safety, not sandboxing — it opens `io`, `os`, and
+    /// `package`, which hand a script full host-filesystem and process
+    /// access. Those three remain available, but only through explicit
+    /// `set_open_libs` opt-in. `base` is always present in mlua and
+    /// `channel` does not exist in Lua 5.4; a list naming only those
+    /// opens base alone.
     fn std_lib_for(names: &[String]) -> StdLib {
         if names.is_empty() {
-            return StdLib::ALL_SAFE;
+            return default_stdlib();
         }
         let mut libs = StdLib::NONE;
         for name in names {

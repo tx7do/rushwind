@@ -48,11 +48,16 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rushwind_transaction::{BoxFuture, TransactionClient, TransactionError};
 
 /// The DTM server address when settings name none.
 const DEFAULT_SERVER: &str = "http://localhost:36789/api/dtmsvr";
+
+/// The per-request HTTP timeout for DTM calls. Without one, a stalled
+/// DTM server hangs every transaction call chain forever.
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The sub-branch count ceiling; registering beyond it is an error.
 const BRANCH_LIMIT: u32 = 99;
@@ -274,23 +279,41 @@ impl DtmClient {
 
     /// Creates a client for an explicit DTM server.
     pub fn with_server(server: impl Into<String>) -> Self {
+        Self::with_server_and_timeout(server, DEFAULT_HTTP_TIMEOUT)
+    }
+
+    /// Creates a client with an explicit per-request timeout. The
+    /// default client carries a total-request timeout ([`DEFAULT_HTTP_TIMEOUT`]):
+    /// without one, a DTM server that stalls hangs every saga/tcc/xa
+    /// call chain forever.
+    pub fn with_server_and_timeout(server: impl Into<String>, timeout: Duration) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: reqwest::Client::builder()
+                    .timeout(timeout)
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new()),
                 server: server.into(),
             }),
         }
     }
 
     /// Constructs from the bootstrap factory's settings wire shape;
-    /// an absent or empty `server` selects the default.
+    /// an absent or empty `server` selects the default, an absent
+    /// `timeout_ms` the default request timeout.
     pub fn from_settings(settings: serde_json::Value) -> Result<Self, TransactionError> {
         let server = settings
             .get("server")
             .and_then(|value| value.as_str())
             .filter(|value| !value.is_empty())
             .unwrap_or(DEFAULT_SERVER);
-        Ok(Self::with_server(server))
+        let timeout = settings
+            .get("timeout_ms")
+            .and_then(|value| value.as_u64())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_HTTP_TIMEOUT);
+        Ok(Self::with_server_and_timeout(server, timeout))
     }
 
     /// The DTM server address.

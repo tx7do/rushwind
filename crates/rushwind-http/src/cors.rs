@@ -9,6 +9,23 @@
 //! origin is the only
 //! shape that works). An empty origin list allows nothing — CORS stays
 //! off until configured.
+//!
+//! Two security notes every deployment should read before enabling:
+//!
+//! - **`*` + credentials means every origin is trusted with the
+//!   user's credentials.** The per-request echo makes any web page
+//!   able to carry that user's cookies/session and read the response
+//!   cross-origin — it is the moral equivalent of disabling the
+//!   same-origin policy for credentialed requests. Prefer an explicit
+//!   origin list whenever credentials are on; there is no
+//!   constructor-time guard, so this is a deployment-level decision.
+//!
+//! - **The gorilla-compat layer (`with_cors_compat`) has the opposite
+//!   empty-list semantics.** Matching the reference Go package, an
+//!   empty origin list there allows *everything* and answers
+//!   `Access-Control-Allow-Origin: *` — see `cors_compat`. The
+//!   "empty means off" contract in this module holds only for the
+//!   tower-http path.
 
 use std::time::Duration;
 
@@ -105,7 +122,10 @@ impl CorsOptions {
         let any_origin = self.allow_origins.iter().any(|origin| origin == "*");
         let origin = if any_origin && self.allow_credentials {
             // Credentialed + any-origin is a browser-rejected shape;
-            // echo the request origin instead.
+            // echo the request origin instead. Note the consequence:
+            // every origin is now trusted with the user's credentials
+            // — the module docs should be read before enabling this
+            // combination.
             AllowOrigin::predicate(|_, _| true)
         } else if any_origin {
             AllowOrigin::any()

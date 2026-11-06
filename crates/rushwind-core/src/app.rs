@@ -267,11 +267,14 @@ impl App {
         }
 
         // Phase 2 — before hooks, sequential, fresh budget each. Hook
-        // outcomes are deliberately discarded: a failing or hanging hook
-        // must never block the teardown of the servers below it.
+        // outcomes are deliberately discarded: a failing, hanging, or
+        // panicking hook must never block the teardown of the servers
+        // below it — the panic is caught and discarded like any other
+        // outcome, so the sequence reaches phase 3.
         for hook in &self.opts.hooks_before {
             let budget = self.opts.stop_timeout;
-            let _ = timeout(budget, hook(budget)).await;
+            let bounded = timeout(budget, hook(budget));
+            let _ = AssertUnwindSafe(bounded).catch_unwind().await;
         }
 
         // Phase 3 — concurrent server teardown, each bounded by a fresh
@@ -288,10 +291,12 @@ impl App {
             }
         }
 
-        // Phase 4 — after hooks, same shape as phase 2.
+        // Phase 4 — after hooks, same shape as phase 2: panics caught
+        // and discarded so the terminal aggregation below always runs.
         for hook in &self.opts.hooks_after {
             let budget = self.opts.stop_timeout;
-            let _ = timeout(budget, hook(budget)).await;
+            let bounded = timeout(budget, hook(budget));
+            let _ = AssertUnwindSafe(bounded).catch_unwind().await;
         }
 
         // Aggregate the terminal outcome: the first non-cooperative start

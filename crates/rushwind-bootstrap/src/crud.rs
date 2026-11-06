@@ -15,7 +15,19 @@ use crate::{
 
 pub(crate) fn random_instance_id() -> String {
     let mut bytes = [0u8; 16];
-    let _ = getrandom::fill(&mut bytes);
+    if getrandom::fill(&mut bytes).is_err() {
+        // The entropy source failed: fall back to pid + wall clock so
+        // two replicas still mint distinct instance ids instead of
+        // publishing colliding all-zero registrations that overwrite
+        // each other in the registry.
+        let pid = u64::from(std::process::id());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        bytes[..8].copy_from_slice(&pid.to_le_bytes());
+        bytes[8..].copy_from_slice(&now.to_le_bytes());
+    }
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

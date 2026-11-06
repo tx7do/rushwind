@@ -11,10 +11,11 @@
 //!
 //! # Divergences
 //!
-//! - Waking concurrent Waiters when a Close or
-//!   take makes tokens available: here each Wait recomputes its own
-//!   delay from the shared state, which serves the same purpose
-//!   without the broadcast.
+//! - Waking concurrent Waiters when a *take* makes tokens available:
+//!   here each Wait recomputes its own delay from the shared state,
+//!   which serves the same purpose without the broadcast. A Close
+//!   does wake every sleeping Waiter (via a notification) so it
+//!   answers `Limited` immediately.
 //! - No clock injection (`WithClock`): tests use real short
 //!   durations.
 
@@ -37,6 +38,8 @@ pub struct TokenBucket {
     state: Mutex<State>,
     rate: f64,
     burst: f64,
+    /// Wakes sleeping `wait`ers when [`Limiter::close`] fires.
+    close_notify: tokio::sync::Notify,
 }
 
 /// The token-bucket engine's settings.
@@ -65,6 +68,7 @@ impl TokenBucket {
             }),
             rate: options.rate,
             burst: options.burst,
+            close_notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -99,7 +103,11 @@ impl TokenBucket {
 
         let deficit = n - state.tokens;
         Take {
-            wait: Duration::from_secs_f64(deficit / self.rate),
+            // An extreme `rate` can push the quotient past the
+            // Duration representation ceiling; `from_secs_f64` would
+            // panic there, and an unrepresentable wait simply means
+            // "not for the foreseeable future".
+            wait: Duration::try_from_secs_f64(deficit / self.rate).unwrap_or(Duration::MAX),
         }
     }
 
@@ -138,12 +146,21 @@ impl Limiter for TokenBucket {
                 if wait.is_zero() {
                     return Ok(());
                 }
-                tokio::time::sleep(wait).await;
+                // The close notification cuts the sleep short: a
+                // closed limiter answers its waiters with `Limited`
+                // right away instead of after the full (possibly
+                // astronomically long) delay.
+                let closed = self.close_notify.notified();
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = closed => {}
+                }
             }
         })
     }
 
     fn close(&self) {
         self.state.lock().unwrap().closed = true;
+        self.close_notify.notify_waiters();
     }
 }

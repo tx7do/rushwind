@@ -48,7 +48,10 @@ pub struct Rule {
     pub action: String,
     /// The resource pattern.
     pub resource: String,
-    /// The effect: `allow` (default) or `deny`.
+    /// The effect: `allow` (default) or `deny`. Any other value — a
+    /// misspelled `"Deny"`, say — evaluates as allow, so
+    /// [`Engine::set_policies`] rejects policies carrying one
+    /// instead of installing them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub effect: String,
 }
@@ -238,9 +241,18 @@ impl Engine for AclEngine {
 
     fn set_policies(&self, policies: PolicyMap, _roles: RoleMap) -> Result<(), AuthzError> {
         // A payload that does not deserialize into the rule
-        // type is silently skipped.
+        // type is silently skipped. A payload that deserializes but
+        // carries an unknown effect is REJECTED: an effect value only
+        // ever evaluated as allow (a misspelled "deny", say) would
+        // silently widen access instead of restricting it.
         if let Some(payload) = policies.get("rules") {
             if let Ok(rules) = serde_json::from_value::<Vec<Rule>>(payload.clone()) {
+                if rules
+                    .iter()
+                    .any(|rule| !matches!(rule.effect.as_str(), "" | "allow" | "deny"))
+                {
+                    return Err(AuthzError::InvalidPolicy);
+                }
                 self.set_rules(rules);
             }
         }
@@ -478,6 +490,51 @@ mod tests {
         );
         engine.set_policies(policies, RoleMap::new()).unwrap();
         // Now allowed.
+        assert!(ask(&engine, "alice", "read", "doc:1"));
+    }
+
+    #[test]
+    fn a_policy_with_an_unknown_effect_is_rejected_not_installed() {
+        let engine = AclEngine::new(AclOptions::new());
+        // A misspelled deny would evaluate as allow — the install
+        // refuses it instead of silently widening access.
+        for effect in ["Deny", "DENY", "block", " permits "] {
+            let rules = vec![Rule {
+                subject: "alice".to_string(),
+                action: "read".to_string(),
+                resource: "doc:1".to_string(),
+                effect: effect.to_string(),
+            }];
+            let mut policies = PolicyMap::new();
+            policies.insert(
+                "rules".to_string(),
+                serde_json::to_value(&rules).expect("rules serialize"),
+            );
+            assert_eq!(
+                engine.set_policies(policies, RoleMap::new()).unwrap_err(),
+                AuthzError::InvalidPolicy,
+                "effect {effect:?}"
+            );
+        }
+        // Nothing was installed: the default deny holds.
+        assert!(!ask(&engine, "alice", "read", "doc:1"));
+    }
+
+    #[test]
+    fn an_empty_effect_still_installs_as_allow() {
+        let engine = AclEngine::new(AclOptions::new());
+        let rules = vec![Rule {
+            subject: "alice".to_string(),
+            action: "read".to_string(),
+            resource: "doc:1".to_string(),
+            effect: String::new(),
+        }];
+        let mut policies = PolicyMap::new();
+        policies.insert(
+            "rules".to_string(),
+            serde_json::to_value(&rules).expect("rules serialize"),
+        );
+        engine.set_policies(policies, RoleMap::new()).unwrap();
         assert!(ask(&engine, "alice", "read", "doc:1"));
     }
 

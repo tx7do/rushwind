@@ -54,11 +54,15 @@ impl RequestContext {
     }
 
     /// An unsigned claim by name; accepts integral JSON numbers and
-    /// numeric strings (JWT libraries encode uint32s either way).
+    /// numeric strings (JWT libraries encode uint32s either way). A
+    /// number above the u32 range saturates instead of wrapping — a
+    /// wrapped id would alias an unrelated tenant or user.
     pub fn claim_u32(&self, name: &str) -> Option<u32> {
         let value = self.claims.as_ref()?.get(name)?;
         match value {
-            serde_json::Value::Number(n) => n.as_u64().map(|v| v as u32),
+            serde_json::Value::Number(n) => {
+                n.as_u64().map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+            }
             serde_json::Value::String(s) => s.parse().ok(),
             _ => None,
         }

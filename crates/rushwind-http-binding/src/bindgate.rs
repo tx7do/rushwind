@@ -23,6 +23,12 @@
 //! value, empty when absent) — empirically pinned against the reference:
 //! this check fires even for an empty body, ahead of the auth layer.
 //!
+//! One deliberate divergence from the reference: the body is read under
+//! a ceiling ([`DEFAULT_BODY_LIMIT`], override via
+//! [`bind_run_with_limit`]) and an over-limit body answers 413 — the
+//! reference buffers unconditionally, which turns every pre-auth body
+//! route into an unbounded memory commitment.
+//!
 //! The bound message rides to the handler as a [`BoundMessage`] request
 //! extension. Path-variable binding CANNOT run here — axum middleware
 //! never sees the router's captures — so it runs in the handler, after
@@ -49,6 +55,12 @@ fn codec_failure(message: String) -> Response {
     error_response(codec_error(message))
 }
 
+/// The over-limit body: 413 with an empty reason — the ceiling the
+/// reference lacks, so there is no reference prose to mirror.
+fn payload_too_large() -> crate::envelope::StatusError {
+    crate::envelope::StatusError::new(413, "", "request body exceeds the configured limit")
+}
+
 /// Collects key→values pairs from a urlencoded string (query string or
 /// form body), accumulating repeated keys — the shape `url.Values` gives
 /// the reference's populate machinery.
@@ -64,13 +76,48 @@ fn collect_pairs(input: &[u8]) -> Vec<(String, Vec<String>)> {
     pairs
 }
 
-/// The bind layer body. `pool` supplies the input message descriptor;
-/// `registered` is the assembly's registered codec-subtype set.
+/// The default request-body ceiling: 2 MiB, matching axum's own
+/// `DefaultBodyLimit` so every buffering edge in one process shares the
+/// same bound. The reference decoder buffers unconditionally; this limit
+/// is a deliberate rushwind divergence (the assembly's compat spec should
+/// register it) — the pre-auth layer must not turn unauthenticated
+/// request bodies into unbounded memory. [`bind_run_with_limit`] accepts
+/// a custom ceiling.
+pub const DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// The bind layer body with the default body limit. `pool` supplies the
+/// input message descriptor; `registered` is the assembly's registered
+/// codec-subtype set.
 pub async fn bind_run(
     pool: &'static DescriptorPool,
     input_fq: &'static str,
     body_star: bool,
     registered: &[&str],
+    req: Request,
+    next: Next,
+) -> Response {
+    bind_run_with_limit(
+        pool,
+        input_fq,
+        body_star,
+        registered,
+        DEFAULT_BODY_LIMIT,
+        req,
+        next,
+    )
+    .await
+}
+
+/// The bind layer body with an explicit body ceiling. `pool` supplies the
+/// input message descriptor; `registered` is the assembly's registered
+/// codec-subtype set; `body_limit` caps how many bytes of the request
+/// body are buffered (a larger body answers 413 before any decode).
+pub async fn bind_run_with_limit(
+    pool: &'static DescriptorPool,
+    input_fq: &'static str,
+    body_star: bool,
+    registered: &[&str],
+    body_limit: usize,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -81,8 +128,8 @@ pub async fn bind_run(
 
     // 1. Body binding (body routes only). Codec resolution happens FIRST —
     //    an unresolvable Content-Type answers 400 even for an empty body —
-    //    then the body is read, and an empty body skips binding (the
-    //    reference decoder's exact sequence).
+    //    then the body is read under the ceiling, and an empty body skips
+    //    binding (the reference decoder's exact sequence).
     if body_star {
         let Some(codec) = resolve_codec(&req, registered) else {
             return codec_failure(format!(
@@ -91,9 +138,9 @@ pub async fn bind_run(
             ));
         };
         let (parts, body) = req.into_parts();
-        let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        let bytes = match axum::body::to_bytes(body, body_limit).await {
             Ok(b) => b,
-            Err(e) => return codec_failure(format!("body read {e}")),
+            Err(_) => return error_response(payload_too_large()),
         };
         req = Request::from_parts(parts, axum::body::Body::empty());
         if !bytes.is_empty() {
@@ -101,7 +148,9 @@ pub async fn bind_run(
                 ResolvedCodec::Json => {
                     let mut de = serde_json::Deserializer::from_slice(&bytes);
                     let opts = DeserializeOptions::new();
-                    match DynamicMessage::deserialize_with_options(desc, &mut de, &opts) {
+                    match DynamicMessage::deserialize_with_options(desc, &mut de, &opts)
+                        .and_then(|parsed| de.end().map(|_| parsed))
+                    {
                         Ok(parsed) => dyn_msg = parsed,
                         Err(e) => return codec_failure(format!("body unmarshal {e}")),
                     }

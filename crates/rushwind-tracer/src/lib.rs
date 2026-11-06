@@ -224,7 +224,7 @@ impl TracerProviderBuilder {
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .with_timeout(options.export_timeout)
-                .with_metadata(headers_to_metadata(&options.headers))
+                .with_metadata(headers_to_metadata(&options.headers)?)
                 .build()?,
         };
 
@@ -279,19 +279,29 @@ impl opentelemetry::propagation::Injector for MapCarrier {
 }
 
 /// Converts string header pairs into a tonic metadata map — the
-/// gRPC exporter's header carrier.
-fn headers_to_metadata(headers: &[(String, String)]) -> tonic::metadata::MetadataMap {
+/// gRPC exporter's header carrier. A key or value outside metadata
+/// ASCII is a typed build error, not a panic: the pairs come from the
+/// deployment's configuration document.
+fn headers_to_metadata(
+    headers: &[(String, String)],
+) -> StdResult<tonic::metadata::MetadataMap, opentelemetry_otlp::ExporterBuildError> {
     let mut metadata = tonic::metadata::MetadataMap::new();
     for (key, value) in headers {
         let parsed: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = value
             .parse()
-            .expect("header value must be valid metadata ASCII");
-        let key: tonic::metadata::MetadataKey<tonic::metadata::Ascii> = key
-            .parse()
-            .expect("header key must be valid metadata ASCII");
+            .map_err(|_| opentelemetry_otlp::ExporterBuildError::InvalidConfig {
+                name: "headers".to_string(),
+                reason: format!("header value {value:?} is not valid metadata ASCII"),
+            })?;
+        let key: tonic::metadata::MetadataKey<tonic::metadata::Ascii> =
+            key.parse()
+                .map_err(|_| opentelemetry_otlp::ExporterBuildError::InvalidConfig {
+                    name: "headers".to_string(),
+                    reason: format!("header key {key:?} is not valid metadata ASCII"),
+                })?;
         metadata.insert(key, parsed);
     }
-    metadata
+    Ok(metadata)
 }
 
 /// The extract half of the span lifecycle for server/consumer

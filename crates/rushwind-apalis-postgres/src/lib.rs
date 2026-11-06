@@ -48,13 +48,19 @@
 //!   `run_at = now() + retry_backoff(attempt)` (1s, 2s, 4s … capped at
 //!   1h); failure with attempts exhausted, or an `Error::Abort` →
 //!   `killed`, the dead-letter state. The batch update only touches
-//!   rows still in `running`, so a late ack after orphan recovery is
-//!   dropped instead of corrupting the requeued row.
+//!   rows still in `running` **under the acking worker's claim**
+//!   (`lock_by` match), so a late ack after orphan recovery — or after
+//!   another worker re-claimed the task — is dropped instead of
+//!   corrupting the requeued row.
 //! - **Crash recovery**: the heartbeat refreshes `lock_at` for this
 //!   worker's running tasks each keep-alive, and re-queues any task
 //!   whose `lock_at` expired — a dead worker's in-flight work returns
-//!   to the pool automatically. Delivery is therefore at-least-once;
-//!   handlers should be idempotent.
+//!   to the pool automatically. Claim time both counts the attempt and
+//!   enforces the budget: a job whose `attempts` have reached its
+//!   `max_attempts` is dead-lettered at the next claim instead of
+//!   cycling through crash → reclaim → crash forever, and never
+//!   re-claimed past the budget. Delivery is therefore
+//!   at-least-once; handlers should be idempotent.
 //! - **Scheduled jobs** are plain rows with a future `run_at`; the
 //!   claim query simply will not see them before then.
 //! - [`Storage::vacuum`] deletes terminal rows (`done`/`killed`) older
@@ -122,7 +128,12 @@ const DEFAULT_MAX_ATTEMPTS: u32 = 10;
 
 /// One acknowledged outcome waiting for the heartbeat to persist:
 /// `(task_id, next status, next run_at, last_error)`.
-type AckRow = (String, State, Option<DateTime<Utc>>, Option<String>);
+/// One acknowledged outcome: the claiming worker id, the task id, the
+/// outcome state, the retry schedule (when the task goes back to
+/// pending), and the recorded error. The worker id rides every row so
+/// the batch write can refuse to touch a task another worker has since
+/// re-claimed.
+type AckRow = (String, String, State, Option<DateTime<Utc>>, Option<String>);
 
 /// The error surface of the storage. Detail rides in the message, per
 /// the workspace error taxonomy (`RegistryError`/`BrokerError` style).
@@ -144,13 +155,17 @@ impl fmt::Display for StorageError {
 impl std::error::Error for StorageError {}
 
 /// The per-task context the storage hands to apalis — the job's
-/// `max_attempts`, resolved from the row at claim time. A task pushed
-/// with the default context takes the storage-wide setting; build a
-/// custom [`Request`] with a specific [`PgContext`] to override per
-/// task.
+/// `max_attempts`, resolved from the row at claim time, plus the
+/// claiming worker's id stamped at claim time (the ack path compares it
+/// against the row's `lock_by` so a stale worker cannot overwrite
+/// another worker's claim). A task pushed with the default context
+/// takes the storage-wide setting; build a custom [`Request`] with a
+/// specific [`PgContext`] to override per task.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PgContext {
     max_attempts: i32,
+    #[serde(default)]
+    worker_id: String,
 }
 
 impl Default for PgContext {
@@ -158,6 +173,7 @@ impl Default for PgContext {
         Self {
             max_attempts: i32::try_from(DEFAULT_MAX_ATTEMPTS)
                 .expect("DEFAULT_MAX_ATTEMPTS fits in i32"),
+            worker_id: String::new(),
         }
     }
 }
@@ -167,6 +183,7 @@ impl PgContext {
     pub fn new(max_attempts: u32) -> Self {
         Self {
             max_attempts: max_attempts.max(1) as i32,
+            worker_id: String::new(),
         }
     }
 
@@ -427,13 +444,21 @@ impl<T> PostgresStorage<T> {
             + chrono::Duration::from_std(self.config.lock_timeout())
                 .map_err(|e| StorageError::Failed(format!("lock timeout: {e}")))?;
         let rows = sqlx::query(
-            "WITH claimed AS (
+            "WITH dead AS (
+                 UPDATE rushwind_apalis_jobs
+                 SET status = 'killed', lock_by = NULL, lock_at = NULL,
+                     done_at = now(), updated_at = now()
+                 WHERE queue = $3 AND status = 'pending' AND attempts >= max_attempts
+                 RETURNING task_id
+             ),
+             claimed AS (
                  UPDATE rushwind_apalis_jobs
                  SET status = 'running', lock_by = $1, lock_at = $2,
                      attempts = attempts + 1, updated_at = now()
                  WHERE task_id IN (
                      SELECT task_id FROM rushwind_apalis_jobs
                      WHERE queue = $3 AND status = 'pending' AND run_at <= now()
+                           AND attempts < max_attempts
                      ORDER BY run_at ASC, task_id ASC
                      LIMIT $4
                      FOR UPDATE SKIP LOCKED
@@ -450,12 +475,15 @@ impl<T> PostgresStorage<T> {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StorageError::Failed(format!("claim: {e}")))?;
-        rows.iter().map(|row| self.request_from_row(row)).collect()
+        rows.iter()
+            .map(|row| self.request_from_row(row, &worker_id.to_string()))
+            .collect()
     }
 
     fn request_from_row(
         &self,
         row: &sqlx::postgres::PgRow,
+        worker_id: &str,
     ) -> Result<Request<T, PgContext>, StorageError>
     where
         T: DeserializeOwned,
@@ -481,7 +509,10 @@ impl<T> PostgresStorage<T> {
             usize::try_from(attempts.max(0))
                 .map_err(|e| StorageError::Failed(format!("attempts: {e}")))?,
         );
-        parts.context = PgContext { max_attempts };
+        parts.context = PgContext {
+            max_attempts,
+            worker_id: worker_id.to_string(),
+        };
         parts.namespace = Some(Namespace(self.queue.clone()));
         Ok(Request::new_with_parts(args, parts))
     }
@@ -526,16 +557,19 @@ impl<T> PostgresStorage<T> {
     }
 
     /// Batch-persists acknowledged outcomes. Only rows still in
-    /// `running` are touched: if orphan recovery already re-queued a
-    /// task, the stale ack is dropped.
+    /// `running` **under this worker's claim** are touched: if orphan
+    /// recovery already re-queued a task, or another worker re-claimed
+    /// it while this worker sat stalled past the lock deadline, the
+    /// stale ack is dropped (`lock_by` must match the acking worker).
     async fn write_acks(&self, acks: Vec<AckRow>) -> Result<(), StorageError> {
         if acks.is_empty() {
             return Ok(());
         }
         let rows: Vec<serde_json::Value> = acks
             .iter()
-            .map(|(task_id, status, run_at, last_error)| {
+            .map(|(worker_id, task_id, status, run_at, last_error)| {
                 serde_json::Value::Array(vec![
+                    serde_json::Value::String(worker_id.clone()),
                     serde_json::Value::String(task_id.clone()),
                     serde_json::Value::String(status_to_sql(status).to_string()),
                     run_at
@@ -561,13 +595,15 @@ impl<T> PostgresStorage<T> {
                                 THEN now() ELSE NULL END,
                  updated_at = now()
              FROM (
-                 SELECT (value->>0)::text AS task_id,
-                        (value->>1)::text AS status,
-                        (value->>2)::timestamptz AS run_at,
-                        (value->>3)::text AS last_error
+                 SELECT (value->>0)::text AS worker_id,
+                        (value->>1)::text AS task_id,
+                        (value->>2)::text AS status,
+                        (value->>3)::timestamptz AS run_at,
+                        (value->>4)::text AS last_error
                  FROM json_array_elements($1::json)
              ) q
-             WHERE j.task_id = q.task_id AND j.queue = $2 AND j.status = 'running'",
+             WHERE j.task_id = q.task_id AND j.queue = $2
+                   AND j.status = 'running' AND j.lock_by = q.worker_id",
         )
         .bind(encoded)
         .bind(&self.queue)
@@ -618,7 +654,13 @@ where
         };
         let last_error = res.inner.as_ref().err().map(|e| e.to_string());
         self.ack_notify
-            .notify((res.task_id.to_string(), status, run_at, last_error))
+            .notify((
+                ctx.worker_id.clone(),
+                res.task_id.to_string(),
+                status,
+                run_at,
+                last_error,
+            ))
             .map_err(|e| StorageError::Failed(format!("ack channel: {e}")))?;
         Ok(())
     }
@@ -805,7 +847,9 @@ where
         .map_err(|e| StorageError::Failed(format!("fetch_by_id: {e}")))?;
         match row {
             None => Ok(None),
-            Some(row) => self.request_from_row(&row).map(Some),
+            // The maintenance fetch carries no claim: an empty worker id
+            // means the ack's lock_by guard would refuse to finalize it.
+            Some(row) => self.request_from_row(&row, "").map(Some),
         }
     }
 

@@ -15,6 +15,7 @@ fn options() -> VegasOptions {
         warmup_samples: 0, // no warmup gating in these tests
         min_rtt: Duration::from_millis(1),
         max_rtt: Duration::from_secs(30),
+        probe_stride: 16,
     }
 }
 
@@ -52,6 +53,7 @@ fn allow_tracks_the_state() {
         warmup_samples: 0,
         min_rtt: Duration::from_millis(1),
         max_rtt: Duration::from_secs(30),
+        probe_stride: 16,
     });
     // Establish a 10 ms baseline first.
     for _ in 0..10 {
@@ -83,6 +85,7 @@ fn outlier_samples_are_filtered() {
         warmup_samples: 0,
         min_rtt: Duration::from_millis(10),
         max_rtt: Duration::from_secs(30),
+        probe_stride: 16,
     });
 
     // Establish a 20 ms baseline.
@@ -106,6 +109,7 @@ fn half_open_failure_re_opens() {
         warmup_samples: 0,
         min_rtt: Duration::from_millis(1),
         max_rtt: Duration::from_secs(30),
+        probe_stride: 16,
     });
 
     // Baseline at 10 ms, then inflate to 50 ms: the circuit opens.
@@ -124,4 +128,42 @@ fn half_open_failure_re_opens() {
         breaker.record_latency(Duration::from_millis(12));
     }
     assert_eq!(breaker.state(), State::Closed);
+}
+
+/// An open circuit admits a probe every `probe_stride` allow calls:
+/// without one, an `execute`-style caller can never produce the latency
+/// sample the healing path needs, and the circuit stays open forever.
+#[test]
+fn an_open_circuit_probes_and_heals_through_the_probe() {
+    let breaker = VegasBreaker::with_options(VegasOptions {
+        alpha: 0.5,
+        beta: 0.3,
+        warmup_samples: 0,
+        min_rtt: Duration::from_millis(1),
+        max_rtt: Duration::from_secs(30),
+        probe_stride: 2,
+    });
+
+    // Baseline at 10 ms, then inflate: the circuit opens.
+    for _ in 0..5 {
+        breaker.record_latency(Duration::from_millis(10));
+    }
+    for _ in 0..40 {
+        breaker.record_latency(Duration::from_millis(100));
+    }
+    assert_eq!(breaker.state(), State::Open);
+
+    // The first open-state call rejects, the probe call admits.
+    assert!(
+        breaker.allow().is_err(),
+        "the first open-state call rejects"
+    );
+    assert!(breaker.allow().is_ok(), "the probe call admits");
+
+    // The probe's recovered latency heals the circuit.
+    for _ in 0..40 {
+        breaker.record_latency(Duration::from_millis(10));
+    }
+    assert_eq!(breaker.state(), State::Closed);
+    assert!(breaker.allow().is_ok(), "healed circuit admits");
 }
