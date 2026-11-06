@@ -19,6 +19,7 @@
 //! refresh binding key; the refresh token value itself is validated
 //! elsewhere).
 
+#![forbid(unsafe_code)]
 use async_trait::async_trait;
 use rushwind_authn::{AuthClaims, Authenticator};
 

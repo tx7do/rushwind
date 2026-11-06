@@ -183,7 +183,14 @@ impl DatadogMetrics {
         let mut line = format!("{full}:{value}|{kind}");
         let tags = canonical_labels(labels);
         if !tags.is_empty() {
-            let joined: Vec<String> = tags.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            // Tag keys/values pass through the DogStatsD sanitizers:
+            // a `\n` in an attacker-influenced value would forge a
+            // second metric line, and `|`/`,`/`#` would split the tag
+            // section of the packet.
+            let joined: Vec<String> = tags
+                .iter()
+                .map(|(k, v)| format!("{}:{}", sanitize_tag(k), sanitize_tag(v)))
+                .collect();
             line.push_str(&format!("|#{}", joined.join(",")));
         }
         if self.rate < 1.0 {
@@ -215,16 +222,43 @@ impl DatadogMetrics {
     }
 }
 
-/// Joins the buffered lines into one payload and hands it to `send`.
-fn flush_buffer(buffer: &Buffer, send: impl FnOnce(String)) {
+/// The soft cap on one DogStatsD datagram: a UDP payload over this
+/// size risks fragmentation or silent drop at the agent. The flush
+/// splits oversized batches into several datagrams instead of joining
+/// everything into one.
+const MAX_DATAGRAM_BYTES: usize = 8 * 1024;
+
+/// Joins the buffered lines into datagrams under [`MAX_DATAGRAM_BYTES`]
+/// and hands each to `send`.
+fn flush_buffer(buffer: &Buffer, mut send: impl FnMut(String)) {
     let mut lines = buffer.lines.lock().expect("datadog buffer lock");
     if lines.is_empty() {
         return;
     }
-    let payload = lines.join("\n");
-    lines.clear();
+    let mut payload = String::new();
+    for line in lines.drain(..) {
+        if !payload.is_empty() && payload.len() + 1 + line.len() > MAX_DATAGRAM_BYTES {
+            send(std::mem::take(&mut payload));
+        }
+        if !payload.is_empty() {
+            payload.push('\n');
+        }
+        payload.push_str(&line);
+    }
     drop(lines);
-    send(payload);
+    if !payload.is_empty() {
+        send(payload);
+    }
+}
+
+/// Replaces the DogStatsD delimiters in a tag key or value.
+fn sanitize_tag(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\n' | '\r' | '|' | ',' | '#' => '_',
+            _ => c,
+        })
+        .collect()
 }
 
 impl Drop for DatadogMetrics {
@@ -270,6 +304,7 @@ fn format_float(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::sanitize_tag;
     use super::*;
     use std::str::from_utf8;
 
@@ -379,5 +414,11 @@ mod tests {
         assert_eq!(format_float(42.0), "42");
         assert_eq!(format_float(42.5), "42.5");
         assert_eq!(format_float(0.042), "0.042");
+    }
+    #[test]
+    fn tag_delimiters_are_neutralized() {
+        assert_eq!(sanitize_tag("tenant\nfake:1|c"), "tenant_fake:1_c");
+        assert_eq!(sanitize_tag("a,b|c#d"), "a_b_c_d");
+        assert_eq!(sanitize_tag("plain"), "plain");
     }
 }

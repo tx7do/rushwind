@@ -69,6 +69,7 @@
 //! A missing or wrongly-typed field on the read face is
 //! [`StorageError::InvalidQuery`](rushwind_storage::StorageError::InvalidQuery).
 
+#![forbid(unsafe_code)]
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;

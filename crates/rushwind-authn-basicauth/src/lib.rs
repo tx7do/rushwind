@@ -31,7 +31,9 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use rushwind_authn::{AuthClaims, Authenticator, AuthnError, CLAIM_FIELD_SUBJECT, SCHEME_BASIC};
+use rushwind_authn::{
+    constant_time_eq, AuthClaims, Authenticator, AuthnError, CLAIM_FIELD_SUBJECT, SCHEME_BASIC,
+};
 
 /// A callback verifying one username/password pair. Return `false` to
 /// reject.
@@ -139,7 +141,7 @@ impl BasicAuthAuthenticator {
         self.options
             .users
             .get(username)
-            .is_some_and(|expected| expected == password)
+            .is_some_and(|expected| constant_time_eq(expected, password))
     }
 }
 

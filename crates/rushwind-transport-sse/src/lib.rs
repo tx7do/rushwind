@@ -35,6 +35,7 @@
 //! table-anchored one (reason → the error-table HTTP status), so the
 //! failure envelopes carry the deployment's own reason codes.
 
+#![forbid(unsafe_code)]
 mod factory;
 mod handler;
 mod hub;

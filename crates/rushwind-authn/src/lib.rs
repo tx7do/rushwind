@@ -64,6 +64,7 @@ mod claims;
 mod error;
 mod gate;
 mod headers;
+mod secret;
 
 pub use authenticator::Authenticator;
 pub use claims::{
@@ -77,3 +78,4 @@ pub use headers::{
     auth_from_headers, format_authorization, HEADER_AUTHORIZE, SCHEME_BASIC, SCHEME_BEARER,
     SCHEME_DIGEST,
 };
+pub use secret::constant_time_eq;

@@ -33,6 +33,7 @@
 //! shape-compatible corpus; if an upstream contract ever grows them, the
 //! build breaks instead of serving a divergent route set.
 
+#![forbid(unsafe_code)]
 use std::collections::BTreeMap;
 
 use prost_reflect::{DescriptorPool, FieldDescriptor, Kind};

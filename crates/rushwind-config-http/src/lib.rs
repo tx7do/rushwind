@@ -113,14 +113,47 @@ impl HttpSource {
                 "http get {url}: HTTP {status}"
             )));
         }
-        Ok(Some(
-            response
-                .bytes()
-                .await
-                .map_err(|e| ConfigError::Failed(format!("http get {url}: {e}")))?
-                .to_vec(),
-        ))
+        read_bounded(response, url).await
     }
+}
+
+/// The largest accepted response body: a config endpoint gone wrong
+/// must not turn a load — or a 30-second poll loop — into an
+/// unbounded buffer.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Reads a successful response under [`MAX_BODY_BYTES`], rejecting the
+/// body (by declared `Content-Length` first, then by accumulated
+/// bytes) instead of buffering whatever the endpoint sends.
+async fn read_bounded(
+    response: reqwest::Response,
+    url: &str,
+) -> Result<Option<Vec<u8>>, ConfigError> {
+    if let Some(length) = response.content_length() {
+        if length as usize > MAX_BODY_BYTES {
+            return Err(ConfigError::Failed(format!(
+                "http get {url}: body of {length} bytes exceeds the {MAX_BODY_BYTES} limit"
+            )));
+        }
+    }
+    let mut body = Vec::new();
+    let mut response = response;
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|e| ConfigError::Failed(format!("http get {url}: {e}")))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(ConfigError::Failed(format!(
+                "http get {url}: body exceeds the {MAX_BODY_BYTES} limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
 }
 
 impl Source for HttpSource {
@@ -156,11 +189,16 @@ impl Source for HttpSource {
                         .timeout(request_timeout);
                     if let Ok(response) = request.send().await {
                         if response.status().is_success() {
-                            if let Ok(body) = response.bytes().await {
-                                let body = body.to_vec();
+                            if let Ok(Some(body)) = read_bounded(response, &url).await {
                                 if last.as_deref() != Some(body.as_slice()) {
                                     last = Some(body.clone());
-                                    let _ = tx.send(body);
+                                    // A send failure means the stream
+                                    // (and its receiver) is gone: end
+                                    // the task instead of polling a
+                                    // channel nobody reads forever.
+                                    if tx.send(body).is_err() {
+                                        break;
+                                    }
                                 }
                             }
                         }

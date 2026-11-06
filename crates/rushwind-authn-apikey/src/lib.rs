@@ -35,7 +35,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use rushwind_authn::{AuthClaims, Authenticator, AuthnError, SCHEME_BEARER};
+use rushwind_authn::{constant_time_eq, AuthClaims, Authenticator, AuthnError, SCHEME_BEARER};
 
 /// A callback validating one API key and producing the claims it carries.
 ///
@@ -109,7 +109,13 @@ impl Authenticator for ApiKeyAuthenticator {
         let Some(keys) = &self.options.keys else {
             return Err(AuthnError::Unauthenticated);
         };
-        if !keys.contains(token) {
+        // Membership by constant-time scan rather than a hash-table
+        // probe: the probe's timing encodes how much of the presented
+        // key matched a bucket.
+        if !keys
+            .iter()
+            .any(|candidate| constant_time_eq(candidate, token))
+        {
             return Err(AuthnError::Unauthenticated);
         }
 

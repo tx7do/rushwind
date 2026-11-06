@@ -492,19 +492,28 @@ impl Subscriber for MqttSubscriber {
             }
             if let (Some(client), true) = (self.client.clone(), *self.shared.connected.lock().await)
             {
-                client.unsubscribe(&self.topic).await.map_err(|e| {
-                    BrokerError::Failed(format!("mqtt unsubscribe {}: {e}", self.topic))
-                })?;
+                // The queue entry goes in under the same critical
+                // section as the wire send. Two concurrent
+                // unsubscribers could otherwise push in the opposite
+                // order of their sends, and UNSUBACKs — which follow
+                // the wire order — would confirm the wrong waiter,
+                // reporting a teardown the broker has not confirmed.
                 // Wait for the broker's UNSUBACK before reporting
-                // success — the client call only queued the request, so
+                // success: the client call only queues the request, so
                 // returning on enqueue alone would claim a teardown the
                 // broker has not confirmed (upstream paho waited on the
                 // unsubscribe token for the same reason).
-                self.shared
-                    .pending_unsubs
-                    .lock()
-                    .await
-                    .push_back(self.topic.clone());
+                {
+                    let mut pending = self.shared.pending_unsubs.lock().await;
+                    pending.push_back(self.topic.clone());
+                    if let Err(e) = client.unsubscribe(&self.topic).await {
+                        pending.retain(|topic| topic != &self.topic);
+                        return Err(BrokerError::Failed(format!(
+                            "mqtt unsubscribe {}: {e}",
+                            self.topic
+                        )));
+                    }
+                }
                 let mut generation = self.shared.unsub_generation.subscribe();
                 let confirmed = async {
                     loop {

@@ -37,6 +37,7 @@
 //! byte-identical on the ASCII fields (phone/email) the corpus
 //! annotates and safe where the reference is not.
 
+#![forbid(unsafe_code)]
 mod apply;
 mod plan;
 mod rules;

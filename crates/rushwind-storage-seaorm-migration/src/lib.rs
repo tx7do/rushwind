@@ -8,6 +8,7 @@
 //! foreign keys beyond the entity catalog ride later migrations via
 //! [`EntityTables::statement`].
 
+#![forbid(unsafe_code)]
 use sea_orm::sea_query::{ColumnDef as QueryColumnDef, Index, StringLen, Table};
 use sea_orm::{
     ColumnTrait, ColumnType, DatabaseBackend, DbErr, EntityTrait, IdenStatic, Iterable,

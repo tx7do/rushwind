@@ -10,6 +10,7 @@
 //! not trust that alone). The content type is accepted
 //! and ignored: a filesystem stores no content-type metadata.
 
+#![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 
 use rushwind_oss::{ObjectStorage, StorageError};

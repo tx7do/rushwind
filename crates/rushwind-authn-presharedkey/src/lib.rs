@@ -18,7 +18,7 @@
 
 use std::collections::HashSet;
 
-use rushwind_authn::{AuthClaims, Authenticator, AuthnError, SCHEME_BEARER};
+use rushwind_authn::{constant_time_eq, AuthClaims, Authenticator, AuthnError, SCHEME_BEARER};
 
 /// Builder for [`PresharedKeyAuthenticator`].
 #[derive(Default)]
@@ -80,7 +80,15 @@ impl Authenticator for PresharedKeyAuthenticator {
         if self.options.keys.is_empty() {
             return Err(AuthnError::Unauthenticated);
         }
-        if !self.options.keys.contains(token) {
+        // Membership by constant-time scan rather than a hash-table
+        // probe: the probe's timing encodes how much of the presented
+        // key matched a bucket.
+        if !self
+            .options
+            .keys
+            .iter()
+            .any(|candidate| constant_time_eq(candidate, token))
+        {
             return Err(AuthnError::Unauthenticated);
         }
         // A valid key authenticates to empty claims: this engine carries

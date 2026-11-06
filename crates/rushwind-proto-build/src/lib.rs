@@ -31,6 +31,7 @@
 //! the dependency data files, the auth-free whitelist, the gen config,
 //! and the face list.
 
+#![forbid(unsafe_code)]
 pub mod slice;
 
 use std::fs;

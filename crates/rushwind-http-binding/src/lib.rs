@@ -48,6 +48,7 @@
 //! implementation — its sources are cited purely as semantic anchors for
 //! the compatibility contract.
 
+#![forbid(unsafe_code)]
 pub mod binder;
 pub mod bindgate;
 pub mod codec;
