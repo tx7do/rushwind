@@ -18,3 +18,4 @@ rmp-serde = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

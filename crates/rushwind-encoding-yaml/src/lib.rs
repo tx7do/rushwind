@@ -3,7 +3,11 @@
 //! A direct delegate. Payloads are UTF-8 YAML
 //! text. Note for the record: `serde_yaml` is upstream-deprecated but
 //! remains the most battle-tested YAML serde implementation — an
-//! accepted, maintenance-mode choice.
+//! accepted, maintenance-mode choice. Its deserializer enforces its
+//! own recursion limit (`RecursionLimitExceeded`) and rejects
+//! recursive aliases, so hostile nesting and billion-laughs shapes
+//! answer typed errors instead of overflowing the stack — no extra
+//! depth guard needed here, unlike the msgpack and cbor codecs.
 //!
 //! # Usage
 //!

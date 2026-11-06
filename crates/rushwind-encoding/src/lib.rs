@@ -73,6 +73,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod depth;
+
 use std::{
     collections::HashMap,
     fmt,

@@ -72,6 +72,20 @@ impl Codec for MsgpackCodec {
         data: &'de [u8],
         decode: &mut dyn FnMut(&mut dyn ErasedDeserializer<'de>) -> Result<(), EncodingError>,
     ) -> Result<(), EncodingError> {
+        // The depth pre-scan walks the wire format with an explicit
+        // heap stack: the deserializer recurses per nesting level, and
+        // a hostile deep payload would overflow the machine stack — an
+        // abort outside any catch_unwind. Same ceiling as serde_json's
+        // text decoder.
+        if rushwind_encoding::depth::msgpack_exceeds_depth(
+            data,
+            rushwind_encoding::depth::MAX_DEPTH,
+        ) {
+            return Err(EncodingError::Failed(format!(
+                "msgpack parse: nesting exceeds the {}-level depth limit",
+                rushwind_encoding::depth::MAX_DEPTH
+            )));
+        }
         let mut deserializer = rmp_serde::Deserializer::from_read_ref(data);
         decode(&mut <dyn ErasedDeserializer>::erase(&mut deserializer))
     }
@@ -94,6 +108,34 @@ mod tests {
             seq: 7,
             note: "hello".into(),
         }
+    }
+
+    fn nested(depth: usize) -> serde_json::Value {
+        let mut value = serde_json::Value::from(1u8);
+        for _ in 0..depth {
+            value = serde_json::Value::Array(vec![value]);
+        }
+        value
+    }
+
+    #[test]
+    fn a_hostile_deep_payload_answers_a_typed_error_not_an_abort() {
+        let codec = MsgpackCodec;
+        let bytes = marshal(&codec, &nested(512)).expect("marshal deep");
+        let err = unmarshal::<serde_json::Value>(&codec, &bytes)
+            .expect_err("deep payload must be refused");
+        assert!(
+            err.to_string().contains("depth limit"),
+            "wrong refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn an_honest_depth_round_trips() {
+        let codec = MsgpackCodec;
+        let bytes = marshal(&codec, &nested(50)).expect("marshal shallow");
+        let round = unmarshal::<serde_json::Value>(&codec, &bytes).expect("round trip");
+        assert_eq!(round, nested(50));
     }
 
     #[test]

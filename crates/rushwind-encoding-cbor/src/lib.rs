@@ -86,6 +86,17 @@ impl Codec for CborCodec {
         data: &'de [u8],
         decode: &mut dyn FnMut(&mut dyn ErasedDeserializer<'de>) -> Result<(), EncodingError>,
     ) -> Result<(), EncodingError> {
+        // The depth pre-scan walks the wire format with an explicit
+        // heap stack: the decoder recurses per nesting level, and a
+        // hostile deep payload would overflow the machine stack — an
+        // abort outside any catch_unwind. Same ceiling as serde_json's
+        // text decoder.
+        if rushwind_encoding::depth::cbor_exceeds_depth(data, rushwind_encoding::depth::MAX_DEPTH) {
+            return Err(EncodingError::Failed(format!(
+                "cbor parse: nesting exceeds the {}-level depth limit",
+                rushwind_encoding::depth::MAX_DEPTH
+            )));
+        }
         // Parse eagerly to an in-memory value (the ciborium serializer
         // types are private), then let `decode` read the target out of
         // it.
@@ -113,6 +124,36 @@ mod tests {
             seq: 7,
             note: "hello".into(),
         }
+    }
+
+    fn nested(depth: usize) -> serde_json::Value {
+        let mut value = serde_json::Value::from(1u8);
+        for _ in 0..depth {
+            value = serde_json::Value::Array(vec![value]);
+        }
+        value
+    }
+
+    #[test]
+    fn a_hostile_deep_payload_answers_a_typed_error_not_an_abort() {
+        // Hand-crafted: the encode bridge's serde_json leg refuses deep
+        // values on its own, so the hostile shape is bytes built
+        // directly — 512 nested indefinite-less arrays around one int.
+        let mut bytes = vec![0x81u8; 512];
+        bytes.push(0x01);
+        let err = unmarshal::<serde_json::Value>(&CborCodec, &bytes)
+            .expect_err("deep payload must be refused");
+        assert!(
+            err.to_string().contains("depth limit"),
+            "wrong refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn an_honest_depth_round_trips() {
+        let bytes = marshal(&CborCodec, &nested(50)).expect("marshal shallow");
+        let round = unmarshal::<serde_json::Value>(&CborCodec, &bytes).expect("round trip");
+        assert_eq!(round, nested(50));
     }
 
     #[test]
