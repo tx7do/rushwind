@@ -41,7 +41,7 @@ pub trait Gate: Send + Sync + 'static {
     fn authorize(
         &self,
         token: &str,
-    ) -> impl std::future::Future<Output = Result<u32, Failure>> + Send;
+    ) -> impl std::future::Future<Output = Result<u64, Failure>> + Send;
 }
 
 /// The transport's application state: the hub, the deployment's gate,
@@ -134,7 +134,7 @@ pub async fn events<A: Gate>(
     // The stream must be the token's own userId.
     if !params
         .get("stream")
-        .and_then(|s| s.parse::<u32>().ok())
+        .and_then(|s| s.parse::<u64>().ok())
         .is_some_and(|s| s == uid)
     {
         return error("FORBIDDEN", "stream user mismatch".into());

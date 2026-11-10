@@ -7014,6 +7014,7 @@ dependencies = [
  "rmp-serde",
  "rushwind-encoding",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -45,7 +45,7 @@ struct StubChecker {
 
 #[async_trait]
 impl AccessTokenChecker for StubChecker {
-    async fn is_valid_access_token(&self, _uid: u32, jti: &str, token: &str) -> bool {
+    async fn is_valid_access_token(&self, _uid: u64, jti: &str, token: &str) -> bool {
         self.calls
             .lock()
             .unwrap()
