@@ -45,7 +45,7 @@ struct StubChecker {
 
 #[async_trait]
 impl AccessTokenChecker for StubChecker {
-    async fn is_valid_access_token(&self, _uid: u64, jti: &str, token: &str) -> bool {
+    async fn is_valid_access_token(&self, _uid: i64, jti: &str, token: &str) -> bool {
         self.calls
             .lock()
             .unwrap()
@@ -126,7 +126,7 @@ async fn happy_path_returns_the_claims_after_both_checks() {
     )
     .await
     .unwrap();
-    assert_eq!(claims.0.get("uid").and_then(|v| v.as_u64()), Some(7));
+    assert_eq!(claims.0.get("uid").and_then(|v| v.as_i64()), Some(7));
     let calls = checker.calls.lock().unwrap();
     assert_eq!(
         *calls,
@@ -155,7 +155,7 @@ fn trace_id_reads_traceparent_then_request_id() {
 fn unverified_bearer_sniffs_uid_and_jti() {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
-    let payload = serde_json::json!({ "uid": 7u64, "jti": "abc-123" });
+    let payload = serde_json::json!({ "uid": 7i64, "jti": "abc-123" });
     let seg = URL_SAFE_NO_PAD.encode(payload.to_string());
     let token = format!("e30.{seg}.c2lg");
     assert_eq!(

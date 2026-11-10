@@ -23,7 +23,7 @@ use tower::ServiceExt;
 struct FakeGate;
 
 impl Gate for FakeGate {
-    async fn authorize(&self, token: &str) -> Result<u64, Failure> {
+    async fn authorize(&self, token: &str) -> Result<i64, Failure> {
         match token {
             "good" => Ok(7),
             "blocked" => Err(Failure::new("FORBIDDEN", "token is blocked")),

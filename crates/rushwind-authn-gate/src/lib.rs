@@ -28,7 +28,7 @@ use rushwind_authn::{AuthClaims, Authenticator};
 #[async_trait]
 pub trait AccessTokenChecker: Send + Sync {
     /// `at:{ct}:{uid}:{jti}` exact-match — false means revoked/expired.
-    async fn is_valid_access_token(&self, uid: u64, jti: &str, token: &str) -> bool;
+    async fn is_valid_access_token(&self, uid: i64, jti: &str, token: &str) -> bool;
     /// `bl:{jti}` existence.
     async fn is_blocked_access_token(&self, jti: &str) -> bool;
 }
@@ -69,7 +69,7 @@ pub async fn authenticate_and_check_session(
         _ => SessionError::InvalidOrExpired,
     })?;
 
-    let uid = claims.0.get("uid").and_then(|v| v.as_u64()).unwrap_or(0);
+    let uid = claims.0.get("uid").and_then(|v| v.as_i64()).unwrap_or(0);
     let jti = claims.get_jwt_id().unwrap_or_default();
     let valid = if jti.is_empty() {
         false
@@ -114,7 +114,7 @@ pub fn trace_id(headers: &axum::http::HeaderMap) -> String {
 /// a credential here — it only names the refresh binding key (uid/jti);
 /// the core validates the refresh token value itself. Mirrors the
 /// reference's ParseUnverifiedBearerJWTClaims.
-pub fn parse_unverified_bearer_jwt(token: &str) -> Option<(u64, String)> {
+pub fn parse_unverified_bearer_jwt(token: &str) -> Option<(i64, String)> {
     let payload_b64 = token.split('.').nth(1)?;
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -123,7 +123,7 @@ pub fn parse_unverified_bearer_jwt(token: &str) -> Option<(u64, String)> {
         .ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let uid = match claims.get("uid")? {
-        serde_json::Value::Number(n) => n.as_u64()?,
+        serde_json::Value::Number(n) => n.as_i64()?,
         serde_json::Value::String(s) => s.parse().ok()?,
         _ => return None,
     };

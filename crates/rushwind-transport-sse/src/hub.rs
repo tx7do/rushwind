@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 /// every SSE connection subscribed filters to its own stream.
 #[derive(Clone)]
 pub struct Hub {
-    tx: broadcast::Sender<(u64, String)>,
+    tx: broadcast::Sender<(i64, String)>,
 }
 
 impl Default for Hub {
@@ -20,11 +20,11 @@ impl Default for Hub {
 impl Hub {
     /// TryPublish (non-blocking; a slow/full buffer drops for that
     /// receiver only).
-    pub fn publish(&self, user_id: u64, payload: String) {
+    pub fn publish(&self, user_id: i64, payload: String) {
         let _ = self.tx.send((user_id, payload));
     }
 
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<(u64, String)> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<(i64, String)> {
         self.tx.subscribe()
     }
 }
