@@ -486,6 +486,17 @@ impl rushwind_oss::ObjectStorage for MockObjectStorage {
     ) -> rushwind_oss::BoxFuture<'a, Result<(), rushwind_oss::StorageError>> {
         Box::pin(async { Ok(()) })
     }
+    fn list<'a>(
+        &'a self,
+        _prefix: &'a str,
+        _after: &'a str,
+        _limit: usize,
+    ) -> rushwind_oss::BoxFuture<
+        'a,
+        Result<Vec<rushwind_oss::ListedObject>, rushwind_oss::StorageError>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 /// A config-source mock answering from a fixed map; one instance

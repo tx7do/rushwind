@@ -27,9 +27,8 @@ pub enum ResolvedCodec {
     /// The urlencoded form codec — pairs fed through the same populate
     /// machinery as the query binder.
     Form,
-    /// Binary protobuf wire format. No port in this crate: bodies under
-    /// this codec pass through unvalidated and unbound (the dormant
-    /// divergence the caller's compat spec registers).
+    /// Binary protobuf wire format (`application/proto`), decoded via
+    /// prost-reflect's `DynamicMessage::decode` in the bind layer.
     Proto,
 }
 

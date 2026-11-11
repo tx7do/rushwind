@@ -7,8 +7,11 @@
 //! # The core shapes
 //!
 //! The contract is one `Config → client` factory over two deployment
-//! modes, plus the [`ChatModel`] trait engines implement. There is a
-//! single engine today (`rushwind-ai-openai`): one OpenAI-compatible
+//! modes, plus three traits engines implement: [`ChatModel`] (one
+//! assistant turn), [`StreamingChatModel`] (the turn as a stream of
+//! [`ChatStreamEvent`]s — content deltas, assembled tool calls, the
+//! finish reason) and [`EmbeddingModel`] (texts to vectors). There is
+//! a single engine today (`rushwind-ai-openai`): one OpenAI-compatible
 //! client story, and orchestration frameworks (chains, agents,
 //! compose graphs) stay the caller's business.
 //!
@@ -25,6 +28,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
+
+use futures_core::Stream;
 
 /// Future type used across the ai contract.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -356,13 +361,63 @@ pub struct ChatResponse {
 /// The chat contract: generate one assistant turn from a conversation.
 /// Engines must
 /// be callable through shared references (`&self`).
-///
-/// Streaming and embeddings are engine-level extensions (see
-/// `rushwind-ai-openai`), not part of the contract.
 pub trait ChatModel: Send + Sync {
     /// Completes the conversation — the OpenAI chat-completions
     /// call.
     fn chat<'a>(&'a self, request: ChatRequest) -> BoxFuture<'a, Result<ChatResponse, AiError>>;
+}
+
+/// One increment of a streamed completion — the streaming half of the
+/// contract. Tool calls arrive **assembled**: engines merge the
+/// provider's streamed fragments (id/name on the first, argument
+/// fragments concatenated) and emit each invocation once, complete —
+/// callers handle one shape, the same [`ToolCall`] the non-streaming
+/// [`ChatResponse`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatStreamEvent {
+    /// The next piece of assistant content.
+    Content(String),
+    /// A complete tool invocation, assembled from the streamed
+    /// fragments.
+    ToolCall(ToolCall),
+    /// The stream ended, with the provider's finish reason
+    /// (`stop`, `tool_calls`, `length`, ...).
+    Finish {
+        /// The finish reason, verbatim from the provider.
+        reason: String,
+    },
+}
+
+/// The streamed chat stream — item type
+/// `Result<ChatStreamEvent, AiError>`; a yielded `Err` is terminal
+/// (the stream ends after it).
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, AiError>> + Send>>;
+
+/// The streaming chat contract: generate one assistant turn as a
+/// stream. Engines must be callable through shared references
+/// (`&self`). The request is sent (and its status checked) before the
+/// call resolves; the returned stream yields
+/// [`ChatStreamEvent`]s, ending after [`ChatStreamEvent::Finish`] or
+/// a terminal `Err`.
+pub trait StreamingChatModel: Send + Sync {
+    /// Streams the completion.
+    fn chat_stream<'a>(
+        &'a self,
+        request: ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatStream, AiError>>;
+}
+
+/// The embedding contract: texts to vectors, in input order.
+/// Engines must be callable through shared references (`&self`).
+pub trait EmbeddingModel: Send + Sync {
+    /// Embeds the texts. `model` names the embedding model —
+    /// embedding models usually differ from the chat model — and
+    /// `None` falls back to the engine's configured default.
+    fn embed<'a>(
+        &'a self,
+        model: Option<&'a str>,
+        texts: &'a [&'a str],
+    ) -> BoxFuture<'a, Result<Vec<Vec<f32>>, AiError>>;
 }
 
 #[cfg(test)]
@@ -455,5 +510,49 @@ mod tests {
             .to_string(),
             "ai: HTTP 429: rate limited"
         );
+    }
+
+    /// The three faces are object safe: heterogenous engine
+    /// collections (`Arc<dyn ...>`) are the deployment shape.
+    #[test]
+    fn the_three_faces_are_object_safe() {
+        use std::sync::Arc;
+
+        fn takes_chat(_: Arc<dyn ChatModel>) {}
+        fn takes_streaming(_: Arc<dyn StreamingChatModel>) {}
+        fn takes_embedding(_: Arc<dyn EmbeddingModel>) {}
+        takes_chat(Arc::new(NoopModel));
+        takes_streaming(Arc::new(NoopModel));
+        takes_embedding(Arc::new(NoopModel));
+    }
+
+    struct NoopModel;
+
+    impl ChatModel for NoopModel {
+        fn chat<'a>(
+            &'a self,
+            _request: ChatRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, AiError>> {
+            Box::pin(async { Err(AiError::EmptyModel) })
+        }
+    }
+
+    impl StreamingChatModel for NoopModel {
+        fn chat_stream<'a>(
+            &'a self,
+            _request: ChatRequest,
+        ) -> BoxFuture<'a, Result<ChatStream, AiError>> {
+            Box::pin(async { Err(AiError::EmptyModel) })
+        }
+    }
+
+    impl EmbeddingModel for NoopModel {
+        fn embed<'a>(
+            &'a self,
+            _model: Option<&'a str>,
+            _texts: &'a [&'a str],
+        ) -> BoxFuture<'a, Result<Vec<Vec<f32>>, AiError>> {
+            Box::pin(async { Err(AiError::EmptyModel) })
+        }
     }
 }

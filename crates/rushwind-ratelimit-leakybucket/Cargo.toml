@@ -1,0 +1,19 @@
+[package]
+name = "rushwind-ratelimit-leakybucket"
+description = "Leaky-bucket (pacing) rate limiter for the RushWind ratelimit contract: a backlog draining at a constant rate, admissions paced, nothing banked while idle, Allow/Wait/Close."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-ratelimit = { workspace = true }
+rushwind-transport = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

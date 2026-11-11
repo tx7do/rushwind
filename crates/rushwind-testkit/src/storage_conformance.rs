@@ -516,6 +516,15 @@ macro_rules! rushwind_storage_conformance_suite {
                 assert_eq!(
                     ids_filtered(
                         &repo,
+                        FilterExpr::cond("name", Op::Iexact, [Value::Text("CHARLIE".into())])
+                    )
+                    .await,
+                    vec![3],
+                    "iexact folds case but not shape"
+                );
+                assert_eq!(
+                    ids_filtered(
+                        &repo,
                         FilterExpr::cond("name", Op::Contains, [Value::Text("lt".into())])
                     )
                     .await,

@@ -14,9 +14,9 @@
 //!   parser prose — the differential rig shape-compares this class).
 //! * x-www-form-urlencoded — the form codec: urlencoded pairs fed through
 //!   the same populate machinery as the query binder.
-//! * proto — pass-through, unvalidated and unbound: no wire-format decoder
-//!   in this crate (the dormant divergence the caller's compat spec
-//!   registers).
+//! * proto — the binary wire-format decode: `DynamicMessage::decode` over
+//!   the buffered body; failures → 400 `body unmarshal %s` with the
+//!   decoder's own prose (the same failure class the json branch raises).
 //!
 //! A body route whose Content-Type resolves to nothing answers 400
 //! `unregister Content-Type: %s` with `%s` = `Header.Get` (the first
@@ -161,9 +161,10 @@ pub async fn bind_run_with_limit(
                         return codec_failure(format!("body unmarshal {e}"));
                     }
                 }
-                ResolvedCodec::Proto => {
-                    // No wire-format port: the body passes unbound.
-                }
+                ResolvedCodec::Proto => match DynamicMessage::decode(desc.clone(), &bytes[..]) {
+                    Ok(parsed) => dyn_msg = parsed,
+                    Err(e) => return codec_failure(format!("body unmarshal {e}")),
+                },
             }
         }
     }
@@ -183,4 +184,163 @@ pub async fn bind_run_with_limit(
 
     req.extensions_mut().insert(BoundMessage(dyn_msg));
     next.run(req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request as HttpRequest, StatusCode};
+    use axum::middleware::from_fn;
+    use axum::routing::post;
+    use axum::{Extension, Router};
+    use prost::Message as _;
+    use prost_reflect::prost_types::field_descriptor_proto::{Label, Type};
+    use prost_reflect::prost_types::{
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+    };
+    use prost_reflect::Value;
+    use tower::ServiceExt;
+
+    const INPUT_FQ: &str = "bind.test.v1.BindInput";
+    const REGISTERED: &[&str] = &["json", "x-www-form-urlencoded", "proto"];
+
+    /// A leaked single-message pool: one proto3 message with a string and
+    /// an int32 scalar — the minimal corpus the bind layer needs.
+    fn test_pool() -> &'static DescriptorPool {
+        let msg = DescriptorProto {
+            name: Some("BindInput".to_string()),
+            field: [("name", 1, Type::String), ("count", 2, Type::Int32)]
+                .map(|(name, number, ty)| FieldDescriptorProto {
+                    name: Some(name.to_string()),
+                    number: Some(number),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ty as i32),
+                    ..Default::default()
+                })
+                .into(),
+            ..Default::default()
+        };
+        let file = FileDescriptorProto {
+            name: Some("bind_test.proto".to_string()),
+            package: Some("bind.test.v1".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![msg],
+            ..Default::default()
+        };
+        let set = FileDescriptorSet { file: vec![file] };
+        Box::leak(Box::new(
+            DescriptorPool::from_file_descriptor_set(set).unwrap(),
+        ))
+    }
+
+    async fn echo(Extension(bound): Extension<BoundMessage>) -> String {
+        let name = bound
+            .0
+            .get_field_by_name("name")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let count = bound
+            .0
+            .get_field_by_name("count")
+            .and_then(|v| v.as_i32())
+            .unwrap_or_default();
+        format!("{name}/{count}")
+    }
+
+    fn app(pool: &'static DescriptorPool) -> Router {
+        Router::new()
+            .route("/echo", post(echo))
+            .layer(from_fn(move |req, next| async move {
+                bind_run(pool, INPUT_FQ, true, REGISTERED, req, next).await
+            }))
+    }
+
+    fn wire_input(name: &str, count: i32) -> Vec<u8> {
+        let pool = test_pool();
+        let desc = pool.get_message_by_name(INPUT_FQ).unwrap();
+        let mut msg = DynamicMessage::new(desc);
+        msg.set_field_by_name("name", Value::String(name.to_string()));
+        msg.set_field_by_name("count", Value::I32(count));
+        msg.encode_to_vec()
+    }
+
+    async fn run(app: Router, content_type: &str, body: Vec<u8>) -> (StatusCode, String) {
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/echo")
+            .header("content-type", content_type)
+            .body(Body::from(body))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn binary_proto_body_binds() {
+        let pool = test_pool();
+        let (status, body) = run(app(pool), "application/proto", wire_input("bolt", 7)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "bolt/7");
+    }
+
+    #[tokio::test]
+    async fn binary_proto_body_with_parameters_resolves() {
+        let pool = test_pool();
+        let (status, body) = run(
+            app(pool),
+            "application/proto; codec=proto",
+            wire_input("silt", 3),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "silt/3");
+    }
+
+    #[tokio::test]
+    async fn empty_proto_body_skips_binding() {
+        let pool = test_pool();
+        let (status, body) = run(app(pool), "application/proto", Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        // The reference decoder's exact sequence: empty body → no binding —
+        // the handler sees an all-default message.
+        assert_eq!(body, "/0");
+    }
+
+    #[tokio::test]
+    async fn malformed_proto_wire_format_is_a_codec_failure() {
+        let pool = test_pool();
+        let (status, body) = run(app(pool), "application/proto", vec![0x0A]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("\"code\":400"), "{body}");
+        assert!(body.contains("\"reason\":\"CODEC\""), "{body}");
+        assert!(body.contains("\"message\":\"body unmarshal "), "{body}");
+    }
+
+    #[tokio::test]
+    async fn truncated_proto_wire_format_is_a_codec_failure() {
+        let pool = test_pool();
+        let mut truncated = wire_input("bolt", 7);
+        truncated.pop(); // cut the int32 payload off its tag
+        let (status, body) = run(app(pool), "application/proto", truncated).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("\"message\":\"body unmarshal "), "{body}");
+    }
+
+    #[tokio::test]
+    async fn json_branch_still_binds() {
+        let pool = test_pool();
+        let (status, body) = run(
+            app(pool),
+            "application/json",
+            br#"{"name":"clay","count":4}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "clay/4");
+    }
 }

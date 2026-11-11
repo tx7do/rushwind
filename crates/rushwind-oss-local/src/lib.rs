@@ -13,7 +13,7 @@
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 
-use rushwind_oss::{ObjectStorage, StorageError};
+use rushwind_oss::{ListedObject, ObjectStorage, PresignMethod, StorageError};
 
 /// The local-disk engine for one bucket: objects land under `root`.
 pub struct LocalStorage {
@@ -96,5 +96,76 @@ impl ObjectStorage for LocalStorage {
                 Err(e) => Err(StorageError::Failed(format!("storage delete: {e}"))),
             }
         })
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+        after: &'a str,
+        limit: usize,
+    ) -> rushwind_oss::BoxFuture<'a, Result<Vec<ListedObject>, StorageError>> {
+        Box::pin(async move {
+            if limit == 0 {
+                return Err(StorageError::InvalidLimit);
+            }
+            // Walk the bucket root; keys are the relative paths with the
+            // platform separator normalized to `/` so a listing reads
+            // the same key space put/get address.
+            let mut keys: Vec<(String, u64)> = Vec::new();
+            let mut stack = vec![self.root.clone()];
+            while let Some(dir) = stack.pop() {
+                let mut entries = match tokio::fs::read_dir(&dir).await {
+                    Ok(entries) => entries,
+                    // An absent bucket root is an empty bucket.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(StorageError::Failed(format!("storage list: {e}")));
+                    }
+                };
+                while let Some(entry) = entries
+                    .next_entry()
+                    .await
+                    .map_err(|e| StorageError::Failed(format!("storage list: {e}")))?
+                {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    let relative = path
+                        .strip_prefix(&self.root)
+                        .map_err(|e| StorageError::Failed(format!("storage list: {e}")))?;
+                    let key = relative.to_string_lossy().replace('\\', "/");
+                    let size = entry
+                        .metadata()
+                        .await
+                        .map_err(|e| StorageError::Failed(format!("storage list: {e}")))?
+                        .len();
+                    keys.push((key, size));
+                }
+            }
+            keys.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(keys
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                // The strict-after cursor: S3's `start-after` semantics —
+                // keys strictly greater in the same ascending order.
+                .filter(|(key, _)| key.as_str() > after)
+                .take(limit)
+                .map(|(key, size)| ListedObject { key, size })
+                .collect())
+        })
+    }
+
+    fn presign(
+        &self,
+        key: &str,
+        method: PresignMethod,
+        expires: std::time::Duration,
+    ) -> Result<String, StorageError> {
+        let _ = (key, method, expires);
+        // A `file://` path carries no signature: there is no authority
+        // vouching for the grant, so the honest answer is refusal.
+        Err(StorageError::Unsupported)
     }
 }

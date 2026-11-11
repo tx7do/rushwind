@@ -340,14 +340,147 @@ async fn sse_stream_assembles_deltas_and_finish() {
     assert_eq!(
         events,
         vec![
-            ChatStreamEvent::Delta("Hel".to_string()),
-            ChatStreamEvent::Delta("lo".to_string()),
-            ChatStreamEvent::Finish("stop".to_string()),
+            ChatStreamEvent::Content("Hel".to_string()),
+            ChatStreamEvent::Content("lo".to_string()),
+            ChatStreamEvent::Finish {
+                reason: "stop".to_string()
+            },
         ]
     );
     let recorded = recorded.lock().unwrap().take().unwrap();
     assert_eq!(recorded.path, "/chat/completions");
     assert_eq!(recorded.body["stream"], true);
+}
+
+#[tokio::test]
+async fn sse_stream_assembles_tool_call_fragments() {
+    // The provider shape: id+name on the first fragment, the arguments
+    // string split across three.
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Hangzhou\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (base, _recorded) = spawn(Reply::Sse(sse.to_string())).await;
+    let client = cloud_client(&base, "gpt-4o");
+
+    let mut stream = client.chat_stream(chat_request("weather?")).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert_eq!(
+        events,
+        vec![
+            ChatStreamEvent::ToolCall(rushwind_ai::ToolCall {
+                id: "call_1".to_string(),
+                kind: rushwind_ai::ToolKind::Function,
+                function: rushwind_ai::ToolCallFunction {
+                    name: "get_weather".to_string(),
+                    arguments: "{\"city\":\"Hangzhou\"}".to_string(),
+                },
+            }),
+            ChatStreamEvent::Finish {
+                reason: "tool_calls".to_string()
+            },
+        ],
+        "the fragments must assemble into one complete call, emitted before the finish"
+    );
+}
+
+#[tokio::test]
+async fn two_tool_calls_assemble_by_index() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"f\",\"arguments\":\"1\"}},{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"g\",\"arguments\":\"2\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (base, _recorded) = spawn(Reply::Sse(sse.to_string())).await;
+    let client = cloud_client(&base, "gpt-4o");
+    let mut stream = client.chat_stream(chat_request("x")).await.unwrap();
+
+    let mut calls = Vec::new();
+    while let Some(event) = stream.next().await {
+        if let ChatStreamEvent::ToolCall(call) = event.unwrap() {
+            calls.push(call);
+        }
+    }
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].id, "call_a");
+    assert_eq!(calls[1].id, "call_b");
+    assert_eq!(calls[0].function.arguments, "1");
+    assert_eq!(calls[1].function.arguments, "2");
+}
+
+#[tokio::test]
+async fn eof_without_finish_reason_still_flushes_partial_tool_calls() {
+    let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"ci\"}}]}}]}\n\n";
+    // The peer closes without a finish chunk — EOF flushes what arrived.
+    let (base, _recorded) = spawn(Reply::Sse(sse.to_string())).await;
+    let client = cloud_client(&base, "gpt-4o");
+    let mut stream = client.chat_stream(chat_request("x")).await.unwrap();
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    assert_eq!(
+        events,
+        vec![ChatStreamEvent::ToolCall(rushwind_ai::ToolCall {
+            id: "call_1".to_string(),
+            kind: rushwind_ai::ToolKind::Function,
+            function: rushwind_ai::ToolCallFunction {
+                name: "get_weather".to_string(),
+                arguments: "{\"ci".to_string(),
+            },
+        })],
+        "what arrived is yielded assembled; the stream simply ends"
+    );
+}
+
+/// The streaming and embedding faces ride trait objects — the
+/// deployment shape — against the live mock.
+#[tokio::test]
+async fn streaming_and_embedding_faces_work_through_trait_objects() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (base, _recorded) = spawn(Reply::Sse(sse.to_string())).await;
+    let client: Arc<dyn rushwind_ai::StreamingChatModel> = Arc::new(cloud_client(&base, "gpt-4o"));
+
+    let mut stream = client.chat_stream(chat_request("hello")).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    assert_eq!(
+        events,
+        vec![
+            ChatStreamEvent::Content("Hi".to_string()),
+            ChatStreamEvent::Finish {
+                reason: "stop".to_string()
+            },
+        ]
+    );
+
+    let canned = serde_json::json!({
+        "data": [{"index": 0, "embedding": [1.0, 2.0]}]
+    });
+    let (base, recorded) = spawn(Reply::Json(canned)).await;
+    let embedder: Arc<dyn rushwind_ai::EmbeddingModel> = Arc::new(cloud_client(&base, "chat-x"));
+    let vectors = embedder
+        .embed(Some("text-embedding-3-small"), &["doc"])
+        .await
+        .unwrap();
+    assert_eq!(vectors, vec![vec![1.0, 2.0]]);
+    // The explicit model overrides the configured default on the wire.
+    let recorded = recorded.lock().unwrap().take().unwrap();
+    assert_eq!(recorded.body["model"], "text-embedding-3-small");
 }
 
 #[tokio::test]

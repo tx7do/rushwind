@@ -6591,6 +6591,7 @@ dependencies = [
 name = "rushwind-ai"
 version = "0.0.1"
 dependencies = [
+ "futures-core",
  "serde",
  "serde_json",
 ]
@@ -7035,6 +7036,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-config-nacos"
+version = "0.0.1"
+dependencies = [
+ "reqwest 0.12.28",
+ "rushwind-config",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-core"
 version = "0.0.1"
 dependencies = [
@@ -7187,6 +7199,8 @@ dependencies = [
  "rushwind-authn",
  "rushwind-redact",
  "serde_json",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -7347,6 +7361,24 @@ dependencies = [
 
 [[package]]
 name = "rushwind-ratelimit-bbr"
+version = "0.0.1"
+dependencies = [
+ "rushwind-ratelimit",
+ "rushwind-transport",
+ "tokio",
+]
+
+[[package]]
+name = "rushwind-ratelimit-leakybucket"
+version = "0.0.1"
+dependencies = [
+ "rushwind-ratelimit",
+ "rushwind-transport",
+ "tokio",
+]
+
+[[package]]
+name = "rushwind-ratelimit-slidingwindow"
 version = "0.0.1"
 dependencies = [
  "rushwind-ratelimit",

@@ -57,7 +57,7 @@ let sum = engine.call_function("add", &args).await?;   // Int(3)
 
 **Starlark** —— 确定性构建语言。语义是**每次执行把累积的全部脚本按序重跑**（后脚本可见前脚本的全局），副作用脚本会重复生效；整数全局被钳到 32 位；宿主函数不可注册。
 
-**WASM** —— wasmi 字节码引擎，只具备"加载 + 执行 `last` 模块的 `_start` 导出"；没有 `_start` 就静默执行返回 `Null`。坑：源契约是 `String`，而编译器产物通常不是合法 UTF-8——手工编码的字节段才能走得通这条路径。
+**WASM** —— wasmi 字节码引擎：加载 + 执行 `last` 模块的 `_start` 导出（没有 `_start` 就静默执行返回 `Null`），外加两个真能力面——**globals**（wasm 标量注册进 `env` 导入模块、注册表为唯一事实来源）与 **call_function**（按名调用导出函数，参数按签名严格编组、范围检查绝不截断）；`register_function` 维持拒绝（异步 HostFunction 对同步解释器的诚实桥需要 reactor，行内 poll 会死锁）。坑：源契约是 `String`，而编译器产物通常不是合法 UTF-8——手工编码的字节段才能走得通这条路径。
 
 ## 与配置域的桥
 

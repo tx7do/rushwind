@@ -2,6 +2,23 @@
 
 全部 20 个域的 Rust 实现收口记录。日期：2026-09-14。
 
+## 契约扩面与引擎增量（2026-11-12）
+
+九项一次落地（各带单元/一致性测试，fmt/clippy -D warnings 全仓干净）：
+
+- **http-binding 二进制 proto 请求体解码**：`ResolvedCodec::Proto` 从透传改为 `DynamicMessage::decode` 真绑定，失败与其他 codec 同类回 400 `body unmarshal %s`（解码器自己的 prose）；空体仍跳过绑定（参考解码器的精确次序）。此前"需要二进制线格式的接口先别开"的告警解除。
+- **oss 契约扩面（list + presign）**：契约加 `list(prefix, after, limit)`（升序键 + 严格 after 游标 + limit 页；零 limit = `InvalidLimit`）与 `presign(key, method, expires)`（缺省实现 = `Unsupported`——只有签名权威引擎可覆写）。s3 引擎两件都实现（ListObjectsV2 + `encoding-type=url` + `start-after` + max-keys 钳 1000；presign 即引擎本就说着的 query-string 签名），oss-local 实现 list（目录遍历 + 平台分隔符归一）、presign 诚实拒绝（file:// 无签名权威）；live 套件补 list/presign 用例（含"无凭据客户端可执行 presigned GET"钉子）。
+- **ratelimit 引擎族 +2**：`rushwind-ratelimit-slidingwindow`（滑动窗口日志：任意滑动窗内至多 limit 次准入、边界精确无固定窗双预算缝、日志内存以 limit 为界）与 `rushwind-ratelimit-leakybucket`（漏桶整流：背漏恒速排出、空闲不攒额度——与令牌桶的突发语义相对），两者都带 `with_clock` 注入钟与 close-唤醒 waiter。
+- **ai 契约三面**：`StreamingChatModel`（`ChatStreamEvent::{Content, ToolCall, Finish}`；工具调用分片在引擎侧拼装成完整调用才进事件面）与 `EmbeddingModel` 提为契约 trait（原为 openai 引擎私有扩展），`rushwind-ai-openai` 补齐 SSE 工具调用 delta 拼装（按 index 合并、EOF 无 finish_reason 也冲刷已到达的分片），对象安全钉死（`Arc<dyn …>` 是部署形状）。
+- **script-wasm 能力面**：`GlobalAccessor` 真实现（wasm 标量 Int/UInt/Float/Bool、`env` 导入模块链接进每次实例化、注册表为唯一事实来源）+ `FunctionRegistrar::call_function`（按名调用导出函数，参数按签名严格编组——Bool→整型参数、Int/UInt 范围检查绝不截断、Float→f64/f32；算术不符与未知导出按 Failed 拒绝）。`register_function` 维持拒绝并写明原因：契约 HostFunction 是异步的而 wasmi 同步执行，诚实的桥需要一个 reactor，行内 poll 会死锁任何等待运行时原语的宿主函数。
+- **config/nacos 源**（`rushwind-config-nacos`）：v1 cs/configs REST 读（原文直传、404=缺席、可选 tenant/accessToken），轮询 watch 沿 config-http 形状；mock server 套件钉读/缺席/构造守卫/watch 推送。
+- **broker 毒消息契约前置面**：`NackAction::{Requeue, Drop}` + `Event::nack`（`Nacker`；隐式 ack 引擎为文档化 no-op——投递已落定，无物可退回）与 `with_error_handler`（ErrorHandler 观察点：包装 Handler，错误到达观察者但仍以 Err 面目冒出，投递结算权留在引擎投递循环）。`BrokerError` 补 Clone。**各引擎翻转 manual-ack 仍按需立项**——七个投递循环的逐引擎翻转换来的是另一场战役（kafka seek、rabbitmq manual-ack、redelivery 上限与 live 套件重验）。
+- **storage IEXACT 操作符全矩阵**：契约 `Op::Iexact`（Unicode 折叠精确等值、text-only、一元）接进 wire（此前点名拒绝）、memory 评估器（折叠比较）、seaorm（`LOWER(col) = LOWER(?)`）、mongo（锚定折叠正则）、ES/OpenSearch（`term` 的 `case_insensitive`）、ClickHouse（`lowerUTF8`）；一致性套件与三方言快照各补钉子。REGEXP/IREGEXP 维持 wire 拒绝（前置：契约零依赖doctrine下的正则求值故事）；JSON_CONTAINS/ARRAY_CONTAINS/json_path 维持拒绝（前置：Value 协议先有 JSON/Array 种类——两个前置项都已写进架构文档的操作符表）。
+- **文档改齐**：security-authn-authz.md 的"bootstrap 尚不装配认证"过时口径更正（bootstrap 经命名实例工厂表装配 authn/authz 并按声明挂 with_authn/with_authorization*）。
+
+testkit 套件增量：storage 一致性套件增 iexact 钉子（折叠大小写不折叠形状）。
+
+
 ## 独立路线增量（2026-11-11）
 
 不依赖上游三仓的独立功能面，六个模块一次落地（各带一致性/单元套件，fmt/clippy -D warnings 干净）：
@@ -39,7 +56,7 @@ testkit 新增三个特性门控套件：`password`（8 测试：三分面验证
 - broker-kafka：**移植**——key→id 映射。**核对不适用**——writer nil map（disconnect 清空而非置 nil）、批量间隔零值（无批量模式）、同主题（ additive 设计无覆盖面）。
 - transport-mqtt：**移植**——重启真重订阅端到端钉子（嵌入式 broker 验证）；注册表锁/僵尸窗口等骨架缺陷在 Rust 面无对应结构。
 - webtransport/h3/quic/axum/cron 经逐条核对为已覆盖或设计不适用：Rust 面以 endpoint 级真释放 + 逐连接 stop 竞速实现关停（强于上游 http3.Server 不可重启补丁的意图），axum 中间件短路是 tower 模型结构保证，cron 无 gRPC keepalive 对应面。
-- **遗留契约缺口**：上游毒消息路由（ErrorHandler + 非自动确认 Nack）需要 `rushwind-broker` 契约先有 error-handler hook 与 ack 策略选项才能移植；当前各引擎已保证 handler 错误不杀订阅。
+- **遗留契约缺口（2026-11-12 部分收口）**：契约已备好上游毒消息路由的两块前置面（`NackAction`/`Event::nack` 拒绝脸 + `with_error_handler` 错误观察点）；剩余工作是各引擎的 manual-ack 翻转（当前七引擎全部隐式 ack，见上方 2026-11-12 节），按需立项。
 
 **bootstrap 线（kratos-bootstrap bc2912a..5968de4）**
 
@@ -48,7 +65,7 @@ testkit 新增三个特性门控套件：`password`（8 测试：三分面验证
 **明确推迟**（feature 级，非缺陷）：
 
 - 向量检索契约模块（vector/）与 qdrant/milvus/weaviate/neo4j 四引擎：整个向量域未移植，按需立项。
-- JSONB 点路径过滤（638881f 修的 JsonValue 绑定缺陷）：Rust 线尚无 JSON 路径过滤能力（storage-proto 拒绝 json_path、seaorm 无 JSON 翻译），补能力时按其教训以类型化值绑定并测试 CONTAINS 命中与 EQ 精确两案例。
+- JSONB 点路径过滤（638881f 修的 JsonValue 绑定缺陷）：Rust 线尚无 JSON 路径过滤能力（storage-proto 拒绝 json_path、seaorm 无 JSON 翻译），补能力时按其教训以类型化值绑定并测试 CONTAINS 命中与 EQ 精确两案例——前置是 `Value` 协议先有 JSON/Array 种类（2026-11-12 已写入架构文档操作符表）；IEXACT 这一族已在 2026-11-12 全矩阵落地。
 - 13→8 引擎口径差：上游新增 qdrant/milvus/weaviate/neo4j（向量），cassandra 仓库层补完对应 Rust 面为契约优先设计（scylla 驱动typed 行反序列化天然规避三缺陷）。
 
 ## 已完成域

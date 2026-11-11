@@ -111,6 +111,11 @@ pub(crate) fn condition_json(
             wildcard_clause(field_borrow.to_owned(), &pattern_operand(condition)?, false)
         ] } }),
         Op::Ilike => wildcard_clause(field_borrow.to_owned(), &pattern_operand(condition)?, true),
+        // The `term` query's own case-insensitive flag — exact folding,
+        // not a wildcard.
+        Op::Iexact => json!({
+            "term": { field_borrow: { "value": scalar(&first()), "case_insensitive": true } }
+        }),
         Op::Contains => {
             let text = pattern_operand(condition)?;
             wildcard_clause(field_borrow.to_owned(), &format!("%{text}%"), false)

@@ -182,13 +182,16 @@ fn condition_to_filter(condition: &FilterCondition) -> Result<ContractFilterExpr
         Operator::Icontains => cond(Op::Ilike, wrap_pattern(&values, |s| format!("%{s}%"))),
         Operator::IstartsWith => cond(Op::Ilike, wrap_pattern(&values, |s| format!("{s}%"))),
         Operator::IendsWith => cond(Op::Ilike, wrap_pattern(&values, |s| format!("%{s}"))),
+        // Case-insensitive equality is its own contract operator — the
+        // SQL engines render LOWER(col) = LOWER(?), MongoDB an anchored
+        // case-folded regex.
+        Operator::Iexact => cond(Op::Iexact, values),
         Operator::Regexp
         | Operator::Iregexp
         | Operator::JsonContains
         | Operator::ArrayContains
         | Operator::Exists
-        | Operator::Search
-        | Operator::Iexact => return Err(unsupported(op_name(op))),
+        | Operator::Search => return Err(unsupported(op_name(op))),
     })
 }
 

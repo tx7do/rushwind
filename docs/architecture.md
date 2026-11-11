@@ -121,7 +121,8 @@
 | `BETWEEN` | `Between` |
 | `CONTAINS` `STARTS_WITH` `ENDS_WITH` | 同名直映 |
 | `ICONTAINS` `ISTARTS_WITH` `IENDS_WITH` | 折叠为 `Ilike` 模式（`%v%` / `v%` / `%v`）——每个 SQL 引擎已说着的方言 |
-| `REGEXP` `IREGEXP` `JSON_CONTAINS` `ARRAY_CONTAINS` `EXISTS` `SEARCH` `IEXACT`；`date_part`/`json_path` 扩展 | **`Unsupported`**，在 wire 边界点名拒绝，绝不静默丢弃 |
+| `IEXACT` | 自有契约算子 `Iexact`——SQL 引擎渲染 `LOWER(col) = LOWER(?)`，MongoDB 锚定大小写折叠正则，ES/OpenSearch `term` 的 `case_insensitive`，ClickHouse `lowerUTF8(col) = '…'` |
+| `REGEXP` `IREGEXP` `JSON_CONTAINS` `ARRAY_CONTAINS` `EXISTS` `SEARCH`；`date_part`/`json_path` 扩展 | **`Unsupported`**，在 wire 边界点名拒绝，绝不静默丢弃——regex 族需要契约侧的正则求值故事（契约刻意零依赖），JSON 族需要 `Value` 协议先有 JSON/Array 种类，两者都是独立前置项 |
 
 三种分页经 `PaginationRequest` oneof 进入：`NoPaging` 映射为 `Offset{0, MAX_LIMIT}`（契约允许的最大窗口）。protojson 之外，契约 crate 还内建 **AIP 文本子集**解析器（`FilterExpr::from_aip`，零依赖手写）：`name = "bolt" AND (age >= 10 OR role IN ("a","b"))`，AND 优先于 OR、并列即隐式 AND、`NOT` 翻转有精确补运算的操作符——与 protojson 两条路汇入同一棵 [`FilterExpr`] 树，端到端测试钉死两条路在引擎上的结果一致。
 
@@ -180,7 +181,7 @@ DTO↔Entity 映射落在 `rushwind-storage-macros`：契约 crate 定义 `ToRec
 | 用例组 | 验证 |
 |:---|:---|
 | CRUD 七件（create 回填主键/全列往返/get 缺失 None/update 只补丁给定字段且越权即 NotFound/delete 双向语义/批写原子性冲突回滚/upsert 插改一体） | 契约的写路径义务与 NULL 往返 |
-| 比较符/模式符/NULL/集合区间/实数数值比较 | 18 个操作符语义；模式符为 SQL 通配（`%`/`_`），`ilike` 折叠大小写 |
+| 比较符/模式符/NULL/集合区间/实数数值比较 | 19 个操作符语义；模式符为 SQL 通配（`%`/`_`），`ilike`/`iexact` 折叠大小写 |
 | `and_or_groups_nest` | `All`/`Any` 任意嵌套翻译与求值一致 |
 | `invalid_filters_are_rejected_before_the_engine` | 未知列、操作符元数以 `InvalidQuery` 拒绝 |
 | `sorting_asc_desc_and_secondary` | 多级排序，主键兜底决胜 |

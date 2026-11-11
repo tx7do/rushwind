@@ -14,6 +14,12 @@
 //! local endpoints; virtual-host style (`http://bucket.host/key`)
 //! suits AWS. Session tokens (`x-amz-security-token`) pass through
 //! rusty-s3's credentials.
+//!
+//! [`ObjectStorage::list`] rides ListObjectsV2 (`encoding-type=url` so
+//! keys arrive percent-decoded, `start-after` as the strict-after
+//! cursor, `max-keys` clamped to S3's 1000 ceiling); `presign` is the
+//! same query-string signing the engine already speaks — mint the URL,
+//! hand it to any client, no credential headers needed.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -21,7 +27,8 @@
 use std::time::Duration;
 
 use rushwind_oss::BoxFuture;
-use rushwind_oss::{ObjectStorage, StorageConfig, StorageError};
+use rushwind_oss::{ListedObject, ObjectStorage, PresignMethod, StorageConfig, StorageError};
+use rusty_s3::actions::ListObjectsV2;
 use rusty_s3::{Bucket, Credentials};
 use rusty_s3::{S3Action, UrlStyle};
 
@@ -118,6 +125,9 @@ impl S3Storage {
             Ok(())
         }
     }
+
+    /// S3's own hard cap on a single list page.
+    const MAX_LIST_PAGE: usize = 1000;
 }
 
 impl ObjectStorage for S3Storage {
@@ -215,6 +225,83 @@ impl ObjectStorage for S3Storage {
             }
             Ok(())
         })
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+        after: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<ListedObject>, StorageError>> {
+        Box::pin(async move {
+            if limit == 0 {
+                return Err(StorageError::InvalidLimit);
+            }
+            let mut action = self
+                .inner
+                .bucket
+                .list_objects_v2(Some(&self.inner.credentials));
+            if !prefix.is_empty() {
+                action.with_prefix(prefix);
+            }
+            if !after.is_empty() {
+                action.with_start_after(after);
+            }
+            action.with_max_keys(limit.min(Self::MAX_LIST_PAGE));
+            let url = action.sign(SIGNATURE_VALIDITY);
+            let response = self
+                .inner
+                .http
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| StorageError::Failed(format!("s3 list {prefix}: {e}")))?;
+            if !response.status().is_success() {
+                return Err(StorageError::Failed(format!(
+                    "s3 list {prefix}: HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            let text = response
+                .text()
+                .await
+                .map_err(|e| StorageError::Failed(format!("s3 list {prefix}: {e}")))?;
+            let parsed = ListObjectsV2::parse_response(&text)
+                .map_err(|e| StorageError::Failed(format!("s3 list parse: {e}")))?;
+            Ok(parsed
+                .contents
+                .into_iter()
+                .map(|entry| ListedObject {
+                    key: entry.key,
+                    size: entry.size,
+                })
+                .collect())
+        })
+    }
+
+    fn presign(
+        &self,
+        key: &str,
+        method: PresignMethod,
+        expires: Duration,
+    ) -> Result<String, StorageError> {
+        Self::validate_key(key)?;
+        if expires.is_zero() {
+            return Err(StorageError::InvalidExpiry);
+        }
+        let url = match method {
+            PresignMethod::Get => self
+                .inner
+                .bucket
+                .get_object(Some(&self.inner.credentials), key)
+                .sign(expires),
+            PresignMethod::Put => self
+                .inner
+                .bucket
+                .put_object(Some(&self.inner.credentials), key)
+                .sign(expires),
+        };
+        Ok(url.to_string())
     }
 }
 

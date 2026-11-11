@@ -1,0 +1,19 @@
+[package]
+name = "rushwind-ratelimit-slidingwindow"
+description = "Sliding-window-log rate limiter for the RushWind ratelimit contract: at most `limit` admissions per trailing `window`, exact boundaries, Allow/Wait/Close."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-ratelimit = { workspace = true }
+rushwind-transport = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

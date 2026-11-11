@@ -363,7 +363,7 @@ fn negate(node: &FilterNode) -> Result<FilterExpr, StorageError> {
                 Op::IsNotNull => Op::IsNull,
                 Op::Between => Op::NotBetween,
                 Op::NotBetween => Op::Between,
-                Op::Ilike | Op::Contains | Op::StartsWith | Op::EndsWith => {
+                Op::Ilike | Op::Iexact | Op::Contains | Op::StartsWith | Op::EndsWith => {
                     return Err(StorageError::Unsupported(
                         "negated pattern operators".into(),
                     ))

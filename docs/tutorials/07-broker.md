@@ -88,6 +88,7 @@ let broker = MiddlewareBroker::new(Arc::new(inner), publish_mw, subscriber_mw);
 - **RabbitMQ 每次发布开新信道并等 confirm**：高频发布场景在契约外自行池化或批量。
 - **退订要显式调用 `unsubscribe()`**：多个引擎的 Drop 退订只是尽力而为（锁被占就跳过）。
 - **`request` 只有 NATS 实现**，其余引擎返回 `Failed("request not implemented by this engine")`——选型时这是硬约束。
+- **毒消息面是契约级的两件套**：`Event::nack(NackAction::Requeue/Drop)`（隐式 ack 引擎是文档化 no-op）与 `with_error_handler(handler, observer)`——handler 错误到达观察者但仍以 `Err` 冒出，订阅不被杀死。当前七引擎全部隐式 ack；manual-ack 翻转按需立项。
 
 ## 动手练习
 

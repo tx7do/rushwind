@@ -31,7 +31,7 @@
 
 **会话传输（ws/quic）**：`rushwind-authn` 提供 `AuthenticationGate`——把任意 `Authenticator` 接入 [`GateChain`](../crates/rushwind-transport/src/session.rs) 的适配层。门链是 [session-middleware.md](./session-middleware.md) 认定的会话传输唯一 authn/authz 挂载点；认证失败映射为 Rejection{status: 错误分类学状态码, reason: 错误 code}。门按契约**同步纯 CPU**：只有本地证据引擎（静态集合、签名验证、进程内存储）可以进门；带 IO 的验证回调必须前置进程内缓存，或不进门链。
 
-**HTTP 族（axum）**：tower 中间件看得到每个请求，路由级 enforcement 是应用自己的装配；契约 crate 只供给原语。`rushwind-bootstrap` 目前不装配认证，接入属后续工作。
+**HTTP 族（axum）**：tower 中间件看得到每个请求，路由级 enforcement 是应用自己的装配；契约 crate 只供给原语。`rushwind-http` 把这套装配写好（`with_authn`/`with_authorization*` 与提取器），`rushwind-bootstrap` 经命名实例工厂表装配 authn/authz 引擎、并在 route pack/storage endpoint 上按声明挂 `with_authn`/`with_authorization*` 包装（见其 `config.rs` 的 `authn`/`authz` 节）。
 
 ## 设计决策清单
 

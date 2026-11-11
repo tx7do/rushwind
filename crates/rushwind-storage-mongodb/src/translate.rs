@@ -198,6 +198,18 @@ pub(crate) fn condition_to_doc(condition: &Condition) -> Result<Document, Storag
         Op::Contains => doc! { field: { "$regex": text_shape(|s| s.to_owned())? } },
         Op::StartsWith => doc! { field: { "$regex": text_shape(|s| format!("^{s}"))? } },
         Op::EndsWith => doc! { field: { "$regex": text_shape(|s| format!("{s}$"))? } },
+        Op::Iexact => {
+            let owned = first();
+            let Some(text) = owned.as_str() else {
+                return Err(StorageError::InvalidQuery(
+                    "IEXACT needs one text operand".into(),
+                ));
+            };
+            doc! { field: { "$regex": Bson::RegularExpression(Regex {
+                pattern: format!("^{}$", escape_regex(text)),
+                options: "i".into(),
+            }) } }
+        }
     })
 }
 
@@ -375,6 +387,17 @@ mod tests {
             "$regex",
         );
         assert_eq!(pattern, r"^.*AM.*$");
+        assert_eq!(options, "i");
+    }
+
+    #[test]
+    fn iexact_anchors_with_the_case_insensitive_flag() {
+        let (pattern, options) = regex_of(
+            &leaf("name", Op::Iexact, vec![Value::Text("CHARLIE".into())]),
+            "name",
+            "$regex",
+        );
+        assert_eq!(pattern, r"^CHARLIE$");
         assert_eq!(options, "i");
     }
 

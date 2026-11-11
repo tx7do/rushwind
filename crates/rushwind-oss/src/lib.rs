@@ -1,5 +1,5 @@
-//! Object storage contract for RushWind: put/get/delete of byte objects
-//! in an S3-compatible bucket.
+//! Object storage contract for RushWind: put/get/delete/list of byte
+//! objects in an S3-compatible bucket, plus presigned direct access.
 //!
 //! # The core shapes
 //!
@@ -11,19 +11,29 @@
 //! Guard-style error sentinels are unneeded here — the type system
 //! makes nil inputs impossible; validation failures surface as
 //! [`StorageError`] variants
-//! (`EmptyBucket`, `EmptyObjectKey`) plus `NotFound` for a missing
+//! (`EmptyBucket`, `EmptyObjectKey`, `InvalidLimit`, `InvalidExpiry`)
+//! plus `NotFound` for a missing
 //! object read.
 //!
 //! # Engines
 //!
 //! - `rushwind-oss-s3` — SigV4-signed REST over reqwest; works
 //!   against AWS S3, MinIO, and any S3-compatible endpoint.
+//! - `rushwind-oss-local` — the local-disk twin for the no-endpoint
+//!   profile.
+//!
+//! Presigned URLs need a signing authority: the S3 engine mints them
+//! (query-string signing is its native wire form), the local engine
+//! answers [`StorageError::Unsupported`] — a `file://` path would
+//! carry no signature, and pretending otherwise would be a false
+//! grant.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 /// Future type used across the oss contract.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -42,6 +52,15 @@ pub enum StorageError {
     EmptyObjectKey,
     /// The object body is empty where content was required.
     EmptyObjectBody,
+    /// The operation has no meaning for this engine (presigned URLs
+    /// against a local disk — there is no signing authority to vouch
+    /// for the grant).
+    Unsupported,
+    /// A list page size of zero was requested.
+    InvalidLimit,
+    /// A presign expiry of zero was requested — the URL would be dead
+    /// at birth.
+    InvalidExpiry,
 }
 
 impl std::fmt::Display for StorageError {
@@ -52,6 +71,9 @@ impl std::fmt::Display for StorageError {
             Self::EmptyBucket => write!(f, "oss: bucket is empty"),
             Self::EmptyObjectKey => write!(f, "oss: object key is empty"),
             Self::EmptyObjectBody => write!(f, "oss: object body is empty"),
+            Self::Unsupported => write!(f, "oss: operation unsupported by this engine"),
+            Self::InvalidLimit => write!(f, "oss: list limit must be greater than zero"),
+            Self::InvalidExpiry => write!(f, "oss: presign expiry must be greater than zero"),
         }
     }
 }
@@ -83,6 +105,27 @@ pub struct StorageConfig {
     pub bucket: String,
 }
 
+/// One entry of a [`ObjectStorage::list`] page: the key and the byte
+/// size. Keys come back in ascending byte order — the S3 list order —
+/// so pagination by "everything strictly after the last key seen"
+/// composes with the engine's own ordering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    /// The object key, relative to the bucket root.
+    pub key: String,
+    /// The object size in bytes.
+    pub size: u64,
+}
+
+/// The HTTP method a presigned URL grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresignMethod {
+    /// `GET` — direct download.
+    Get,
+    /// `PUT` — direct upload.
+    Put,
+}
+
 /// The object storage contract.
 /// Engines must be callable through shared references (`&self`).
 pub trait ObjectStorage: Send + Sync {
@@ -101,6 +144,37 @@ pub trait ObjectStorage: Send + Sync {
 
     /// Removes the object; a no-op when missing.
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StorageError>>;
+
+    /// Lists object keys in ascending byte order, at most `limit` of
+    /// them (engines may cap the page below `limit` — S3's own cap is
+    /// 1000), strictly after `after` in that order (an empty `after`
+    /// starts from the beginning) and under `prefix` (an empty prefix
+    /// matches everything). The strict-after cursor plus the fixed
+    /// ordering make `list(prefix, last_key_seen, limit)` a complete
+    /// enumeration of any bucket. A zero `limit` is
+    /// [`StorageError::InvalidLimit`].
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+        after: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<ListedObject>, StorageError>>;
+
+    /// Mints a presigned URL granting `method` on `key` for `expires`.
+    /// The signature rides the query string, so the grant is
+    /// executable by any HTTP client with no credential headers. A
+    /// zero expiry is [`StorageError::InvalidExpiry`]. The default
+    /// implementation answers [`StorageError::Unsupported`] — only
+    /// engines with a signing authority override it.
+    fn presign(
+        &self,
+        key: &str,
+        method: PresignMethod,
+        expires: Duration,
+    ) -> Result<String, StorageError> {
+        let _ = (key, method, expires);
+        Err(StorageError::Unsupported)
+    }
 
     /// Probes the engine with a timeout bound for liveness checks —
     /// the default implementation is a no-op.

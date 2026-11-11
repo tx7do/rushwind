@@ -132,6 +132,8 @@ pub(crate) fn translate(node: &FilterNode) -> Result<Condition, StorageError> {
                 Op::NotLike => col.not_like(pattern(|s| s.to_owned())),
                 // No ILIKE in SQLite/MySQL: LOWER on the column, folded in Rust.
                 Op::Ilike => Expr::from(Func::lower(col)).like(pattern(|s| s.to_lowercase())),
+                // Same folding for case-insensitive equality.
+                Op::Iexact => Expr::from(Func::lower(col)).eq(pattern(|s| s.to_lowercase())),
                 Op::IsNull => col.is_null(),
                 Op::IsNotNull => col.is_not_null(),
                 Op::Between => {

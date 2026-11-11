@@ -228,6 +228,13 @@ pub(crate) fn condition_sql(condition: &Condition) -> Result<String, StorageErro
         Op::Like => format!("{} LIKE '{}'", column, pattern(|s| s.to_owned())?),
         Op::NotLike => format!("{} NOT LIKE '{}'", column, pattern(|s| s.to_owned())?),
         Op::Ilike => format!("{} ILIKE '{}'", column, pattern(|s| s.to_lowercase())?),
+        // lowerUTF8 is ClickHouse's Unicode-aware LOWER; the operand
+        // folds on the Rust side, as every SQL engine here does.
+        Op::Iexact => format!(
+            "lowerUTF8({}) = '{}'",
+            column,
+            pattern(|s| s.to_lowercase())?
+        ),
         Op::Contains => format!("{} LIKE '%{}%'", column, pattern(|s| s.to_owned())?),
         Op::StartsWith => format!("{} LIKE '{}%'", column, pattern(|s| s.to_owned())?),
         Op::EndsWith => format!("{} LIKE '%{}'", column, pattern(|s| s.to_owned())?),

@@ -19,23 +19,30 @@
 //!
 //! # Beyond the sync surface
 //!
-//! [`ChatModel::chat`] covers the contract. The engine also streams
-//! server-sent events ([`OpenAiClient::chat_stream`]: content deltas
-//! plus the finish reason; tool-call delta assembly is not provided)
-//! and embeds text ([`OpenAiClient::embed`]), both over the same
-//! endpoint resolution.
+//! [`ChatModel::chat`] covers the one-shot face; the streaming face
+//! ([`StreamingChatModel`]) rides the same endpoint as server-sent
+//! events, and the engine assembles the provider's tool-call
+//! fragments into complete [`ToolCall`]s before they enter the
+//! stream — the contract's event face carries assembled calls only.
+//! The embedding face ([`EmbeddingModel`]) posts `/embeddings`, with
+//! `None` falling back to the configured model.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::BoxStream;
 use rushwind_ai::{
-    AiError, BoxFuture, ChatModel, ChatRequest, ChatResponse, Config, ModelType, Usage,
+    AiError, BoxFuture, ChatModel, ChatRequest, ChatResponse, ChatStream, Config, EmbeddingModel,
+    ModelType, StreamingChatModel, ToolCall, ToolCallFunction, ToolKind, Usage,
 };
+
+/// One increment of a streamed completion — the contract's event
+/// face, re-exported for callers of the engine directly.
+pub use rushwind_ai::ChatStreamEvent;
 
 /// The provider default when [`rushwind_ai::CloudConfig::base_url`]
 /// is empty.
@@ -62,14 +69,12 @@ pub struct OpenAiClient {
     inner: Arc<Inner>,
 }
 
-/// One increment of a streamed completion.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChatStreamEvent {
-    /// The next piece of assistant content.
-    Delta(String),
-    /// The stream ended, with the provider's finish reason
-    /// (`stop`, `tool_calls`, `length`, ...).
-    Finish(String),
+/// The tool-call fragment under assembly: id/name arrive on the first
+/// fragment, the arguments string concatenates across all of them.
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 impl OpenAiClient {
@@ -112,8 +117,9 @@ impl OpenAiClient {
 
     /// Streams a completion as server-sent events. The request is
     /// sent (and its status checked) before the call resolves; the
-    /// returned stream then yields content deltas and the finish
-    /// reason, ending after [`ChatStreamEvent::Finish`] or an error.
+    /// returned stream then yields content deltas, assembled tool
+    /// calls, and the finish reason, ending after
+    /// [`ChatStreamEvent::Finish`] or an error.
     pub async fn chat_stream(
         &self,
         request: ChatRequest,
@@ -139,6 +145,7 @@ impl OpenAiClient {
             response,
             buffer: Vec::new(),
             pending: VecDeque::new(),
+            partial_tools: BTreeMap::new(),
             done: false,
         };
         Ok(Box::pin(futures::stream::unfold(
@@ -290,6 +297,30 @@ impl ChatModel for OpenAiClient {
     }
 }
 
+impl StreamingChatModel for OpenAiClient {
+    fn chat_stream<'a>(
+        &'a self,
+        request: ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatStream, AiError>> {
+        Box::pin(async move { OpenAiClient::chat_stream(self, request).await })
+    }
+}
+
+impl EmbeddingModel for OpenAiClient {
+    fn embed<'a>(
+        &'a self,
+        model: Option<&'a str>,
+        texts: &'a [&'a str],
+    ) -> BoxFuture<'a, Result<Vec<Vec<f32>>, AiError>> {
+        Box::pin(async move {
+            match model {
+                Some(model) => self.embed_with_model(model, texts).await,
+                None => self.embed(texts).await,
+            }
+        })
+    }
+}
+
 /// The endpoint/bearer/organization triple for a [`Config`] — pure
 /// so the normalizing fallbacks (empty host, zero port, default
 /// base URL) unit-test without a client.
@@ -387,14 +418,38 @@ struct StreamChoiceWire {
 struct DeltaWire {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<StreamToolCallWire>,
+}
+
+/// One streamed tool-call fragment, keyed by its index into the
+/// response's tool-call list.
+#[derive(serde::Deserialize)]
+struct StreamToolCallWire {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamToolFunctionWire>,
+}
+
+#[derive(serde::Deserialize)]
+struct StreamToolFunctionWire {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 /// The incremental state of one SSE stream: the live response, the
-/// byte buffer between newlines, and events parsed ahead of demand.
+/// byte buffer between newlines, events parsed ahead of demand, and
+/// the tool-call fragments under assembly.
 struct SseState {
     response: reqwest::Response,
     buffer: Vec<u8>,
     pending: VecDeque<Result<ChatStreamEvent, AiError>>,
+    partial_tools: BTreeMap<usize, PartialToolCall>,
     done: bool,
 }
 
@@ -418,6 +473,10 @@ impl SseState {
                 }
                 Ok(None) => {
                     self.flush_partial_line();
+                    // A stream that ends without a finish_reason but
+                    // with tool-call fragments still yields what
+                    // arrived — assembled, in index order.
+                    self.flush_tool_calls();
                     self.done = true;
                 }
                 Err(e) => return Err(AiError::Request(format!("stream: {e}"))),
@@ -472,12 +531,62 @@ impl SseState {
             }
         };
         for choice in chunk.choices {
+            for fragment in choice.delta.tool_calls {
+                self.merge_tool_fragment(fragment);
+            }
             if let Some(content) = choice.delta.content {
-                self.pending.push_back(Ok(ChatStreamEvent::Delta(content)));
+                self.pending
+                    .push_back(Ok(ChatStreamEvent::Content(content)));
             }
             if let Some(reason) = choice.finish_reason {
-                self.pending.push_back(Ok(ChatStreamEvent::Finish(reason)));
+                // The finish chunk closes the assembly: the provider
+                // has sent every fragment by now.
+                self.flush_tool_calls();
+                self.pending
+                    .push_back(Ok(ChatStreamEvent::Finish { reason }));
             }
+        }
+    }
+
+    /// Merges one streamed tool-call fragment into the assembly under
+    /// its index: id/name are set when present (the first fragment
+    /// carries them; later repeats overwrite harmlessly), argument
+    /// fragments concatenate.
+    fn merge_tool_fragment(&mut self, fragment: StreamToolCallWire) {
+        let partial = self
+            .partial_tools
+            .entry(fragment.index)
+            .or_insert_with(|| PartialToolCall {
+                id: String::new(),
+                name: String::new(),
+                arguments: String::new(),
+            });
+        if let Some(id) = fragment.id {
+            partial.id = id;
+        }
+        if let Some(function) = fragment.function {
+            if let Some(name) = function.name {
+                partial.name = name;
+            }
+            if let Some(arguments) = function.arguments {
+                partial.arguments.push_str(&arguments);
+            }
+        }
+    }
+
+    /// Emits the assembled tool calls in index order and clears the
+    /// assembly.
+    fn flush_tool_calls(&mut self) {
+        for (_, partial) in std::mem::take(&mut self.partial_tools) {
+            self.pending
+                .push_back(Ok(ChatStreamEvent::ToolCall(ToolCall {
+                    id: partial.id,
+                    kind: ToolKind::Function,
+                    function: ToolCallFunction {
+                        name: partial.name,
+                        arguments: partial.arguments,
+                    },
+                })));
         }
     }
 }

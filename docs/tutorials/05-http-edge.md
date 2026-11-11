@@ -105,7 +105,6 @@ let source = rushwind_gen_http::generate_from_bytes(&descriptor_set_bytes, &cfg)
 - **`HttpEdge::wrap` 之后再 merge 路由，新路由不在栈里**。与"层只包早期路由"同源：先把所有子树 merge 完，最后交给 `wrap`。
 - **鉴权桥依赖认证桥注入的 claims**。两者同用时，鉴权层先 `layer`、认证层后 `layer`（认证在外圈）——见[第 06 章](06-auth.md)。
 - **authz 面上"没有 claims"是 401，不是 403**；引擎故障拒绝时回 403 带稳定 reason。别把两类问题混进同一个告警。
-- **二进制 proto 请求体解码未实现**：`ResolvedCodec::Proto` 的请求体目前透传不绑定——需要二进制线格式的接口先别开。
 - **axum-only**：这层栈建立在 axum 语义上，别试图换 web 框架；要别的协议请用传输矩阵（[第 12 章](12-transports.md)）。
 
 ## 动手练习

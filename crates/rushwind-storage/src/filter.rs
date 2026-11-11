@@ -41,6 +41,10 @@ pub enum Op {
     NotLike,
     /// Case-insensitive `LIKE` (one operand).
     Ilike,
+    /// Case-insensitive equality (one operand) — `Eq` under Unicode
+    /// case folding, the same folding the `I`-prefixed pattern family
+    /// uses.
+    Iexact,
     /// The field is `NULL` (no operands).
     IsNull,
     /// The field is not `NULL` (no operands).
@@ -84,6 +88,7 @@ impl Op {
             | Op::Like
             | Op::NotLike
             | Op::Ilike
+            | Op::Iexact
             | Op::Contains
             | Op::StartsWith
             | Op::EndsWith => Arity::One,
@@ -106,7 +111,13 @@ impl Op {
     pub fn is_text_only(self) -> bool {
         matches!(
             self,
-            Op::Like | Op::NotLike | Op::Ilike | Op::Contains | Op::StartsWith | Op::EndsWith
+            Op::Like
+                | Op::NotLike
+                | Op::Ilike
+                | Op::Iexact
+                | Op::Contains
+                | Op::StartsWith
+                | Op::EndsWith
         )
     }
 }
@@ -230,6 +241,10 @@ impl FilterExpr {
             Op::Like => like(&value, &first(), false),
             Op::NotLike => !like(&value, &first(), false),
             Op::Ilike => like(&value, &first(), true),
+            Op::Iexact => match (value.as_str(), first().as_str()) {
+                (Some(a), Some(b)) => a.to_lowercase() == b.to_lowercase(),
+                _ => false,
+            },
             Op::IsNull => value.is_null(),
             Op::IsNotNull => !value.is_null(),
             Op::Between => {

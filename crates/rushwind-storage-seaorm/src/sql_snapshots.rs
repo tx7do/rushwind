@@ -259,3 +259,21 @@ fn garbage_cursor_is_invalid_query() {
         .expect_err("garbage cursor must fail");
     assert!(matches!(err, StorageError::InvalidQuery(_)));
 }
+
+#[test]
+fn iexact_lowers_the_column() {
+    let filter = FilterExpr::cond("name", Op::Iexact, [Value::Text("CHARLIE".into())]);
+    let select = list_select(
+        &schema(),
+        &["id".into()],
+        Some(&translate(filter.node()).expect("translates")),
+        &ListQuery::default(),
+        DbBackend::Sqlite,
+    )
+    .expect("builds");
+    let (sqlite, _) = render(&select, DbBackend::Sqlite);
+    assert_eq!(
+        sqlite,
+        r#"SELECT "id" FROM "widgets" WHERE LOWER("name") = ? ORDER BY "id" ASC LIMIT ? OFFSET ?"#
+    );
+}

@@ -106,3 +106,87 @@ async fn traversal_and_empty_keys_are_refused() {
     let err = store.get("").await.unwrap_err();
     assert!(matches!(err, rushwind_oss::StorageError::EmptyObjectKey));
 }
+
+#[tokio::test]
+async fn list_walks_ascending_with_prefix_after_limit() {
+    let scratch = Scratch::new("list");
+    let store = LocalStorage::new(scratch.path().to_path_buf());
+
+    for (key, size) in [
+        ("probe/list/alpha", 3usize),
+        ("probe/list/beta", 5),
+        ("probe/list/gamma", 7),
+    ] {
+        store
+            .put(key, vec![0u8; size].as_slice(), None)
+            .await
+            .unwrap();
+    }
+
+    let page = store.list("probe/list/", "", 10).await.unwrap();
+    assert_eq!(
+        page,
+        vec![
+            rushwind_oss::ListedObject {
+                key: "probe/list/alpha".into(),
+                size: 3
+            },
+            rushwind_oss::ListedObject {
+                key: "probe/list/beta".into(),
+                size: 5
+            },
+            rushwind_oss::ListedObject {
+                key: "probe/list/gamma".into(),
+                size: 7
+            },
+        ],
+        "the page must be ascending with the true sizes"
+    );
+
+    let after = store
+        .list("probe/list/", "probe/list/beta", 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(),
+        vec!["probe/list/gamma"],
+        "the cursor is strict: the cursor key itself is excluded"
+    );
+
+    let limited = store.list("probe/list/", "", 2).await.unwrap();
+    assert_eq!(limited.len(), 2, "the limit bounds the page");
+
+    let empty_prefix = store.list("", "", 10).await.unwrap();
+    assert_eq!(empty_prefix.len(), 3, "an empty prefix matches everything");
+
+    let result = store.list("probe/list/", "", 0).await;
+    assert!(
+        matches!(result, Err(rushwind_oss::StorageError::InvalidLimit)),
+        "a zero limit must fail with InvalidLimit"
+    );
+}
+
+#[tokio::test]
+async fn list_over_an_absent_root_is_an_empty_page() {
+    let scratch = Scratch::new("list-absent");
+    // Point the engine one level BELOW the scratch dir: the root itself
+    // never materializes (nothing is put there).
+    let store = LocalStorage::new(scratch.path().join("never-created"));
+    let page = store.list("", "", 10).await.unwrap();
+    assert!(page.is_empty(), "an absent bucket root reads as empty");
+}
+
+#[tokio::test]
+async fn presign_is_unsupported_on_local_disk() {
+    let scratch = Scratch::new("presign");
+    let store = LocalStorage::new(scratch.path().to_path_buf());
+    let result = store.presign(
+        "k",
+        rushwind_oss::PresignMethod::Get,
+        std::time::Duration::from_secs(60),
+    );
+    assert!(
+        matches!(result, Err(rushwind_oss::StorageError::Unsupported)),
+        "a file path carries no signature authority: the honest answer is Unsupported"
+    );
+}

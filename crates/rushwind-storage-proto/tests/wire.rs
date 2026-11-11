@@ -116,6 +116,22 @@ fn derived_pattern_operators_fold_into_ilike() {
 }
 
 #[test]
+fn iexact_maps_to_its_own_operator() {
+    let filter = filter_expr_from_json(
+        r#"{"conditions": [{"field": "name", "op": "IEXACT", "value": "CHARLIE"}]}"#,
+    )
+    .expect("parses");
+    let FilterNode::All(children) = filter.node() else {
+        panic!("unexpected tree: {filter:?}");
+    };
+    assert_eq!(children.len(), 1);
+    assert!(
+        matches!(&children[0], FilterNode::Cond(c) if c.op == Op::Iexact),
+        "IEXACT is its own contract operator, not a LIKE fold: {filter:?}"
+    );
+}
+
+#[test]
 fn nested_groups_translate_recursively() {
     let filter = filter_expr_from_json(
         r#"{"type": "OR", "conditions": [{"field": "age", "op": "LT", "value": 6}],
@@ -143,7 +159,6 @@ fn unsupported_taxonomy_is_named_at_the_boundary() {
         "ARRAY_CONTAINS",
         "EXISTS",
         "SEARCH",
-        "IEXACT",
     ] {
         let err = filter_expr_from_json(&format!(
             r#"{{"conditions": [{{"field": "name", "op": "{op}", "value": "x"}}]}}"#

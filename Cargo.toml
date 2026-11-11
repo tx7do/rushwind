@@ -12,6 +12,7 @@ repository = "https://github.com/tx7do/rushwind"
 [workspace.dependencies]
 tokio = "1"
 futures = "0.3"
+futures-core = "0.3"
 tokio-util = "0.7"
 rushwind-transport = { path = "crates/rushwind-transport", version = "0.0.1" }
 rushwind-core = { path = "crates/rushwind-core", version = "0.0.1" }
@@ -50,6 +51,8 @@ rushwind-health = { path = "crates/rushwind-health", version = "0.0.1" }
 rushwind-ratelimit = { path = "crates/rushwind-ratelimit", version = "0.0.1" }
 rushwind-ratelimit-tokenbucket = { path = "crates/rushwind-ratelimit-tokenbucket", version = "0.0.1" }
 rushwind-ratelimit-bbr = { path = "crates/rushwind-ratelimit-bbr", version = "0.0.1" }
+rushwind-ratelimit-slidingwindow = { path = "crates/rushwind-ratelimit-slidingwindow", version = "0.0.1" }
+rushwind-ratelimit-leakybucket = { path = "crates/rushwind-ratelimit-leakybucket", version = "0.0.1" }
 rushwind-tracer = { path = "crates/rushwind-tracer", version = "0.0.1" }
 rushwind-retry = { path = "crates/rushwind-retry", version = "0.0.1" }
 rushwind-metrics-datadog = { path = "crates/rushwind-metrics-datadog", version = "0.0.1" }
@@ -66,6 +69,7 @@ rushwind-config-etcd = { path = "crates/rushwind-config-etcd", version = "0.0.1"
 rushwind-config-consul = { path = "crates/rushwind-config-consul", version = "0.0.1" }
 rushwind-config-embedded = { path = "crates/rushwind-config-embedded", version = "0.0.1" }
 rushwind-config-apollo = { path = "crates/rushwind-config-apollo", version = "0.0.1" }
+rushwind-config-nacos = { path = "crates/rushwind-config-nacos", version = "0.0.1" }
 rushwind-broker-nats = { path = "crates/rushwind-broker-nats", version = "0.0.1" }
 rushwind-broker-rabbitmq = { path = "crates/rushwind-broker-rabbitmq", version = "0.0.1" }
 rushwind-broker-stomp = { path = "crates/rushwind-broker-stomp", version = "0.0.1" }

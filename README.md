@@ -120,6 +120,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-config-consul` | Consul KV 配置源：按键 GET + blocking query 的 push 式 watch |
 | `crates/rushwind-config-embedded` | 编译期嵌入源：`include_bytes!`/`include_str!` 喂进的静态键→字节树，零 I/O、不可 watch（链接期即定） |
 | `crates/rushwind-config-apollo` | Apollo 配置源：configs REST 读（canonical JSON、404=缺席）+ notifications/v2 长轮询 watch，手写 reqwest 无 SDK |
+| `crates/rushwind-config-nacos` | Nacos 配置源：v1 cs/configs REST 读（原文直传、404=缺席、可选 tenant/accessToken）+ 轮询 watch，手写 reqwest 无 SDK |
 
 ### 注册中心域
 
@@ -154,6 +155,8 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-ratelimit` | 限流契约：算法无关的 `Limiter` trait |
 | `crates/rushwind-ratelimit-tokenbucket` | 令牌桶引擎：按速率回填 + 突发容量，Allow/Wait/Close，时钟可注入（记账走注入钟） |
 | `crates/rushwind-ratelimit-bbr` | BBR 式自适应引擎：滑窗吞吐估计 + inflight 上限，时钟可注入（窗口旋转走注入钟） |
+| `crates/rushwind-ratelimit-slidingwindow` | 滑动窗口日志引擎：任意滑动窗内至多 `limit` 次准入，边界精确无固定窗双预算缝，日志内存以 `limit` 为界，时钟可注入 |
+| `crates/rushwind-ratelimit-leakybucket` | 漏桶（整流）引擎：背漏恒速排出、准入按 `drain_rate` 节流、空闲不攒额度（与令牌桶的突发语义相对），时钟可注入 |
 | `crates/rushwind-circuitbreaker` | 熔断契约：`State` + `CircuitBreaker` trait（Allow/MarkSuccess/MarkFailure/Execute/State/Close） |
 | `crates/rushwind-circuitbreaker-vegas` | Vegas 式引擎：延迟膨胀探测 |
 | `crates/rushwind-circuitbreaker-sres` | Google SRE 概率式引擎：以接受率优雅衰减取代硬开/硬闭 |
@@ -221,9 +224,9 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 
 | 位置 | 职责 |
 |:---|:---|
-| `crates/rushwind-ai` | AI 模型契约：OpenAI 兼容端点上的 chat 补全 |
+| `crates/rushwind-ai` | AI 模型契约：chat 补全 + 流式（含拼装完整的工具调用事件）+ embeddings 三面 trait |
 | `crates/rushwind-ai-openai` | OpenAI 兼容引擎：reqwest 上的 chat / 流式 / embeddings，通吃 OpenAI、Qwen、Ollama |
-| `crates/rushwind-oss` | 对象存储契约：S3 兼容存储上的 put/get/delete |
+| `crates/rushwind-oss` | 对象存储契约：S3 兼容存储上的 put/get/delete/list 与 presign（presign 仅签名权威引擎可用，缺省 Unsupported） |
 | `crates/rushwind-oss-s3` | S3 引擎：reqwest 上的 SigV4 签名 REST，覆盖 AWS S3 与 MinIO |
 | `crates/rushwind-oss-local` | 本地盘引擎：每 bucket 一实例、目录随 put 物化、缺失读 NotFound、删除幂等、键穿越拒绝 |
 

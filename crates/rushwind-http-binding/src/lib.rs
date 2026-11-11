@@ -40,8 +40,7 @@
 //! whichever codec packages the reference binary imports.
 //!
 //! Known dormant divergences (the caller's compatibility spec owns the
-//! register): the binary wire-format body decode is not implemented here
-//! (pass-through), and `form_urlencoded` parses lossily where the
+//! register): `form_urlencoded` parses lossily where the
 //! reference's `url.ParseQuery` errors on malformed escapes.
 //!
 //! Note: this crate carries no versioned dependency on the reference

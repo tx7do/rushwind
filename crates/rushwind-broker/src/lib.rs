@@ -14,7 +14,21 @@
 //! [`Event::ack`] acknowledges a delivery: engines whose deliveries
 //! need acknowledging (Kafka offsets, RabbitMQ acks) wire the native
 //! ack into the event; engines with implicit acknowledgment (MQTT)
-//! leave it a no-op. Message metadata narrows to string values — the
+//! leave it a no-op. [`Event::nack`] is the rejection half — the face
+//! poison-message routing needs: an engine whose native delivery
+//! supports negative acknowledgment wires a [`Nacker`] into the event
+//! and [`NackAction`] asks requeue or drop; implicit-ack engines
+//! leave it the documented no-op (the delivery is already settled —
+//! there is nothing to hand back). Today every engine runs implicit
+//! acknowledgment; the nacker face is wired per engine as each grows
+//! a manual-ack mode.
+//!
+//! [`with_error_handler`] is the error-handler hook: it wraps a
+//! [`Handler`] so handler errors reach an [`ErrorHandler`] observation
+//! point — the upstream `ErrorHandler` reshaped into the contract's
+//! composition style — without changing the delivery loops' own
+//! guarantee (a handler error never kills the subscription). Message
+//! metadata narrows to string values — the
 //! native broker metadata surfaces are string-typed. A native-message
 //! handle slot has no equivalent: engines expose what their delivery
 //! actually needs through the event.
@@ -52,7 +66,7 @@ use std::sync::Arc;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Errors surfaced by broker engines.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum BrokerError {
     /// The engine could not complete the operation.
@@ -127,13 +141,29 @@ impl Message {
 /// native delivery needs one.
 pub type Acker = Box<dyn FnOnce() -> BoxFuture<'static, Result<(), BrokerError>> + Send>;
 
+/// What a rejection asks the engine to do with the delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NackAction {
+    /// Hand the delivery back to the broker for redelivery — to this
+    /// or another consumer, per the broker's native redelivery rules.
+    Requeue,
+    /// Drop the delivery — the poison-message terminus. Dead-letter
+    /// routing is the deployment's business, via the broker's own
+    /// DLX/exchange configuration.
+    Drop,
+}
+
+/// The rejection hook an engine wires into an event when the native
+/// delivery supports negative acknowledgment.
+pub type Nacker = Box<dyn FnOnce(NackAction) -> BoxFuture<'static, Result<(), BrokerError>> + Send>;
+
 /// One delivery: the subscribed topic and the message, with the
-/// engine's acknowledgment wired in when the native delivery needs
-/// one.
+/// engine's acknowledgment (and rejection, where supported) wired in.
 pub struct Event {
     topic: String,
     message: Message,
     acker: Option<Acker>,
+    nacker: Option<Nacker>,
 }
 
 impl Event {
@@ -144,6 +174,7 @@ impl Event {
             topic: topic.into(),
             message,
             acker: None,
+            nacker: None,
         }
     }
 
@@ -157,6 +188,22 @@ impl Event {
             topic: topic.into(),
             message,
             acker: Some(Box::new(acker)),
+            nacker: None,
+        }
+    }
+
+    /// Builds an event with a rejection hook — the shape of an engine
+    /// whose native delivery supports negative acknowledgment.
+    pub fn with_nacker(
+        topic: impl Into<String>,
+        message: Message,
+        nacker: impl FnOnce(NackAction) -> BoxFuture<'static, Result<(), BrokerError>> + Send + 'static,
+    ) -> Self {
+        Self {
+            topic: topic.into(),
+            message,
+            acker: None,
+            nacker: Some(Box::new(nacker)),
         }
     }
 
@@ -178,11 +225,51 @@ impl Event {
             None => Ok(()),
         }
     }
+
+    /// Rejects the delivery with `action` — the poison-message face.
+    /// A no-op for engines with implicit acknowledgment: the delivery
+    /// is already settled, there is nothing to hand back (the error
+    /// handler, not the nacker, is the observation point there).
+    pub async fn nack(self, action: NackAction) -> Result<(), BrokerError> {
+        match self.nacker {
+            Some(nacker) => nacker(action).await,
+            None => Ok(()),
+        }
+    }
 }
 
 /// The handler invoked per delivery; cancellation rides the future
 /// instead of a context parameter.
 pub type Handler = Arc<dyn Fn(Event) -> BoxFuture<'static, Result<(), BrokerError>> + Send + Sync>;
+
+/// The error-observation point [`with_error_handler`] runs when a
+/// handler errors: the delivered message and the handler's error.
+/// Observation only — the delivery loop's own settlement semantics
+/// (ack/nack per the engine, the never-kill-the-subscription
+/// guarantee) stay the engine's.
+pub type ErrorHandler = Arc<dyn Fn(Message, BrokerError) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// Wraps a handler with an error handler: every error the inner
+/// handler returns reaches `error_handler` (the delivered message and
+/// the error) *and* still surfaces as the wrapper's `Err` — the
+/// observation point never swallows the outcome, and the engine's
+/// delivery loop keeps owning settlement. Errors the error handler
+/// itself raises while observing are its business; the hook returns
+/// `()` by shape.
+pub fn with_error_handler(handler: Handler, error_handler: ErrorHandler) -> Handler {
+    Arc::new(move |event: Event| {
+        let handler = Arc::clone(&handler);
+        let error_handler = Arc::clone(&error_handler);
+        Box::pin(async move {
+            let message = event.message().clone();
+            let result = handler(event).await;
+            if let Err(error) = &result {
+                error_handler(message, error.clone()).await;
+            }
+            result
+        }) as BoxFuture<'static, Result<(), BrokerError>>
+    })
+}
 
 /// The subscription handle.
 pub trait Subscriber: Send {
@@ -477,6 +564,126 @@ mod tests {
         assert_eq!(
             message.metadata.get("kind").map(String::as_str),
             Some("demo")
+        );
+    }
+
+    /// The nacker receives the action verbatim.
+    #[tokio::test]
+    async fn nack_passes_the_action_to_the_nacker() {
+        for (expected, description) in
+            [(NackAction::Requeue, "requeue"), (NackAction::Drop, "drop")]
+        {
+            let seen = Arc::new(std::sync::Mutex::new(None::<NackAction>));
+            let sink = Arc::clone(&seen);
+            let event =
+                Event::with_nacker("topic", Message::from_payload(vec![1]), move |action| {
+                    let sink = Arc::clone(&sink);
+                    Box::pin(async move {
+                        *sink.lock().unwrap() = Some(action);
+                        Ok(())
+                    }) as BoxFuture<'static, Result<(), BrokerError>>
+                });
+            event.nack(expected).await.expect("nack must settle");
+            assert_eq!(*seen.lock().unwrap(), Some(expected), "{description}");
+        }
+    }
+
+    /// A nack on an implicit-ack event is the documented no-op.
+    #[tokio::test]
+    async fn nack_without_a_nacker_is_a_noop() {
+        let event = Event::new("topic", Message::from_payload(vec![]));
+        let result = event.nack(NackAction::Requeue).await;
+        assert!(
+            result.is_ok(),
+            "implicit-ack engines have nothing to hand back, got {result:?}"
+        );
+    }
+
+    /// The error-handler hook observes failures without swallowing
+    /// them: the wrapper's result stays the inner handler's, and the
+    /// delivered message travels to the observer.
+    #[tokio::test]
+    async fn the_error_handler_observes_without_swallowing() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let poison = Message::from_payload(b"poison".to_vec()).with_header("kind", "bad");
+        let inner_error = BrokerError::Failed("decode blew up".to_string());
+
+        let sink = Arc::clone(&observed);
+        let observer: ErrorHandler = Arc::new(move |message, error| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                sink.lock().unwrap().push(format!(
+                    "{}:{error}",
+                    String::from_utf8_lossy(&message.payload)
+                ));
+            })
+        });
+        let handler = with_error_handler(
+            Arc::new(move |_event: Event| {
+                let error = inner_error.clone();
+                Box::pin(async move { Err(error) }) as BoxFuture<'static, Result<(), BrokerError>>
+            }),
+            observer,
+        );
+
+        let result = handler(Event::new("topic", poison)).await;
+        assert!(result.is_err(), "the error must still surface");
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec!["poison:broker operation failed: decode blew up"],
+            "the observer saw the message and the error"
+        );
+
+        // A success path never reaches the observer.
+        let handler = with_error_handler(
+            Arc::new(|_event: Event| {
+                Box::pin(async { Ok(()) }) as BoxFuture<'static, Result<(), BrokerError>>
+            }),
+            Arc::new(|_message, _error| Box::pin(async {}) as BoxFuture<'static, ()>),
+        );
+        handler(Event::new("topic", Message::from_payload(vec![])))
+            .await
+            .expect("success passes through");
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            1,
+            "the observer fired only for the failure"
+        );
+    }
+
+    /// The error-handler hook composes with the subscriber middleware
+    /// chain: the wrapped handler is just another Handler.
+    #[tokio::test]
+    async fn the_error_handler_composes_with_middlewares() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let sink = Arc::clone(&order);
+        let observer: ErrorHandler = Arc::new(move |_message, _error| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                sink.lock().unwrap().push("observer");
+            })
+        });
+        let logged = with_error_handler(
+            Arc::new(|_event: Event| {
+                Box::pin(async { Err(BrokerError::NotConnected) })
+                    as BoxFuture<'static, Result<(), BrokerError>>
+            }),
+            observer,
+        );
+        let middleware: SubscriberMiddleware = Arc::new(|handler: Handler| {
+            Arc::new(move |event: Event| {
+                let handler = Arc::clone(&handler);
+                Box::pin(async move { handler(event).await })
+                    as BoxFuture<'static, Result<(), BrokerError>>
+            }) as Handler
+        });
+        let chained = chain_subscriber(logged, &[middleware]);
+        let result = chained(Event::new("topic", Message::from_payload(vec![]))).await;
+        assert!(result.is_err());
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["observer"],
+            "the hook fires inside the chain"
         );
     }
 
