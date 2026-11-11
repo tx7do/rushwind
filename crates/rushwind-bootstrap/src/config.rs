@@ -40,6 +40,12 @@ pub struct BootstrapConfig {
     /// Caches to assemble, keyed by instance name.
     #[serde(default)]
     pub caches: HashMap<String, EngineConfig>,
+    /// Lock managers to assemble, keyed by instance name.
+    #[serde(default)]
+    pub locks: HashMap<String, EngineConfig>,
+    /// Vector indexes to assemble, keyed by instance name.
+    #[serde(default)]
+    pub vectors: HashMap<String, EngineConfig>,
     /// Circuit breakers to assemble, keyed by instance name.
     #[serde(default)]
     pub circuitbreakers: HashMap<String, EngineConfig>,

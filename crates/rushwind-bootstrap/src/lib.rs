@@ -28,6 +28,8 @@
 //! | cache | `caches.<instance>.engine` | [`Bootstrap::cache_factory`] | [`Bootstrapped::caches`] |
 //! | circuit breaker | `circuitbreakers.<instance>.engine` | [`Bootstrap::circuitbreaker_factory`] | [`Bootstrapped::circuitbreakers`] |
 //! | rate limiter | `limiters.<instance>.engine` | [`Bootstrap::limiter_factory`] | [`Bootstrapped::limiters`] |
+//! | lock | `locks.<instance>.engine` | [`Bootstrap::lock_factory`] | [`Bootstrapped::locks`] |
+//! | vector index | `vectors.<instance>.engine` | [`Bootstrap::vector_factory`] | [`Bootstrapped::vectors`] |
 //! | AI chat | `ai.engine` | [`Bootstrap::ai_factory`] | [`Bootstrapped::ai`] |
 //! | object storage | `oss.engine` | [`Bootstrap::oss_factory`] | [`Bootstrapped::object_storage`] |
 //! | metrics | `metrics.engine` | [`Bootstrap::metrics_factory`] | [`Bootstrapped::metrics`] |
@@ -149,6 +151,7 @@ use rushwind_core::App;
 use rushwind_http::{
     with_authn, with_authorization, with_authorization_claim, with_authorization_for, HttpEdge,
 };
+use rushwind_lock::LockManager;
 use rushwind_metrics::Metrics;
 use rushwind_oss::ObjectStorage;
 use rushwind_ratelimit::Limiter;
@@ -158,6 +161,7 @@ use rushwind_storage::Repository;
 use rushwind_transport::{Instance, Server, ServerError, StopSignal};
 use rushwind_transport_axum::AxumServer;
 use rushwind_transport_cron::{CronJob, CronServer};
+use rushwind_vector::VectorIndex;
 
 #[cfg(feature = "health")]
 use rushwind_health::Health;
@@ -225,6 +229,12 @@ pub struct Bootstrapped {
     /// The assembled rate limiters, keyed by their configured instance
     /// names.
     pub limiters: HashMap<String, Arc<dyn Limiter>>,
+    /// The assembled lock managers, keyed by their configured instance
+    /// names.
+    pub locks: HashMap<String, Arc<dyn LockManager>>,
+    /// The assembled vector indexes, keyed by their configured instance
+    /// names.
+    pub vectors: HashMap<String, Arc<dyn VectorIndex>>,
     /// The assembled AI chat model, when the document declared one.
     pub ai: Option<Arc<dyn ChatModel>>,
     /// The assembled object-storage engine, when the document declared
@@ -309,6 +319,10 @@ pub struct RouteInput {
     pub circuitbreakers: HashMap<String, Arc<dyn CircuitBreaker>>,
     /// The assembled rate limiters, if any.
     pub limiters: HashMap<String, Arc<dyn Limiter>>,
+    /// The assembled lock managers, if any.
+    pub locks: HashMap<String, Arc<dyn LockManager>>,
+    /// The assembled vector indexes, if any.
+    pub vectors: HashMap<String, Arc<dyn VectorIndex>>,
     /// The assembled AI chat model, if any.
     pub ai: Option<Arc<dyn ChatModel>>,
     /// The assembled object-storage engine, if any.
@@ -446,6 +460,8 @@ factory_fn_type!(BrokerFactoryFn, dyn Broker);
 factory_fn_type!(CacheFactoryFn, dyn Cache);
 factory_fn_type!(CircuitBreakerFactoryFn, dyn CircuitBreaker);
 factory_fn_type!(LimiterFactoryFn, dyn Limiter);
+factory_fn_type!(LockFactoryFn, dyn LockManager);
+factory_fn_type!(VectorFactoryFn, dyn VectorIndex);
 factory_fn_type!(MetricsFactoryFn, dyn Metrics);
 factory_fn_type!(AiFactoryFn, dyn ChatModel);
 factory_fn_type!(OssFactoryFn, dyn ObjectStorage);
@@ -466,6 +482,8 @@ pub struct Bootstrap {
     cache_factories: HashMap<String, CacheFactoryFn>,
     circuitbreaker_factories: HashMap<String, CircuitBreakerFactoryFn>,
     limiter_factories: HashMap<String, LimiterFactoryFn>,
+    lock_factories: HashMap<String, LockFactoryFn>,
+    vector_factories: HashMap<String, VectorFactoryFn>,
     metrics_factories: HashMap<String, MetricsFactoryFn>,
     ai_factories: HashMap<String, AiFactoryFn>,
     oss_factories: HashMap<String, OssFactoryFn>,
@@ -530,6 +548,8 @@ impl Bootstrap {
             cache_factories: HashMap::new(),
             circuitbreaker_factories: HashMap::new(),
             limiter_factories: HashMap::new(),
+            lock_factories: HashMap::new(),
+            vector_factories: HashMap::new(),
             metrics_factories: HashMap::new(),
             ai_factories: HashMap::new(),
             oss_factories: HashMap::new(),
@@ -662,6 +682,18 @@ impl Bootstrap {
         "Registers a named rate-limiter factory, mountable from `limiters.<instance>.engine`. The closure turns engine-specific settings into the limiter."
     );
     factory_builder!(
+        lock_factory,
+        lock_factories,
+        dyn LockManager,
+        "Registers a named lock factory, mountable from `locks.<instance>.engine`. The closure turns engine-specific settings into the lock manager."
+    );
+    factory_builder!(
+        vector_factory,
+        vector_factories,
+        dyn VectorIndex,
+        "Registers a named vector-index factory, mountable from `vectors.<instance>.engine`. The closure turns engine-specific settings into the index."
+    );
+    factory_builder!(
         metrics_factory,
         metrics_factories,
         dyn Metrics,
@@ -765,6 +797,14 @@ impl Bootstrap {
             limiter_factories,
             dyn Limiter,
             "limiter engine"
+        );
+        assemble_named!(locks, locks, lock_factories, dyn LockManager, "lock engine");
+        assemble_named!(
+            vectors,
+            vectors,
+            vector_factories,
+            dyn VectorIndex,
+            "vector engine"
         );
 
         // The AI chat model: a single instance.
@@ -940,6 +980,8 @@ impl Bootstrap {
             caches: caches.clone(),
             circuitbreakers: circuitbreakers.clone(),
             limiters: limiters.clone(),
+            locks: locks.clone(),
+            vectors: vectors.clone(),
             ai: ai.clone(),
             object_storage: object_storage.clone(),
             config: config.clone(),
@@ -1174,6 +1216,8 @@ impl Bootstrap {
             caches,
             circuitbreakers,
             limiters,
+            locks,
+            vectors,
             ai,
             object_storage,
             config,

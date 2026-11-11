@@ -383,6 +383,69 @@ impl rushwind_ratelimit::Limiter for MockLimiter {
     fn close(&self) {}
 }
 
+struct MockLock;
+impl rushwind_lock::LockManager for MockLock {
+    fn acquire<'a>(
+        &'a self,
+        _key: &'a str,
+        _ttl: std::time::Duration,
+    ) -> rushwind_lock::BoxFuture<
+        'a,
+        Result<Option<rushwind_lock::LockHandle>, rushwind_lock::LockError>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+    fn release<'a>(
+        &'a self,
+        _lock: &'a rushwind_lock::LockHandle,
+    ) -> rushwind_lock::BoxFuture<'a, Result<bool, rushwind_lock::LockError>> {
+        Box::pin(async { Ok(false) })
+    }
+    fn extend<'a>(
+        &'a self,
+        _lock: &'a rushwind_lock::LockHandle,
+        _ttl: std::time::Duration,
+    ) -> rushwind_lock::BoxFuture<'a, Result<bool, rushwind_lock::LockError>> {
+        Box::pin(async { Ok(false) })
+    }
+    fn close(&self) -> rushwind_lock::BoxFuture<'_, Result<(), rushwind_lock::LockError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct MockVector;
+impl rushwind_vector::VectorIndex for MockVector {
+    fn upsert<'a>(
+        &'a self,
+        _collection: &'a str,
+        _id: &'a str,
+        _field: &'a str,
+        _vector: &'a [f32],
+    ) -> rushwind_vector::BoxFuture<'a, Result<(), rushwind_vector::VectorError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn search<'a>(
+        &'a self,
+        _collection: &'a str,
+        _query: &'a rushwind_vector::VectorQuery,
+    ) -> rushwind_vector::BoxFuture<
+        'a,
+        Result<rushwind_vector::SearchResult, rushwind_vector::VectorError>,
+    > {
+        Box::pin(async { Ok(rushwind_vector::SearchResult::default()) })
+    }
+    fn delete<'a>(
+        &'a self,
+        _collection: &'a str,
+        _id: &'a str,
+    ) -> rushwind_vector::BoxFuture<'a, Result<(), rushwind_vector::VectorError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn close(&self) -> rushwind_vector::BoxFuture<'_, Result<(), rushwind_vector::VectorError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 struct MockMetrics;
 impl rushwind_metrics::Metrics for MockMetrics {
     fn counter(&self, _name: &str, _value: f64, _labels: &[(&str, &str)]) {}
@@ -453,6 +516,10 @@ circuitbreakers:
   cb1: { engine: mockcb, settings: {} }
 limiters:
   l1: { engine: mocklimiter, settings: {} }
+locks:
+  k1: { engine: mocklock, settings: {} }
+vectors:
+  v1: { engine: mockvector, settings: {} }
 metrics:
   engine: mockmetrics
   settings: {}
@@ -495,6 +562,12 @@ async fn families_assemble_into_their_exposures() {
         })
         .limiter_factory("mocklimiter", |_settings| {
             Box::pin(async move { Ok(Arc::new(MockLimiter) as Arc<dyn Limiter>) })
+        })
+        .lock_factory("mocklock", |_settings| {
+            Box::pin(async move { Ok(Arc::new(MockLock) as Arc<dyn LockManager>) })
+        })
+        .vector_factory("mockvector", |_settings| {
+            Box::pin(async move { Ok(Arc::new(MockVector) as Arc<dyn VectorIndex>) })
         })
         .metrics_factory("mockmetrics", |_settings| {
             Box::pin(async move { Ok(Arc::new(MockMetrics) as Arc<dyn Metrics>) })
@@ -539,6 +612,10 @@ async fn families_assemble_into_their_exposures() {
     assert!(bootstrapped.circuitbreakers.contains_key("cb1"));
     assert_eq!(bootstrapped.limiters.len(), 1, "limiter instance map");
     assert!(bootstrapped.limiters.contains_key("l1"));
+    assert_eq!(bootstrapped.locks.len(), 1, "lock instance map");
+    assert!(bootstrapped.locks.contains_key("k1"));
+    assert_eq!(bootstrapped.vectors.len(), 1, "vector instance map");
+    assert!(bootstrapped.vectors.contains_key("v1"));
     assert!(bootstrapped.ai.is_some(), "ai single instance");
     assert!(
         bootstrapped.object_storage.is_some(),

@@ -34,6 +34,8 @@ rushwind-authn = { workspace = true }
 rushwind-authz = { workspace = true }
 rushwind-broker = { workspace = true }
 rushwind-cache = { workspace = true }
+rushwind-lock = { workspace = true }
+rushwind-vector = { workspace = true }
 rushwind-config = { workspace = true }
 rushwind-metrics = { workspace = true }
 rushwind-ratelimit = { workspace = true }
