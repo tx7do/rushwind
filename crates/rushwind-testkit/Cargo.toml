@@ -1,6 +1,6 @@
 [package]
 name = "rushwind-testkit"
-description = "Cross-adapter conformance suites for RushWind: lifecycle (transports) and repository (storage engines)."
+description = "Cross-adapter conformance suites for RushWind: lifecycle (transports), repository (storage engines), password hashing, vector retrieval, and distributed locks."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,12 +14,21 @@ workspace = true
 default = []
 # Repository conformance suite over the rushwind-storage contract.
 storage = ["dep:rushwind-storage"]
+# Password conformance suite over the rushwind-password contract.
+password = ["dep:rushwind-password"]
+# Vector conformance suite over the rushwind-vector contract.
+vector = ["dep:rushwind-vector", "tokio/rt"]
+# Lock conformance suite over the rushwind-lock contract.
+lock = ["dep:rushwind-lock", "tokio/rt", "tokio/time"]
 
 [dependencies]
 rushwind-transport = { workspace = true }
 rushwind-core = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 rushwind-storage = { workspace = true, optional = true }
+rushwind-password = { workspace = true, optional = true }
+rushwind-vector = { workspace = true, optional = true }
+rushwind-lock = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }

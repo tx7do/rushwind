@@ -32,9 +32,23 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Instant;
 
 /// Future type used across the ratelimit contract.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A monotonic clock the engines read time through — `Arc<dyn Fn() ->
+/// Instant>`. The default is [`Instant::now`]; engines accept an
+/// injected one (`with_clock`) so tests drive refill accounting and
+/// window rotation by advancing a fake instead of sleeping real
+/// durations.
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// The wall clock every engine runs on when none is injected.
+pub fn system_clock() -> Clock {
+    Arc::new(Instant::now)
+}
 
 /// Errors surfaced by rate limiters.
 #[derive(Debug)]

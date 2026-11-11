@@ -24,7 +24,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 
 ## 当前状态
 
-能力面已全部落地：**104 个 crate + 8 个示例**，覆盖生命周期编排与传输、HTTP、存储、安全、配置、注册中心、可观测、弹性、缓存、消息、事务、任务、编码、脚本、AI、对象存储等全部能力域。每个域 = 一份契约 crate + 按需引入的引擎矩阵；引擎与适配器一律过一致性套件，`cargo test` 全绿即合规。各域独立演进，按 Rust 生态自身的节奏生长。
+能力面已全部落地：**124 个 crate + 8 个示例**，覆盖生命周期编排与传输、HTTP、存储、安全（含密码哈希）、配置、注册中心、可观测、弹性、缓存、消息、事务、任务、编码、脚本、AI、对象存储、向量检索、分布式锁等全部能力域。每个域 = 一份契约 crate + 按需引入的引擎矩阵；引擎与适配器一律过一致性套件，`cargo test` 全绿即合规。各域独立演进，按 Rust 生态自身的节奏生长。
 
 路线图上仅剩：kcp（存量互操作时）、`rushwind-protocols` 独立仓。
 
@@ -78,6 +78,13 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-storage-macros` | `ToRecord`/`FromRecord` derive 宏：DTO↔Record 映射编译期生成；标量族加宽、`#[record(as_text)]` 枚举、`#[record(with = "…")]` 自定义转换、`#[record(rename)]` 列名 |
 | `crates/rushwind-storage-axum` | HTTP 端点层：任意 Repository 挂成 CRUD 路由，列表查询双入口（protojson `q` / AIP `filter`），viewer 钩子收口租户 |
 
+### 向量检索域
+
+| 位置 | 职责 |
+|:---|:---|
+| `crates/rushwind-vector` | 向量检索契约（RAG/语义检索）：统一 `VectorQuery`、score 恒为越大越相似（余弦 `1−d`/L2 `1/(1+d)`/点积原值）、TopK 非分页、维度纪律、pgvector 文本编解码——纯类型与纯函数（移植 go-crud vector 语义） |
+| `crates/rushwind-vector-memory` | 内存参考引擎：暴力 top-k + 维度固定/拒绝，外部引擎适配器的语义基准；外部引擎族（qdrant/milvus/weaviate 等）按需立项 |
+
 ### 安全域
 
 | 位置 | 职责 |
@@ -95,6 +102,11 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-authz-acl` | ACL 引擎：有序 allow/deny 规则 + 通配匹配，默认拒绝、拒绝优先 |
 | `crates/rushwind-authz-rbac` | RBAC 引擎：角色→权限、用户→角色双表，传递继承带环检测 |
 | `crates/rushwind-authz-noop` | Noop 引擎：单裁决全通过、批量过滤全空 |
+| `crates/rushwind-password` | 密码哈希契约：`PasswordHasher` 一脸包 PHC 字符串——验证由存量哈希内嵌参数驱动，`needs_rehash` 是升级闭环的另一半 |
+| `crates/rushwind-password-argon2` | Argon2id 引擎：OWASP 默认成本（m=19456,t=2,p=1），遗留面（argon2i/v16）验证通过但读作待升级 |
+| `crates/rushwind-password-bcrypt` | bcrypt 引擎：MCF 串 + 常数时间验证，72 字节截断是算法本身行为（文档与钉子都说实话） |
+| `crates/rushwind-password-scrypt` | scrypt 引擎：OWASP 默认（ln=17,r=8,p=1），存量哈希内嵌 ln/r/p 驱动验证 |
+| `crates/rushwind-password-pbkdf2` | PBKDF2-HMAC-SHA256 引擎：OWASP 默认 60 万轮，SHA-512 验证放行、SHA-1 拒为 InvalidHash |
 
 ### 配置域
 
@@ -106,6 +118,8 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-config-http` | HTTP 配置源：URL 即键的 GET + 轮询 ValueWatcher |
 | `crates/rushwind-config-etcd` | etcd 配置源：按键 GET + 原生 Watch，signal/push 双模式 |
 | `crates/rushwind-config-consul` | Consul KV 配置源：按键 GET + blocking query 的 push 式 watch |
+| `crates/rushwind-config-embedded` | 编译期嵌入源：`include_bytes!`/`include_str!` 喂进的静态键→字节树，零 I/O、不可 watch（链接期即定） |
+| `crates/rushwind-config-apollo` | Apollo 配置源：configs REST 读（canonical JSON、404=缺席）+ notifications/v2 长轮询 watch，手写 reqwest 无 SDK |
 
 ### 注册中心域
 
@@ -138,8 +152,8 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 |:---|:---|
 | `crates/rushwind-retry` | 可组合重试：指数退避 + 抖动、重试谓词、总超时 |
 | `crates/rushwind-ratelimit` | 限流契约：算法无关的 `Limiter` trait |
-| `crates/rushwind-ratelimit-tokenbucket` | 令牌桶引擎：按速率回填 + 突发容量，Allow/Wait/Close |
-| `crates/rushwind-ratelimit-bbr` | BBR 式自适应引擎：滑窗吞吐估计 + inflight 上限 |
+| `crates/rushwind-ratelimit-tokenbucket` | 令牌桶引擎：按速率回填 + 突发容量，Allow/Wait/Close，时钟可注入（记账走注入钟） |
+| `crates/rushwind-ratelimit-bbr` | BBR 式自适应引擎：滑窗吞吐估计 + inflight 上限，时钟可注入（窗口旋转走注入钟） |
 | `crates/rushwind-circuitbreaker` | 熔断契约：`State` + `CircuitBreaker` trait（Allow/MarkSuccess/MarkFailure/Execute/State/Close） |
 | `crates/rushwind-circuitbreaker-vegas` | Vegas 式引擎：延迟膨胀探测 |
 | `crates/rushwind-circuitbreaker-sres` | Google SRE 概率式引擎：以接受率优雅衰减取代硬开/硬闭 |
@@ -152,6 +166,14 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-cache` | KV 缓存契约：get/set/SetNX/批量 + TTL |
 | `crates/rushwind-cache-local` | 进程内 KV 引擎：TTL 惰性过期 + 容量驱逐 |
 | `crates/rushwind-cache-redis` | Redis 引擎：GET/SET/SETNX/DEL/EXISTS + MGET 与管道批量 |
+
+### 锁域
+
+| 位置 | 职责 |
+|:---|:---|
+| `crates/rushwind-lock` | 分布式锁契约：try-once 获取 + 所有权 token + TTL 强制（无 forever-lock）+ 属主校验的 release/extend |
+| `crates/rushwind-lock-memory` | 进程内引擎：TTL 惰性过期的 map + token 校验——单进程部署与测试，语义与分布式引擎同套件 |
+| `crates/rushwind-lock-redis` | Redis 引擎：`SET NX PX` 获取 + token 比对的 Lua 原子 release/extend，live 套件走 CI redis 容器 |
 
 ### 消息、事务与任务
 
@@ -209,8 +231,8 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 
 | 位置 | 职责 |
 |:---|:---|
-| `crates/rushwind-bootstrap` | 配置驱动装配：YAML → 各域引擎（存储/注册中心/认证/鉴权/broker/缓存/熔断/限流/AI/对象存储/指标/配置源/脚本）+ HTTP 服务器（路由包、边缘中间件栈与 CORS、按子树的认证鉴权包装、特性门控的健康与指标挂载）+ cron 传输，全部汇入单一生命周期 |
-| `crates/rushwind-testkit` | 跨适配器一致性测试套件——任何传输/引擎必须整套通过 |
+| `crates/rushwind-bootstrap` | 配置驱动装配：YAML → 各域引擎（存储/注册中心/认证/鉴权/broker/缓存/熔断/限流/锁/向量检索/AI/对象存储/指标/配置源/脚本）+ HTTP 服务器（路由包、边缘中间件栈与 CORS、按子树的认证鉴权包装、特性门控的健康与指标挂载）+ cron 传输，全部汇入单一生命周期 |
+| `crates/rushwind-testkit` | 跨适配器一致性测试套件（生命周期/存储/密码/向量/锁，特性门控）——任何传输/引擎必须整套通过 |
 
 ### 示例
 

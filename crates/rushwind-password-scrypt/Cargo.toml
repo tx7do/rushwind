@@ -1,0 +1,23 @@
+[package]
+name = "rushwind-password-scrypt"
+description = "scrypt engine for the RushWind password contract: OWASP-default cost parameters, PHC strings, verification driven by the stored hash's embedded parameters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-password = { workspace = true }
+# Default features: simple (password-hash bridge) + std.
+scrypt = "0.11"
+
+# The password-hash face (PHC types, salt generation, constant-time
+# Output equality) is used directly, not through the engine crate's re-export.
+password-hash = "0.5"
+
+[dev-dependencies]
+rushwind-testkit = { workspace = true, features = ["password"] }

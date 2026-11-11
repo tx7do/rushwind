@@ -64,6 +64,8 @@ rushwind-config-file = { path = "crates/rushwind-config-file", version = "0.0.1"
 rushwind-config-http = { path = "crates/rushwind-config-http", version = "0.0.1" }
 rushwind-config-etcd = { path = "crates/rushwind-config-etcd", version = "0.0.1" }
 rushwind-config-consul = { path = "crates/rushwind-config-consul", version = "0.0.1" }
+rushwind-config-embedded = { path = "crates/rushwind-config-embedded", version = "0.0.1" }
+rushwind-config-apollo = { path = "crates/rushwind-config-apollo", version = "0.0.1" }
 rushwind-broker-nats = { path = "crates/rushwind-broker-nats", version = "0.0.1" }
 rushwind-broker-rabbitmq = { path = "crates/rushwind-broker-rabbitmq", version = "0.0.1" }
 rushwind-broker-stomp = { path = "crates/rushwind-broker-stomp", version = "0.0.1" }
@@ -88,6 +90,19 @@ rushwind-authn-jwt = { path = "crates/rushwind-authn-jwt", version = "0.0.1" }
 rushwind-authn-noop = { path = "crates/rushwind-authn-noop", version = "0.0.1" }
 rushwind-authn-presharedkey = { path = "crates/rushwind-authn-presharedkey", version = "0.0.1" }
 rushwind-authz = { path = "crates/rushwind-authz", version = "0.0.1" }
+# Password hashing: contract + one engine crate per algorithm.
+rushwind-password = { path = "crates/rushwind-password", version = "0.0.1" }
+rushwind-password-argon2 = { path = "crates/rushwind-password-argon2", version = "0.0.1" }
+rushwind-password-bcrypt = { path = "crates/rushwind-password-bcrypt", version = "0.0.1" }
+rushwind-password-scrypt = { path = "crates/rushwind-password-scrypt", version = "0.0.1" }
+rushwind-password-pbkdf2 = { path = "crates/rushwind-password-pbkdf2", version = "0.0.1" }
+# Vector retrieval (RAG / semantic search): contract + engines.
+rushwind-vector = { path = "crates/rushwind-vector", version = "0.0.1" }
+rushwind-vector-memory = { path = "crates/rushwind-vector-memory", version = "0.0.1" }
+# Distributed locks: contract + engines.
+rushwind-lock = { path = "crates/rushwind-lock", version = "0.0.1" }
+rushwind-lock-memory = { path = "crates/rushwind-lock-memory", version = "0.0.1" }
+rushwind-lock-redis = { path = "crates/rushwind-lock-redis", version = "0.0.1" }
 rushwind-authz-acl = { path = "crates/rushwind-authz-acl", version = "0.0.1" }
 rushwind-authz-noop = { path = "crates/rushwind-authz-noop", version = "0.0.1" }
 rushwind-authz-rbac = { path = "crates/rushwind-authz-rbac", version = "0.0.1" }

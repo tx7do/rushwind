@@ -54,11 +54,23 @@
 #![deny(missing_docs)]
 
 mod conformance;
+#[cfg(feature = "lock")]
+pub mod lock_conformance;
+#[cfg(feature = "password")]
+pub mod password_conformance;
 pub mod probe;
 #[cfg(feature = "storage")]
 pub mod storage_conformance;
+#[cfg(feature = "vector")]
+pub mod vector_conformance;
 
 pub use rushwind_core;
+#[cfg(feature = "lock")]
+pub use rushwind_lock;
+#[cfg(feature = "password")]
+pub use rushwind_password;
 #[cfg(feature = "storage")]
 pub use rushwind_storage;
 pub use rushwind_transport;
+#[cfg(feature = "vector")]
+pub use rushwind_vector;

@@ -397,6 +397,23 @@ jobs:
         env:
           BROKER_REDIS_URL: redis://127.0.0.1:6379
 
+      # The redis container above also carries the cache and lock
+      # engines' live suites — their conformance is the same wire the
+      # broker engine speaks.
+      - name: Cache redis suite
+        run: |
+          cargo test -p rushwind-cache-redis --features live -- --nocapture 2>&1 | tee /tmp/cache-redis-suite.log
+          exit ${PIPESTATUS[0]}
+        env:
+          CACHE_REDIS_URL: redis://127.0.0.1:6379
+
+      - name: Lock redis suite
+        run: |
+          cargo test -p rushwind-lock-redis --features live -- --nocapture 2>&1 | tee /tmp/lock-redis-suite.log
+          exit ${PIPESTATUS[0]}
+        env:
+          LOCK_REDIS_URL: redis://127.0.0.1:6379
+
       - name: Nats suite
         run: |
           cargo test -p rushwind-broker-nats --features live -- --nocapture 2>&1 | tee /tmp/nats-suite.log
@@ -434,7 +451,7 @@ jobs:
 
       - name: Report suite failure detail
         if: failure()
-        run: sed 's/\x1B\[[0-9;]*m//g' /tmp/mqtt-suite.log /tmp/redis-suite.log /tmp/nats-suite.log /tmp/rabbitmq-suite.log /tmp/stomp-suite.log /tmp/kafka-suite.log /tmp/pulsar-suite.log 2>/dev/null | grep -h "panicked at\|must succeed\|mqtt\|redis\|nats\|rabbitmq\|stomp\|kafka\|pulsar" | grep -v "^     Running\|Doc-tests\|Compiling\|warning" | head -20 | cut -c1-900 | sed 's/^/::error::/'
+        run: sed 's/\x1B\[[0-9;]*m//g' /tmp/mqtt-suite.log /tmp/redis-suite.log /tmp/cache-redis-suite.log /tmp/lock-redis-suite.log /tmp/nats-suite.log /tmp/rabbitmq-suite.log /tmp/stomp-suite.log /tmp/kafka-suite.log /tmp/pulsar-suite.log 2>/dev/null | grep -h "panicked at\|must succeed\|mqtt\|redis\|nats\|rabbitmq\|stomp\|kafka\|pulsar" | grep -v "^     Running\|Doc-tests\|Compiling\|warning" | head -20 | cut -c1-900 | sed 's/^/::error::/'
 
   oss-integration:
     name: oss conformance (live minio)

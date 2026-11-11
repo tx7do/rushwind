@@ -1,0 +1,25 @@
+[package]
+name = "rushwind-password-pbkdf2"
+description = "PBKDF2-HMAC-SHA256 engine for the RushWind password contract: OWASP-default rounds, PHC strings, verification driven by the stored hash's embedded parameters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-password = { workspace = true }
+# `simple` brings the password-hash bridge and the sha2 PRF set.
+pbkdf2 = { version = "0.12", features = ["simple"] }
+# The PRF dispatch imports sha2 directly.
+sha2 = { workspace = true }
+
+# The password-hash face (PHC types, salt generation, constant-time
+# Output equality) is used directly, not through the engine crate's re-export.
+password-hash = "0.5"
+
+[dev-dependencies]
+rushwind-testkit = { workspace = true, features = ["password"] }

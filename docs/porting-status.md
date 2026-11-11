@@ -2,6 +2,19 @@
 
 全部 20 个域的 Rust 实现收口记录。日期：2026-09-14。
 
+## 独立路线增量（2026-11-11）
+
+不依赖上游三仓的独立功能面，六个模块一次落地（各带一致性/单元套件，fmt/clippy -D warnings 干净）：
+
+- **密码哈希域**（`rushwind-password` + argon2/bcrypt/scrypt/pbkdf2 四引擎）：PHC 自描述串，验证恒由存量哈希内嵌参数驱动（bcrypt 的 MCF 同理），`needs_rehash` 承担升级闭环；Ok(false)（错密码）与 Err(InvalidHash)（坏行）严格分面；argon2 0.5 实际未实现 `PasswordVerifier`（文档示例陈旧），四引擎统一走"解析→内嵌参数重导出→常数时间比较"骨架。bcrypt 的 72 字节截断是算法本身行为，文档与钉子测试都如实钉住。
+- **向量检索域**（`rushwind-vector` + memory 参考引擎）：移植 go-crud `vector` 模块语义——score 恒为越大越相似（余弦 `1−d`/L2 `1/(1+d)`/点积原值）、TopK 非分页、维度纪律（首个 upsert 定维、不一致拒绝）、pgvector 文本编解码、零向量 fail-neutral（余弦距离 1.0 而非 NaN）。契约零依赖（类型+纯函数）；外部引擎族（qdrant/milvus/weaviate/neo4j）仍按需立项，契约已可插拔。
+- **分布式锁域**（`rushwind-lock` + memory/redis 引擎）：try-once 获取（等待是调用方重试策略，契约不隐藏活跃性问题）、所有权 token、TTL 强制（零 TTL 拒绝 InvalidTtl——liveness 全靠它）、属主校验的 release/extend（Ok(false) = 互斥已失效，绝不误删后继者的锁）。redis 引擎 = `SET NX PX` + token 比对 Lua；live 套件接进 CI broker 任务的 redis 容器，顺手把从未接线的 cache-redis live 套件也补上。
+- **config 编译期嵌入源**（`rushwind-config-embedded`）：`include_bytes!`/`include_str!` 喂静态键→字节树；不可 watch 是链接期事实的诚实答案。
+- **config/apollo 源**（`rushwind-config-apollo`）：手写 reqwest（house 的 S3/STOMP 手写先例）——configs REST 读（configurations 规范化为键序 JSON，404=缺席）+ notifications/v2 长轮询（304 窗口语义、长轮询超时=窗口+读超时、防即时应答服务器的热自旋 gap）；mock server 测试，无 SDK 依赖。
+- **ratelimit clock 注入**：契约加 `Clock` 类型（`Arc<dyn Fn() -> Instant>`）与 `system_clock()`，tokenbucket/bbr 各加 `with_clock`——令牌记账与窗口旋转走注入钟，测试用假钟推进替代真实短 sleep（wait 路径的 sleep 仍真实时钟，文档写明）。tokenbucket 的 "clock 注入未实现" 备注销案。
+
+testkit 新增三个特性门控套件：`password`（8 测试：三分面验证、盐唯一、needs_rehash 面、篡改摘要、空/Unicode 密码）、`vector`（8 测试：三 metric 排序、top-k 截断、upsert 替换、维度纪律、空集非错误、坏查询拒绝）、`lock`（9 测试：try-once、token 校验、伪造 token 不偷锁、TTL 失效、extend 延长/失效、键独立、零 TTL 拒绝）。
+
 ## 上游跟进（2026-11-05）
 
 三个上游 Go 仓库（go-crud、kratos-transport、kratos-bootstrap）在移植基线（2026-09-14）之后的提交已逐条盘点并跟进：
@@ -65,15 +78,14 @@
 | 域 | 推迟原因 |
 |:---|:---|
 | workflow | 契约仅 Client.Close + Worker.Stop/IsRunning；四个引擎（argo/conductor/goworkflows/temporal）都是重型外部系统的 SDK 适配器，各自独立成项 |
+| vector 外部引擎 | 契约 + memory 参考引擎已落地（2026-11-11）；qdrant/milvus/weaviate/neo4j 外部引擎仍按需立项，各自独立成项 |
 | pprof | pprof 是特定运行时的剖析机制，不跨运行时通用；Rust 生态对应物是 pprof-rs（Linux perf，本仓 CI 含 Windows 无法验证）与 tokio-console |
 | log | 独立日志门面包装；工作区标准是 `tracing`，重复封装无收益 |
 | ratelimit/sentinel | 无维护良好的 Rust SDK；直接阈值+拒绝规则可映射到 token-bucket 引擎 |
 | circuitbreaker/sentinel | 同上，该适配面无维护良好的 Rust SDK |
-| config/apollo | 携程 Apollo 配置中心 SDK，中国区专用，按需再实现（契约已可插拔） |
 
 ## 备注
 
-- bootstrap 装配层 2026-09-15 起覆盖全部可装配域：命名实例族（authn/authz/broker/cache/circuitbreaker/ratelimit，各带应用侧注册的工厂表）与单实例族（ai/oss/metrics）经工厂表装配并在 `Bootstrapped`/`RouteInput` 上暴露；config 域按优先级列表组合进 FallbackSource；script 域经其自带工厂表装配进 Manager 并由关停清扫关闭；内置 http 服务器经 `HttpEdge`（中间件开关、CORS 两层、超时）与按子树的 `with_authn`/`with_authorization*` 包装（含 project 轴的固定/声明两种形态，互斥校验）；`/healthz`+`/readyz` 与 `/metrics` 挂载及 Prometheus 内置引擎走 bootstrap 的 `health`/`metrics` 特性，OTLP tracer 装配走 `trace` 特性，特性关闭时装配报错而非静默；cron 传输按注册任务名挂载。prometheus 与 tracer 引擎为此补了 `from_settings` 接线形状。明确不接：encoding（无设置面的全局自注册，应用一行 `register()` 即全部接线）、apalis 任务存储（作业载荷类型是应用知识）、retry（静态策略工具，无可装配对象）。
-- config 域的 etcd/consul/http 源已实现；编译期文件嵌入源（Rust 侧对应 include_bytes!/include_str! 一类机制）暂未做成独立 Source，按需再补。
+- bootstrap 装配层 2026-09-15 起覆盖全部可装配域：命名实例族（authn/authz/broker/cache/circuitbreaker/ratelimit/lock/vector，各带应用侧注册的工厂表）与单实例族（ai/oss/metrics）经工厂表装配并在 `Bootstrapped`/`RouteInput` 上暴露；config 域按优先级列表组合进 FallbackSource；script 域经其自带工厂表装配进 Manager 并由关停清扫关闭；内置 http 服务器经 `HttpEdge`（中间件开关、CORS 两层、超时）与按子树的 `with_authn`/`with_authorization*` 包装（含 project 轴的固定/声明两种形态，互斥校验）；`/healthz`+`/readyz` 与 `/metrics` 挂载及 Prometheus 内置引擎走 bootstrap 的 `health`/`metrics` 特性，OTLP tracer 装配走 `trace` 特性，特性关闭时装配报错而非静默；cron 传输按注册任务名挂载。prometheus 与 tracer 引擎为此补了 `from_settings` 接线形状。明确不接：encoding（无设置面的全局自注册，应用一行 `register()` 即全部接线）、apalis 任务存储（作业载荷类型是应用知识）、retry（静态策略工具，无可装配对象）。
+- config 域的 etcd/consul/http 源已实现；编译期文件嵌入源（rushwind-config-embedded，include_bytes!/include_str! 静态树）与 Apollo 源（rushwind-config-apollo，手写 REST + 长轮询）已于 2026-11-11 补齐。
 - broker 域的 kafka 已实现：samsa 纯 Rust 协议客户端，免 librdkafka C 构建工具链（消费侧 headers 取不到、无 leave-group 与分区扩容监视等差异见 crate 文档清单）。pulsar 已实现：pulsar-rs（6.9，仅启用 tokio-runtime + compression 特性以规避其默认特性里的 async-std 与 native-tls），载荷经 crate 的字节透传、headers 映射 user properties、key 映射 partition key（无 unsubscribe 请求、无生产者轮换重试等差异见 crate 文档清单）。仍推迟：nsq（唯一 Rust 客户端 0.0.3 止于 2017，无维护）、azuresb（azure_messaging_servicebus 0.21 止于 2024-10，源自已归档的 azure-sdk-for-rust）、rocketmq（crates.io 上唯一客户端 5.0.0 止于 2023-08；aliyun ONS 变体无 Rust SDK）、sqs/gcpubsub（官方 Rust SDK 均存在且活跃——aws-sdk-sqs、google-cloud-pubsub 1.4——但 localstack / gcloud emulator 容器各 2–3GB 超出 CI 拉取预算；契约已可插拔，需要时按需再实现）。
-- ratelimit 的 clock 注入未实现：测试用真实短时长。

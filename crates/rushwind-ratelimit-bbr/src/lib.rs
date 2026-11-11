@@ -29,7 +29,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rushwind_ratelimit::{BoxFuture, Limiter, RateLimitError};
+use rushwind_ratelimit::{system_clock, BoxFuture, Clock, Limiter, RateLimitError};
 
 /// The CPU/load threshold above which requests throttle. Default 0.80.
 const DEFAULT_CPU_THRESHOLD: f64 = 0.80;
@@ -103,6 +103,8 @@ pub struct BbrLimiter {
     bucket_duration: Duration,
     /// The monotonic anchor the bucket ring indexes against.
     start: Instant,
+    /// The clock window rotation reads — injectable for tests.
+    clock: Clock,
 }
 
 impl BbrLimiter {
@@ -113,6 +115,14 @@ impl BbrLimiter {
 
     /// Builds a BBR adaptive limiter with explicit options.
     pub fn with_options(options: BbrOptions) -> Self {
+        Self::with_clock(options, system_clock())
+    }
+
+    /// Builds a BBR adaptive limiter whose window rotation reads
+    /// `clock` — the test seam: a fake clock advanced by hand drives
+    /// bucket rotation and window expiry without real sleeps. The
+    /// `wait` poll sleep still rides tokio's real timer.
+    pub fn with_clock(options: BbrOptions, clock: Clock) -> Self {
         let config = Config {
             cpu_threshold: options.cpu_threshold,
             window: options.window,
@@ -120,6 +130,7 @@ impl BbrLimiter {
             min_qps: options.min_qps,
         };
         let bucket_duration = config.window / config.bucket_count as u32;
+        let now = clock();
         Self {
             state: Mutex::new(State {
                 buckets: vec![
@@ -129,14 +140,15 @@ impl BbrLimiter {
                     };
                     config.bucket_count
                 ],
-                last_bucket_time: Instant::now(),
+                last_bucket_time: now,
                 inflight: 0,
                 max_inflight: 0,
                 closed: false,
             }),
             config,
             bucket_duration,
-            start: Instant::now(),
+            start: now,
+            clock,
         }
     }
 
@@ -147,7 +159,7 @@ impl BbrLimiter {
         if state.closed {
             return false;
         }
-        self.rotate_locked(&mut state, Instant::now());
+        self.rotate_locked(&mut state, (self.clock)());
 
         let max_qps = self.estimate_max_qps_locked(&state);
         let mut max_inflight = (max_qps * self.config.cpu_threshold) as u64;
@@ -168,9 +180,10 @@ impl BbrLimiter {
     pub fn done(&self, rtt: Duration) {
         let mut state = self.state.lock().unwrap();
         state.inflight = state.inflight.saturating_sub(1);
-        self.rotate_locked(&mut state, Instant::now());
+        let now = (self.clock)();
+        self.rotate_locked(&mut state, now);
 
-        let index = self.current_bucket_index(Instant::now());
+        let index = self.current_bucket_index(now);
         state.buckets[index].count += 1;
         state.buckets[index].total_rtt_nanos += rtt.as_nanos() as u64;
     }

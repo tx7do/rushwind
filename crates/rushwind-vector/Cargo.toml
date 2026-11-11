@@ -1,0 +1,15 @@
+[package]
+name = "rushwind-vector"
+description = "Vector-retrieval contract for RushWind (RAG / semantic search): unified Query, bigger-is-more-similar scores, distance metrics, pgvector text codec — types and pure functions only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# Deliberately dependency-free, mirroring go-crud's vector module: the
+# contract holds types and pure functions; engine crates bring drivers.
+[dependencies]

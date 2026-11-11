@@ -1,0 +1,21 @@
+[package]
+name = "rushwind-lock-memory"
+description = "In-process engine for the RushWind lock contract: a TTL'd map with token-checked release and extend — single-process deployments and tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-lock = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+rushwind-testkit = { workspace = true, features = ["lock"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

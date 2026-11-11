@@ -62,7 +62,7 @@
 | Casbin / Cedar 引擎 | 本地重库（casbin-rs / cedar-policy 存在）；接入需先定模型文件与契约的映射 |
 | Cerbos / OPA / Zanzibar 系（keto、openfga）客户端 | 远程策略服务客户端；需要 reqwest + 异步契约面 |
 | AWS IAM（SigV4）校验引擎 | AWS SigV4 校验；需先定凭证-请求绑定的契约形状 |
-| 密码哈希工具族 | 与 authn/authz 契约正交，独立排期 |
+| ~~密码哈希工具族~~ | **已实现**（2026-11-11）：`rushwind-password` 契约 + argon2/bcrypt/scrypt/pbkdf2 四引擎，与 authn/authz 契约正交、共享 testkit 一致性套件 |
 
 ## 威胁面速记
 

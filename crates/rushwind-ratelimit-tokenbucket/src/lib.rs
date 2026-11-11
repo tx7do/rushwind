@@ -16,8 +16,11 @@
 //!   which serves the same purpose without the broadcast. A Close
 //!   does wake every sleeping Waiter (via a notification) so it
 //!   answers `Limited` immediately.
-//! - No clock injection (`WithClock`): tests use real short
-//!   durations.
+//! - Clock injection is [`TokenBucket::with_clock`]: token accounting
+//!   (refill from elapsed, deficit computation) reads the injected
+//!   clock, so tests advance a fake instead of sleeping. The `wait`
+//!   sleep itself still rides tokio's real timer — wait-path tests
+//!   use real short durations.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -25,7 +28,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rushwind_ratelimit::{BoxFuture, Limiter, RateLimitError};
+use rushwind_ratelimit::{system_clock, BoxFuture, Clock, Limiter, RateLimitError};
 
 struct State {
     tokens: f64,
@@ -38,6 +41,8 @@ pub struct TokenBucket {
     state: Mutex<State>,
     rate: f64,
     burst: f64,
+    /// The clock refill accounting reads — injectable for tests.
+    clock: Clock,
     /// Wakes sleeping `wait`ers when [`Limiter::close`] fires.
     close_notify: tokio::sync::Notify,
 }
@@ -55,6 +60,14 @@ impl TokenBucket {
     /// Builds a limiter starting full. Fails when `rate` or `burst`
     /// is not strictly positive.
     pub fn new(options: TokenBucketOptions) -> Result<Self, RateLimitError> {
+        Self::with_clock(options, system_clock())
+    }
+
+    /// Builds a limiter whose token accounting reads `clock` — the
+    /// test seam: a fake clock advanced by hand replaces the real
+    /// short sleeps refill tests would otherwise need. The `wait`
+    /// sleep still rides tokio's real timer.
+    pub fn with_clock(options: TokenBucketOptions, clock: Clock) -> Result<Self, RateLimitError> {
         if options.rate <= 0.0 || options.burst <= 0.0 {
             return Err(RateLimitError::Failed(
                 "rate and burst must be > 0".to_string(),
@@ -63,11 +76,12 @@ impl TokenBucket {
         Ok(Self {
             state: Mutex::new(State {
                 tokens: options.burst,
-                last: Instant::now(),
+                last: clock(),
                 closed: false,
             }),
             rate: options.rate,
             burst: options.burst,
+            clock,
             close_notify: tokio::sync::Notify::new(),
         })
     }
@@ -87,7 +101,7 @@ impl TokenBucket {
     /// bucket cannot cover the request yet.
     /// Replenishes tokens from elapsed time first.
     fn take_locked(&self, state: &mut State, n: f64) -> Take {
-        let now = Instant::now();
+        let now = (self.clock)();
         let elapsed = now.duration_since(state.last).as_secs_f64();
         if elapsed > 0.0 {
             state.tokens = (state.tokens + elapsed * self.rate).min(self.burst);

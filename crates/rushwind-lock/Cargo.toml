@@ -1,0 +1,14 @@
+[package]
+name = "rushwind-lock"
+description = "Distributed-lock contract for RushWind: TTL'd acquire with ownership tokens, ownership-checked release and extend."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# The contract stays dependency-free: engines bring their own drivers.
+[dependencies]

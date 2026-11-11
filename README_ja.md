@@ -20,7 +20,7 @@ RushWind が行うのは一つだけ：**信頼性の高いマルチサーバー
 
 ## 現状
 
-能力面はすべて着地しました：**104 crate + 8 サンプル**。ライフサイクル編成をはじめ、トランスポート、HTTP、ストレージ、セキュリティ、設定、レジストリ、可観測性、レジリエンス、キャッシュ、メッセージ、トランザクション、タスク、エンコーディング、スクリプト、AI、オブジェクトストレージの全能力ドメインをカバーします。各ドメイン = 契約 crate 一つ + 必要に応じて導入するエンジンマトリクス。エンジンとアダプターはすべて適合性スイートに合格しなければなりません——`cargo test` が全緑であることが適合の定義です。各ドメインは独自に、Rust エコシステム自身のペースで進化していきます。
+能力面はすべて着地しました：**124 crate + 8 サンプル**。ライフサイクル編成をはじめ、トランスポート、HTTP、ストレージ、セキュリティ、設定、レジストリ、可観測性、レジリエンス、キャッシュ、メッセージ、トランザクション、タスク、エンコーディング、スクリプト、AI、オブジェクトストレージの全能力ドメインをカバーします。各ドメイン = 契約 crate 一つ + 必要に応じて導入するエンジンマトリクス。エンジンとアダプターはすべて適合性スイートに合格しなければなりません——`cargo test` が全緑であることが適合の定義です。各ドメインは独自に、Rust エコシステム自身のペースで進化していきます。
 
 ロードマップに残っているのは：kcp（レガシー相互運用時）、`rushwind-protocols` 独立リポジトリ。
 
@@ -70,6 +70,13 @@ RushWind が行うのは一つだけ：**信頼性の高いマルチサーバー
 | `crates/rushwind-storage-macros` | `ToRecord`/`FromRecord` derive マクロ：DTO↔Record マッピングをコンパイル時に生成；スカラー拡幅、`#[record(as_text)]` enum、`#[record(with = "…")]` カスタム変換、`#[record(rename)]` カラム名 |
 | `crates/rushwind-storage-axum` | HTTP エッジ層：任意の Repository を CRUD ルートとして公開、一覧クエリは protojson `q` / AIP `filter` の二入口、viewer フックでテナンシーを収口 |
 
+### ベクトル検索ドメイン
+
+| 場所 | 職責 |
+|:---|:---|
+| `crates/rushwind-vector` | ベクトル検索契約（RAG/意味検索）：統一 `VectorQuery`、スコアは常に大きいほど類似（余弦 `1−d`/L2 `1/(1+d)`/内積その値）、TopK でページングなし、次元規律、pgvector テキストコーデック——型と純関数のみ（go-crud vector 意味の移植） |
+| `crates/rushwind-vector-memory` | メモリ参照エンジン：総当たり top-k + 次元固定/拒否。外部エンジンアダプターの意味論ベースライン；外部エンジン族（qdrant/milvus/weaviate 等）は必要時に立ち上げ |
+
 ### セキュリティドメイン
 
 | パス | 役割 |
@@ -97,6 +104,8 @@ RushWind が行うのは一つだけ：**信頼性の高いマルチサーバー
 | `crates/rushwind-config-http` | HTTP 設定ソース：URL をキーとした GET + ポーリング ValueWatcher |
 | `crates/rushwind-config-etcd` | etcd 設定ソース：キーによる GET + ネイティブ Watch、signal/push の両モード |
 | `crates/rushwind-config-consul` | Consul KV 設定ソース：キーによる GET + blocking query による push 式 watch |
+| `crates/rushwind-config-embedded` | コンパイル時埋め込みソース：include_bytes!/include_str! で供給する静的キー→バイト木——ゼロ I/O、watch 不可（リンク時確定） |
+| `crates/rushwind-config-apollo` | Apollo 設定ソース：configs REST 読み取り（canonical JSON、404=不在）+ notifications/v2 ロングポール watch、SDK なしの reqwest 直書き |
 
 ### レジストリドメイン
 
@@ -129,7 +138,7 @@ RushWind が行うのは一つだけ：**信頼性の高いマルチサーバー
 |:---|:---|
 | `crates/rushwind-retry` | 組み合わせ可能なリトライ：指数バックオフ + ジッター、リトライ述語、総タイムアウト |
 | `crates/rushwind-ratelimit` | レート制限契約：アルゴリズム非依存の `Limiter` trait |
-| `crates/rushwind-ratelimit-tokenbucket` | トークンバケット・エンジン：レートでの補充 + バースト容量、Allow/Wait/Close |
+| `crates/rushwind-ratelimit-tokenbucket` | トークンバケット・エンジン：レートでの補充 + バースト容量、Allow/Wait/Close、計時計注入可能 |
 | `crates/rushwind-ratelimit-bbr` | BBR 風の適応型エンジン：スライディングウィンドウのスループット推定 + inflight 上限 |
 | `crates/rushwind-circuitbreaker` | サーキットブレーカー契約：`State` + `CircuitBreaker` trait（Allow/MarkSuccess/MarkFailure/Execute/State/Close） |
 | `crates/rushwind-circuitbreaker-vegas` | Vegas 方式エンジン：レイテンシ膨張の探査 |
@@ -143,6 +152,14 @@ RushWind が行うのは一つだけ：**信頼性の高いマルチサーバー
 | `crates/rushwind-cache` | KV キャッシュ契約：get/set/SetNX/バッチ + TTL |
 | `crates/rushwind-cache-local` | プロセス内 KV エンジン：TTL 付きエントリの遅延失効 + 容量退避 |
 | `crates/rushwind-cache-redis` | Redis エンジン：GET/SET/SETNX/DEL/EXISTS + MGET とパイプライン一括設定 |
+
+### ロックドメイン
+
+| 場所 | 職責 |
+|:---|:---|
+| `crates/rushwind-lock` | 分散ロック契約：try-once 取得 + 所有権トークン + TTL 強制（forever-lock なし）+ 所有権検証付き release/extend |
+| `crates/rushwind-lock-memory` | プロセス内エンジン：TTL 怠惰期限切れの map + トークン検証——単プロセス配置とテスト用、分散エンジンと同じ適合性スイート |
+| `crates/rushwind-lock-redis` | Redis エンジン：`SET NX PX` 取得 + トークン照合の Lua 原子 release/extend、live スイートは CI の redis コンテナで走る |
 
 ### メッセージ・トランザクション・タスク
 
@@ -200,7 +217,7 @@ RushWind が行うのは一つだけ：**信頼性の高いマルチサーバー
 | パス | 役割 |
 |:---|:---|
 | `crates/rushwind-bootstrap` | 設定駆動の組み立て：YAML → ストレージエンジン + HTTP サーバー + ルートパックを、単一ライフサイクルに統合 |
-| `crates/rushwind-testkit` | クロスアダプター適合性スイート——すべてのトランスポート/エンジンが全項目に合格する必要がある |
+| `crates/rushwind-testkit` | クロスアダプター適合性スイート（ライフサイクル/ストレージ/パスワード/ベクトル/ロック、フィーチャー門控）——すべてのトランスポート/エンジンが全項目に合格する必要がある |
 
 ### サンプル
 

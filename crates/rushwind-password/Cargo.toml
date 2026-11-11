@@ -1,0 +1,15 @@
+[package]
+name = "rushwind-password"
+description = "Password-hashing contract for RushWind: one PasswordHasher face over the PHC string format, one engine crate per algorithm."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# The contract stays dependency-free: engines bring their own
+# implementations, callers bring their own upgrade loop.
+[dependencies]

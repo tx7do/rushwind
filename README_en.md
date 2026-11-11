@@ -20,7 +20,7 @@ Everything is designed native to Rust's ownership, cancellation and error models
 
 ## Status
 
-The capability surface is fully landed: **104 crates + 8 examples**, spanning lifecycle orchestration, transport, HTTP, storage, security, config, registry, observability, resilience, cache, messaging, transactions, tasks, encoding, scripts, AI, and object storage. Each domain = one contract crate + an engine matrix pulled in as needed; every engine and adapter must pass the conformance suite — a green `cargo test` is the definition of conformant. Each domain evolves on its own, at the Rust ecosystem's own pace.
+The capability surface is fully landed: **124 crates + 8 examples**, spanning lifecycle orchestration, transport, HTTP, storage, security (password hashing included), config, registry, observability, resilience, cache, messaging, transactions, tasks, encoding, scripts, AI, object storage, vector retrieval, and distributed locks. Each domain = one contract crate + an engine matrix pulled in as needed; every engine and adapter must pass the conformance suite — a green `cargo test` is the definition of conformant. Each domain evolves on its own, at the Rust ecosystem's own pace.
 
 Still on the roadmap: kcp (for legacy interop), and a standalone `rushwind-protocols` repo.
 
@@ -70,6 +70,13 @@ Grouped by domain. Contract crates presuppose no engine; engines and adapters ar
 | `crates/rushwind-storage-macros` | `ToRecord`/`FromRecord` derive macros: DTO↔Record mapping generated at compile time; widened scalars, `#[record(as_text)]` enums, `#[record(with = "…")]` custom conversions, `#[record(rename)]` columns |
 | `crates/rushwind-storage-axum` | the HTTP endpoint layer: any Repository as CRUD routes, list queries via protojson `q` or AIP `filter`, viewer hook for tenancy |
 
+### Vector Retrieval
+
+| Location | Responsibility |
+|:---|:---|
+| `crates/rushwind-vector` | vector-retrieval contract (RAG / semantic search): unified `VectorQuery`, scores always bigger-is-more-similar (cosine `1−d` / L2 `1/(1+d)` / raw dot), top-k not pagination, dimension discipline, pgvector text codec — types and pure functions only (porting go-crud's vector semantics) |
+| `crates/rushwind-vector-memory` | in-memory reference engine: brute-force top-k + dimension fixing/refusal, the semantic baseline for external engine adapters; the external engine family (qdrant/milvus/weaviate, …) is scoped per engine when needed |
+
 ### Security domain
 
 | Path | Role |
@@ -97,6 +104,8 @@ Grouped by domain. Contract crates presuppose no engine; engines and adapters ar
 | `crates/rushwind-config-http` | HTTP config source: GET by URL key + a polling ValueWatcher |
 | `crates/rushwind-config-etcd` | etcd config source: GET by key + native watch, signal and push modes |
 | `crates/rushwind-config-consul` | Consul KV config source: GET by key + push-mode watch via blocking queries |
+| `crates/rushwind-config-embedded` | compile-time embedded source: a static key→bytes tree fed by include_bytes!/include_str! — zero I/O, not watchable (fixed at link time) |
+| `crates/rushwind-config-apollo` | Apollo config source: configs REST read (canonical JSON, 404=absent) + notifications/v2 long-poll watch, hand-written over reqwest, no SDK |
 
 ### Registry domain
 
@@ -129,7 +138,7 @@ Grouped by domain. Contract crates presuppose no engine; engines and adapters ar
 |:---|:---|
 | `crates/rushwind-retry` | composable retry: exponential backoff with jitter, retry predicates, total timeout |
 | `crates/rushwind-ratelimit` | the rate-limiting contract: the algorithm-agnostic `Limiter` trait |
-| `crates/rushwind-ratelimit-tokenbucket` | token-bucket engine: refill at rate + burst capacity, Allow/Wait/Close |
+| `crates/rushwind-ratelimit-tokenbucket` | token-bucket engine: refill at rate + burst capacity, Allow/Wait/Close, injectable clock for accounting |
 | `crates/rushwind-ratelimit-bbr` | BBR-inspired adaptive engine: sliding-window throughput estimation + an inflight cap |
 | `crates/rushwind-circuitbreaker` | the circuit-breaker contract: `State` + the `CircuitBreaker` trait (Allow/MarkSuccess/MarkFailure/Execute/State/Close) |
 | `crates/rushwind-circuitbreaker-vegas` | Vegas-style engine: latency-inflation probing |
@@ -143,6 +152,14 @@ Grouped by domain. Contract crates presuppose no engine; engines and adapters ar
 | `crates/rushwind-cache` | the KV cache contract: get/set/SetNX/batch with TTLs |
 | `crates/rushwind-cache-local` | in-process KV engine: TTL'd entries with lazy expiry + capacity eviction |
 | `crates/rushwind-cache-redis` | Redis engine: GET/SET/SETNX/DEL/EXISTS + MGET and pipelined sets |
+
+### Locks
+
+| Location | Responsibility |
+|:---|:---|
+| `crates/rushwind-lock` | distributed-lock contract: try-once acquire + ownership tokens + mandatory TTLs (no forever-locks) + ownership-checked release/extend |
+| `crates/rushwind-lock-memory` | in-process engine: a lazily-expiring map + token checks — single-process deployments and tests, same conformance suite as the distributed engines |
+| `crates/rushwind-lock-redis` | Redis engine: `SET NX PX` acquire + token-matched atomic Lua release/extend; the live suite runs on CI's redis container |
 
 ### Messaging, transactions & tasks
 
@@ -200,7 +217,7 @@ Grouped by domain. Contract crates presuppose no engine; engines and adapters ar
 | Path | Role |
 |:---|:---|
 | `crates/rushwind-bootstrap` | config-driven assembly: YAML → storage engine + HTTP servers + route packs, under one lifecycle |
-| `crates/rushwind-testkit` | cross-adapter conformance suites — every transport and engine must pass them in full |
+| `crates/rushwind-testkit` | cross-adapter conformance suites (lifecycle / storage / password / vector / lock, feature-gated) — every transport and engine must pass them in full |
 
 ### Examples
 
