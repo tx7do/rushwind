@@ -18,4 +18,5 @@ rmp-serde = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+# No serde_json dev-dep: the depth tests marshal a format-neutral Frame,
+# not serde_json::Value — see the crate docs' wire-portability note.

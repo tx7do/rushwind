@@ -15,6 +15,31 @@
 //! let bytes = marshal(codec.as_ref(), &Ping { seq: 1 }).unwrap();
 //! # let _ = bytes;
 //! ```
+//!
+//! # `serde_json::Value` is not a wire-portable payload
+//!
+//! When the workspace's shared `serde_json` is built with the
+//! `arbitrary_precision` feature, `serde_json::Number` serializes
+//! through foreign formats **as a string** — `Value::Number(1)`
+//! marshals to a msgpack text string `"1"`, and the round trip comes
+//! back `Value::String("1")`. This is serde_json's documented
+//! `arbitrary_precision` behavior (the number rides as text), and no
+//! codec can detect it: the feature arrives by cargo's feature
+//! unification, not by anything this crate does. The workspace itself
+//! demonstrates the leak — `starlark` 0.14 (the latest line on
+//! crates.io) hardcodes `serde_json/arbitrary_precision`, so every
+//! single-command workspace build carries it into the shared
+//! `serde_json`.
+//!
+//! Consequently:
+//!
+//! - marshal `serde_json::Value` only through the JSON codec
+//!   (serde_json is self-consistent in both modes — the same property
+//!   that makes the cbor engine's JSON-leg bridge number-faithful);
+//! - use format-neutral payloads for cross-format marshaling: plain
+//!   structs, or the recursive `Frame` shape the depth tests below
+//!   pin wire-depth semantics on. The pin must hold in every feature
+//!   unification, which a serde_json-typed payload cannot promise.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -110,20 +135,32 @@ mod tests {
         }
     }
 
-    fn nested(depth: usize) -> serde_json::Value {
-        let mut value = serde_json::Value::from(1u8);
+    /// A format-neutral recursive payload for the depth pins. Each
+    /// `Nest` level is one msgpack array wrapping its inner value —
+    /// genuine wire nesting — and the leaf is a plain `u64`. Deliberately
+    /// not `serde_json::Value`: under the workspace's
+    /// `arbitrary_precision` feature unification (see the crate docs),
+    /// a Value's leaf number marshals as a string and the round trip
+    /// loses number-ness — a serde_json-typed payload pins nothing.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    enum Frame {
+        Leaf(u64),
+        Nest(Vec<Frame>),
+    }
+
+    fn nested(depth: usize) -> Frame {
+        let mut frame = Frame::Leaf(1);
         for _ in 0..depth {
-            value = serde_json::Value::Array(vec![value]);
+            frame = Frame::Nest(vec![frame]);
         }
-        value
+        frame
     }
 
     #[test]
     fn a_hostile_deep_payload_answers_a_typed_error_not_an_abort() {
         let codec = MsgpackCodec;
         let bytes = marshal(&codec, &nested(512)).expect("marshal deep");
-        let err = unmarshal::<serde_json::Value>(&codec, &bytes)
-            .expect_err("deep payload must be refused");
+        let err = unmarshal::<Frame>(&codec, &bytes).expect_err("deep payload must be refused");
         assert!(
             err.to_string().contains("depth limit"),
             "wrong refusal: {err}"
@@ -134,7 +171,7 @@ mod tests {
     fn an_honest_depth_round_trips() {
         let codec = MsgpackCodec;
         let bytes = marshal(&codec, &nested(50)).expect("marshal shallow");
-        let round = unmarshal::<serde_json::Value>(&codec, &bytes).expect("round trip");
+        let round = unmarshal::<Frame>(&codec, &bytes).expect("round trip");
         assert_eq!(round, nested(50));
     }
 
