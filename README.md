@@ -84,6 +84,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 |:---|:---|
 | `crates/rushwind-vector` | 向量检索契约（RAG/语义检索）：统一 `VectorQuery`、score 恒为越大越相似（余弦 `1−d`/L2 `1/(1+d)`/点积原值）、TopK 非分页、维度纪律、pgvector 文本编解码——纯类型与纯函数（移植 go-crud vector 语义） |
 | `crates/rushwind-vector-memory` | 内存参考引擎：暴力 top-k + 维度固定/拒绝，外部引擎适配器的语义基准；外部引擎族（qdrant/milvus/weaviate 等）按需立项 |
+| `crates/rushwind-vector-qdrant` | Qdrant 引擎：REST 上手写 reqwest 无 SDK——按 metric 后缀的命名向量（`{field}__cosine/euclidean/dot`，服务端 top-k 对每个契约 metric 都正确，代价 3× 存储；既有的裸字段单 metric 集合走单 metric 模式）、维度纪律读服务端配置、自由字符串 id 经确定性 SHA-1→UUID 映射 + payload 回带原 id |
 
 ### 安全域
 

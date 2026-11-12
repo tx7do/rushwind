@@ -1,0 +1,22 @@
+[package]
+name = "rushwind-vector-qdrant"
+description = "Qdrant engine for the RushWind vector contract: named-vector collections over the qdrant REST API, hand-written over reqwest — no SDK."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-vector = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+rushwind-testkit = { workspace = true, features = ["vector"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }
