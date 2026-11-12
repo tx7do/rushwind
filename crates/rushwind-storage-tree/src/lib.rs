@@ -8,9 +8,16 @@
 //! engine (in-memory, SQL, MongoDB, decorated, …) supports it with zero
 //! extra machinery.
 //!
-//! The trade is deliberate: deep subtrees cost one list per level (an
-//! engine with recursive CTEs can beat that), and the walks carry a cycle
-//! guard because the contract cannot forbid a row from parenting itself.
+//! The trade is deliberate: deep subtrees cost one list per level on the
+//! composition path, and the walks carry a cycle guard because the
+//! contract cannot forbid a row from parenting itself. Engines carrying
+//! the contract's [`rushwind_storage::RecursiveCte`] capability answer the
+//! deep walks (`subtree`/`ancestors`/`is_ancestor`) as **one recursive
+//! query** instead — the SQL engines' fast path, with scope and tenant
+//! enforced inside the CTE and identical answers pinned by the same
+//! suites. A bare engine only: a decorator forwarding the capability
+//! would bypass its own rewriting, so the probe stays `None` there by
+//! contract.
 //! A cycle is [`StorageError::InvalidQuery`], never an infinite loop; a
 //! dangling parent id ends the walk like a root.
 
@@ -102,6 +109,11 @@ impl<'a> Tree<'a> {
     /// A dangling parent id ends the walk; a parent cycle is
     /// [`StorageError::InvalidQuery`].
     pub async fn ancestors(&self, ctx: &QueryCtx, id: i64) -> Result<Vec<Record>, StorageError> {
+        // The fast path: one recursive query for the whole chain (see the
+        // subtree note). The composition below stays the baseline.
+        if let Some(fast) = self.repo.recursive_cte() {
+            return fast.ancestors(ctx, self.parent_column, id).await;
+        }
         let mut chain: Vec<Record> = Vec::new();
         let mut visited: BTreeSet<i64> = BTreeSet::new();
         visited.insert(id);
@@ -136,6 +148,16 @@ impl<'a> Tree<'a> {
         ancestor: i64,
         descendant: i64,
     ) -> Result<bool, StorageError> {
+        // The fast path: the whole chain in one recursive query, membership
+        // checked on the returned rows. The composition below stays the
+        // baseline.
+        if let Some(fast) = self.repo.recursive_cte() {
+            return Ok(fast
+                .ancestors(ctx, self.parent_column, descendant)
+                .await?
+                .iter()
+                .any(|row| self.id_of(row) == Some(ancestor)));
+        }
         let mut visited: BTreeSet<i64> = BTreeSet::new();
         visited.insert(descendant);
         let mut cursor = descendant;
@@ -168,6 +190,21 @@ impl<'a> Tree<'a> {
         id: i64,
         max_depth: Option<u32>,
     ) -> Result<Vec<SubtreeNode>, StorageError> {
+        // The fast path: an engine carrying the recursive-CTE capability
+        // answers the whole sweep in one query, scope and tenant enforced
+        // inside the CTE. The composition below stays the baseline — the
+        // capability's answers must match it exactly, which the engine
+        // suites pin.
+        if let Some(fast) = self.repo.recursive_cte() {
+            return fast
+                .descendants(ctx, self.parent_column, id, max_depth)
+                .await
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|(record, depth)| SubtreeNode { depth, record })
+                        .collect()
+                });
+        }
         let mut found: Vec<SubtreeNode> = Vec::new();
         let mut visited: BTreeSet<i64> = BTreeSet::new();
         visited.insert(id);

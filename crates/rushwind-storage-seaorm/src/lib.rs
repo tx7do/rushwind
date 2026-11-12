@@ -31,7 +31,7 @@ use sea_orm::{
 
 use rushwind_storage::{
     AuditAction, AuditEntry, ColumnKind, FieldMask, FilterExpr, ListQuery, Page, Paging, QueryCtx,
-    Record, RepoFuture, Repository, Schema, Scope, StorageError, Value, Viewer,
+    Record, RecursiveCte, RepoFuture, Repository, Schema, Scope, StorageError, Value, Viewer,
 };
 
 /// A [`Repository`] backed by a SeaORM connection pool.
@@ -819,6 +819,10 @@ impl Repository for SeaRepo {
         &self.schema
     }
 
+    fn recursive_cte(&self) -> Option<&dyn RecursiveCte> {
+        Some(self)
+    }
+
     fn get(&self, ctx: QueryCtx, id: Value) -> RepoFuture<'_, Option<Record>> {
         Box::pin(async move { self.get_async(&ctx, id).await })
     }
@@ -856,6 +860,7 @@ mod condition;
 #[cfg(test)]
 mod sql_snapshots;
 mod statements;
+mod tree;
 
 use condition::{bind, expect_id, translate, ScopeSql, TenantSql};
 use statements::{create_table_statement, list_select};

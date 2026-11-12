@@ -277,3 +277,21 @@ fn iexact_lowers_the_column() {
         r#"SELECT "id" FROM "widgets" WHERE LOWER("name") = ? ORDER BY "id" ASC LIMIT ? OFFSET ?"#
     );
 }
+
+#[test]
+fn the_tree_fast_path_renders_the_recursive_cte() {
+    use crate::tree::descendants_statement;
+
+    let mut schema = schema();
+    schema.columns.push(rushwind_storage::Column {
+        name: "parent_id".into(),
+        kind: rushwind_storage::ColumnKind::Int,
+    });
+    let predicate = sea_orm::sea_query::Condition::all();
+    let select = descendants_statement(&schema, "parent_id", 7, None, 5, &predicate);
+    let (sqlite, _) = render(&select, DbBackend::Sqlite);
+    assert_eq!(
+        sqlite,
+        r#"WITH RECURSIVE "rushwind_tree" ("id", "depth") AS (SELECT "id", ? FROM "widgets" WHERE "id" = ? UNION ALL SELECT "widgets"."id", "rushwind_tree"."depth" + ? FROM "widgets" INNER JOIN "rushwind_tree" ON "widgets"."parent_id" = "rushwind_tree"."id" WHERE "rushwind_tree"."depth" < ?) SELECT "widgets"."id", "widgets"."name", "widgets"."age", "widgets"."score", "widgets"."owner_id", "widgets"."unit_id", "widgets"."parent_id", "rushwind_tree"."depth" AS "rushwind_depth" FROM "widgets" INNER JOIN "rushwind_tree" ON "widgets"."id" = "rushwind_tree"."id" WHERE "widgets"."id" <> ? ORDER BY "rushwind_tree"."depth" ASC, "widgets"."id" ASC"#
+    );
+}

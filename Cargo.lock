@@ -7736,6 +7736,7 @@ name = "rushwind-storage-seaorm"
 version = "0.0.1"
 dependencies = [
  "rushwind-storage",
+ "rushwind-storage-tree",
  "rushwind-testkit",
  "sea-orm",
  "tokio",

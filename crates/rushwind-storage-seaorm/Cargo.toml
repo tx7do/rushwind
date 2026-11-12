@@ -20,5 +20,6 @@ sea-orm = { workspace = true }
 live = []
 
 [dev-dependencies]
+rushwind-storage-tree = { workspace = true }
 rushwind-testkit = { workspace = true, features = ["storage"] }
 tokio = { workspace = true, features = ["macros", "rt"] }

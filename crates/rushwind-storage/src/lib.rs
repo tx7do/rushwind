@@ -58,6 +58,7 @@ pub mod repository;
 pub mod schema;
 pub mod sorting;
 mod syntax;
+pub mod tree_path;
 pub mod value;
 pub mod viewer;
 
@@ -71,5 +72,6 @@ pub use record::{FromRecord, Record, ToRecord};
 pub use repository::{ListQuery, RepoFuture, Repository};
 pub use schema::{Column, ColumnKind, Schema};
 pub use sorting::{Sort, SortDir, SortField};
+pub use tree_path::RecursiveCte;
 pub use value::Value;
 pub use viewer::{DataRange, Scope, Tenancy, TenancyDecision, Viewer};

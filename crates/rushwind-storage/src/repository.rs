@@ -11,6 +11,7 @@ use crate::paging::{Page, Paging};
 use crate::record::Record;
 use crate::schema::Schema;
 use crate::sorting::Sort;
+use crate::tree_path::RecursiveCte;
 use crate::value::Value;
 
 /// The future type returned by [`Repository`] methods.
@@ -139,4 +140,17 @@ pub trait Repository: Send + Sync {
     /// Deletes one row by primary key; missing or out-of-scope rows yield
     /// [`StorageError::NotFound`].
     fn delete(&self, ctx: QueryCtx, id: Value) -> RepoFuture<'_, ()>;
+
+    /// The optional recursive-CTE fast path for tree traversals (see
+    /// [`RecursiveCte`]); the tree layer probes it and falls back to
+    /// its contract-level composition when absent. Defaults to `None`.
+    ///
+    /// A **decorator must keep the default**: a forwarded fast path
+    /// would answer queries the decorator never saw — soft-delete's
+    /// tombstone filter and the cache's scope-keyed entries only
+    /// apply on the paths that pass through the decorator. Only bare
+    /// engines override this.
+    fn recursive_cte(&self) -> Option<&dyn RecursiveCte> {
+        None
+    }
 }
