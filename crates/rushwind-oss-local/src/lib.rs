@@ -13,7 +13,18 @@
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 
-use rushwind_oss::{ListedObject, ObjectStorage, PresignMethod, StorageError};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rushwind_oss::{ListedObject, MultipartUploadId, ObjectStorage, PresignMethod, StorageError};
+
+/// The staging directory multipart uploads write their parts into,
+/// under the bucket root.
+const MULTIPART_DIR: &str = ".rushwind-multipart";
+
+/// The counter backing the multipart upload id mint — nanos alone can
+/// collide across two begins within the same nanosecond on coarse
+/// clocks.
+static MULTIPART_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The local-disk engine for one bucket: objects land under `root`.
 pub struct LocalStorage {
@@ -49,6 +60,50 @@ impl LocalStorage {
             )));
         }
         Ok(self.root.join(relative))
+    }
+
+    /// The staging directory of an upload id, guarded: minted ids are
+    /// plain names, so anything carrying a separator or a `..` is not a
+    /// handle this engine minted — `NotFound`, without ever resolving
+    /// the path.
+    fn multipart_dir(&self, id: &str) -> Result<PathBuf, StorageError> {
+        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+            return Err(StorageError::NotFound);
+        }
+        Ok(self.root.join(MULTIPART_DIR).join(id))
+    }
+
+    /// Validates a multipart part number against S3's 1..=10000 bound —
+    /// the same rule every engine speaks.
+    fn validate_part_number(part_number: usize) -> Result<(), StorageError> {
+        if (1..=10000).contains(&part_number) {
+            Ok(())
+        } else {
+            Err(StorageError::InvalidPart(format!(
+                "part number {part_number} is outside 1..=10000"
+            )))
+        }
+    }
+
+    /// The complete face's shape rule: non-empty, ascending part
+    /// numbers contiguous from 1 — the assembly order and the
+    /// numbering rule in one check.
+    fn validate_parts_shape(parts: &[(usize, String)]) -> Result<(), StorageError> {
+        if parts.is_empty() {
+            return Err(StorageError::InvalidPart(
+                "complete needs at least one part".to_string(),
+            ));
+        }
+        let contiguous = parts
+            .iter()
+            .enumerate()
+            .all(|(index, (number, _))| *number == index + 1);
+        if !contiguous {
+            return Err(StorageError::InvalidPart(
+                "parts must be numbered contiguously from 1 in ascending order".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -167,5 +222,128 @@ impl ObjectStorage for LocalStorage {
         // A `file://` path carries no signature: there is no authority
         // vouching for the grant, so the honest answer is refusal.
         Err(StorageError::Unsupported)
+    }
+
+    fn multipart_begin<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> rushwind_oss::BoxFuture<'a, Result<MultipartUploadId, StorageError>> {
+        Box::pin(async move {
+            self.resolve(key)?;
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let counter = MULTIPART_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let id = format!("mp-{nanos}-{counter}");
+            let staging = self.multipart_dir(&id)?;
+            tokio::fs::create_dir_all(&staging)
+                .await
+                .map_err(|e| StorageError::Failed(format!("storage multipart mkdir: {e}")))?;
+            Ok(MultipartUploadId(id))
+        })
+    }
+
+    fn multipart_put<'a>(
+        &'a self,
+        key: &'a str,
+        upload: &'a MultipartUploadId,
+        part_number: usize,
+        body: &'a [u8],
+    ) -> rushwind_oss::BoxFuture<'a, Result<String, StorageError>> {
+        Box::pin(async move {
+            self.resolve(key)?;
+            Self::validate_part_number(part_number)?;
+            if body.is_empty() {
+                return Err(StorageError::EmptyObjectBody);
+            }
+            let staging = self.multipart_dir(&upload.0)?;
+            let part_path = staging.join(part_number.to_string());
+            if !staging.exists() {
+                return Err(StorageError::NotFound);
+            }
+            tokio::fs::write(&part_path, body)
+                .await
+                .map_err(|e| StorageError::Failed(format!("storage multipart write: {e}")))?;
+            // The part token is the byte size: completion verifies the
+            // staged part still matches what was uploaded.
+            Ok(body.len().to_string())
+        })
+    }
+
+    fn multipart_complete<'a>(
+        &'a self,
+        key: &'a str,
+        upload: &'a MultipartUploadId,
+        parts: &'a [(usize, String)],
+    ) -> rushwind_oss::BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move {
+            let path = self.resolve(key)?;
+            Self::validate_parts_shape(parts)?;
+            let staging = self.multipart_dir(&upload.0)?;
+            if !staging.exists() {
+                return Err(StorageError::NotFound);
+            }
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| StorageError::Failed(format!("storage multipart mkdir: {e}")))?;
+            }
+            // Assembly streams part by part: memory holds one part at a
+            // time, not the object.
+            let mut object = tokio::fs::File::create(&path)
+                .await
+                .map_err(|e| StorageError::Failed(format!("storage multipart create: {e}")))?;
+            use tokio::io::AsyncWriteExt;
+            for (part_number, token) in parts {
+                let part_path = staging.join(part_number.to_string());
+                let bytes = tokio::fs::read(&part_path)
+                    .await
+                    .map_err(|e| match e.kind() {
+                        std::io::ErrorKind::NotFound => StorageError::NotFound,
+                        _ => StorageError::Failed(format!("storage multipart read: {e}")),
+                    })?;
+                let expected = token.parse::<u64>().map_err(|_| {
+                    StorageError::Failed(format!(
+                        "storage multipart: part {part_number} carries an unrecognizable token"
+                    ))
+                })?;
+                if bytes.len() as u64 != expected {
+                    return Err(StorageError::Failed(format!(
+                        "storage multipart: part {part_number} no longer matches its token"
+                    )));
+                }
+                object
+                    .write_all(&bytes)
+                    .await
+                    .map_err(|e| StorageError::Failed(format!("storage multipart write: {e}")))?;
+            }
+            object
+                .flush()
+                .await
+                .map_err(|e| StorageError::Failed(format!("storage multipart flush: {e}")))?;
+            tokio::fs::remove_dir_all(&staging)
+                .await
+                .map_err(|e| StorageError::Failed(format!("storage multipart cleanup: {e}")))?;
+            Ok(())
+        })
+    }
+
+    fn multipart_abort<'a>(
+        &'a self,
+        key: &'a str,
+        upload: &'a MultipartUploadId,
+    ) -> rushwind_oss::BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move {
+            self.resolve(key)?;
+            let staging = self.multipart_dir(&upload.0)?;
+            match tokio::fs::remove_dir_all(&staging).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
+                Err(e) => Err(StorageError::Failed(format!(
+                    "storage multipart abort: {e}"
+                ))),
+            }
+        })
     }
 }

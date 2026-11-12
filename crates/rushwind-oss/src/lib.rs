@@ -1,5 +1,8 @@
 //! Object storage contract for RushWind: put/get/delete/list of byte
-//! objects in an S3-compatible bucket, plus presigned direct access.
+//! objects in an S3-compatible bucket, presigned direct access, and
+//! the multipart upload face (begin/put/complete/abort — parts stage
+//! invisibly, completion assembles in part-number order, abort
+//! discards).
 //!
 //! # The core shapes
 //!
@@ -61,6 +64,9 @@ pub enum StorageError {
     /// A presign expiry of zero was requested — the URL would be dead
     /// at birth.
     InvalidExpiry,
+    /// A multipart part is malformed: a part number outside 1..=10000,
+    /// a complete call without parts or with a gap in the numbering.
+    InvalidPart(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -74,6 +80,7 @@ impl std::fmt::Display for StorageError {
             Self::Unsupported => write!(f, "oss: operation unsupported by this engine"),
             Self::InvalidLimit => write!(f, "oss: list limit must be greater than zero"),
             Self::InvalidExpiry => write!(f, "oss: presign expiry must be greater than zero"),
+            Self::InvalidPart(msg) => write!(f, "oss: invalid multipart part: {msg}"),
         }
     }
 }
@@ -104,6 +111,15 @@ pub struct StorageConfig {
     /// The bucket every operation targets.
     pub bucket: String,
 }
+
+/// The handle of an in-flight multipart upload, minted by the engine
+/// at [`ObjectStorage::multipart_begin`] and echoed to every multipart
+/// call. Opaque: the engine owns whatever state the id names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartUploadId(
+    /// The engine's opaque upload identifier.
+    pub String,
+);
 
 /// One entry of a [`ObjectStorage::list`] page: the key and the byte
 /// size. Keys come back in ascending byte order — the S3 list order —
@@ -181,4 +197,54 @@ pub trait ObjectStorage: Send + Sync {
     fn health_check(&self) -> BoxFuture<'_, Result<(), StorageError>> {
         Box::pin(async move { Ok(()) })
     }
+
+    /// Opens a multipart upload for `key`: the engine mints an opaque
+    /// [`MultipartUploadId`]; parts stream through
+    /// [`ObjectStorage::multipart_put`] until
+    /// [`ObjectStorage::multipart_complete`] assembles the object or
+    /// [`ObjectStorage::multipart_abort`] discards them. Nothing is
+    /// visible to `get`/`list` until completion — an in-flight upload
+    /// is not an object.
+    fn multipart_begin<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<MultipartUploadId, StorageError>>;
+
+    /// Uploads one part of an in-flight upload. Part numbers live in
+    /// 1..=10000 (S3's own bound); an empty body is
+    /// [`StorageError::EmptyObjectBody`] and an out-of-range or
+    /// unknown-upload request is refused. The returned part token (on
+    /// S3, the part's ETag) is opaque — echo it back, unchanged, in
+    /// [`ObjectStorage::multipart_complete`].
+    fn multipart_put<'a>(
+        &'a self,
+        key: &'a str,
+        upload: &'a MultipartUploadId,
+        part_number: usize,
+        body: &'a [u8],
+    ) -> BoxFuture<'a, Result<String, StorageError>>;
+
+    /// Assembles the object from the listed parts, ascending part
+    /// numbers, contiguous from 1 — every token exactly as
+    /// [`ObjectStorage::multipart_put`] returned it. Parts assemble in
+    /// the listed order; an empty part list or a gap in the numbering
+    /// is [`StorageError::InvalidPart`], a token that no longer
+    /// matches its part is [`StorageError::Failed`], an unknown
+    /// upload is [`StorageError::NotFound`]. On success the object
+    /// reads as one body and the upload is closed.
+    fn multipart_complete<'a>(
+        &'a self,
+        key: &'a str,
+        upload: &'a MultipartUploadId,
+        parts: &'a [(usize, String)],
+    ) -> BoxFuture<'a, Result<(), StorageError>>;
+
+    /// Discards an in-flight upload: every uploaded part is dropped
+    /// and the object is never created. A missing upload is
+    /// [`StorageError::NotFound`].
+    fn multipart_abort<'a>(
+        &'a self,
+        key: &'a str,
+        upload: &'a MultipartUploadId,
+    ) -> BoxFuture<'a, Result<(), StorageError>>;
 }

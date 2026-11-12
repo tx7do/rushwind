@@ -228,7 +228,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 |:---|:---|
 | `crates/rushwind-ai` | AI 模型契约：chat 补全 + 流式（含拼装完整的工具调用事件）+ embeddings 三面 trait |
 | `crates/rushwind-ai-openai` | OpenAI 兼容引擎：reqwest 上的 chat / 流式 / embeddings，通吃 OpenAI、Qwen、Ollama |
-| `crates/rushwind-oss` | 对象存储契约：S3 兼容存储上的 put/get/delete/list 与 presign（presign 仅签名权威引擎可用，缺省 Unsupported） |
+| `crates/rushwind-oss` | 对象存储契约：S3 兼容存储上的 put/get/delete/list 与 presign，外加 multipart 上传四面（begin/put/complete/abort，部分号 1..=10000、连续组装；presign 仅签名权威引擎可用，缺省 Unsupported） |
 | `crates/rushwind-oss-s3` | S3 引擎：reqwest 上的 SigV4 签名 REST，覆盖 AWS S3 与 MinIO |
 | `crates/rushwind-oss-local` | 本地盘引擎：每 bucket 一实例、目录随 put 物化、缺失读 NotFound、删除幂等、键穿越拒绝 |
 

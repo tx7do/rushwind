@@ -190,3 +190,147 @@ async fn presign_is_unsupported_on_local_disk() {
         "a file path carries no signature authority: the honest answer is Unsupported"
     );
 }
+
+#[tokio::test]
+async fn multipart_lifecycle_assembles_in_part_order() {
+    let scratch = Scratch::new("multipart");
+    let store = LocalStorage::new(scratch.path().to_path_buf());
+
+    let upload = store.multipart_begin("uploads/big.bin").await.unwrap();
+    // Parts arrive out of order on purpose: the assembly is by part
+    // number, not arrival.
+    let token_three = store
+        .multipart_put("uploads/big.bin", &upload, 3, b"tail".as_slice())
+        .await
+        .unwrap();
+    let token_one = store
+        .multipart_put("uploads/big.bin", &upload, 1, b"head".as_slice())
+        .await
+        .unwrap();
+    let token_two = store
+        .multipart_put("uploads/big.bin", &upload, 2, b"-".as_slice())
+        .await
+        .unwrap();
+
+    let tokens = vec![(1usize, token_one), (2, token_two), (3, token_three)];
+    store
+        .multipart_complete("uploads/big.bin", &upload, &tokens)
+        .await
+        .expect("complete assembles");
+
+    assert_eq!(
+        store.get("uploads/big.bin").await.unwrap(),
+        b"head-tail".to_vec(),
+        "the parts concatenate by part number"
+    );
+    // The staging directory is gone: completion closes the upload.
+    assert!(
+        store
+            .multipart_complete("uploads/big.bin", &upload, &tokens)
+            .await
+            .is_err(),
+        "a completed upload is closed"
+    );
+}
+
+#[tokio::test]
+async fn multipart_abort_discards_everything() {
+    let scratch = Scratch::new("multipart-abort");
+    let store = LocalStorage::new(scratch.path().to_path_buf());
+
+    let upload = store
+        .multipart_begin("uploads/abandoned.bin")
+        .await
+        .unwrap();
+    store
+        .multipart_put("uploads/abandoned.bin", &upload, 1, b"junk".as_slice())
+        .await
+        .unwrap();
+    store
+        .multipart_abort("uploads/abandoned.bin", &upload)
+        .await
+        .expect("abort discards");
+
+    // The object never existed; the upload is gone.
+    assert!(store.get("uploads/abandoned.bin").await.is_err());
+    assert!(store
+        .multipart_put("uploads/abandoned.bin", &upload, 1, b"x".as_slice())
+        .await
+        .is_err());
+    assert!(
+        store
+            .multipart_abort("uploads/abandoned.bin", &upload)
+            .await
+            .is_err(),
+        "a second abort reads as NotFound"
+    );
+}
+
+#[tokio::test]
+async fn multipart_refusals_are_typed() {
+    let scratch = Scratch::new("multipart-refusals");
+    let store = LocalStorage::new(scratch.path().to_path_buf());
+
+    // Part numbers live in 1..=10000.
+    let upload = store.multipart_begin("k").await.unwrap();
+    for bad in [0usize, 10001] {
+        let err = store
+            .multipart_put("k", &upload, bad, b"x".as_slice())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rushwind_oss::StorageError::InvalidPart(ref m) if m.contains(&bad.to_string())),
+            "{bad}: {err:?}"
+        );
+    }
+    // An empty part body is the EmptyObjectBody refusal, same as put.
+    let err = store.multipart_put("k", &upload, 1, &[]).await.unwrap_err();
+    assert!(matches!(err, rushwind_oss::StorageError::EmptyObjectBody));
+
+    store
+        .multipart_put("k", &upload, 1, b"real".as_slice())
+        .await
+        .unwrap();
+
+    // Complete demands the parts back: none, or a gap, refuses.
+    for bad_parts in [
+        vec![],
+        vec![(1usize, "4".to_string()), (3usize, "0".to_string())],
+    ] {
+        let err = store
+            .multipart_complete("k", &upload, &bad_parts)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rushwind_oss::StorageError::InvalidPart(_)),
+            "{err:?}"
+        );
+    }
+
+    // A token that no longer matches the staged part refuses at
+    // completion — the assembly verifies what it assembles.
+    let err = store
+        .multipart_complete("k", &upload, &[(1usize, "999".to_string())])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, rushwind_oss::StorageError::Failed(ref m) if m.contains("token")),
+        "{err:?}"
+    );
+
+    // Unknown uploads read as NotFound — including a hostile id that
+    // tries to escape the staging directory.
+    let stranger = rushwind_oss::MultipartUploadId("no-such-upload".to_string());
+    assert!(store
+        .multipart_put("k", &stranger, 1, b"x".as_slice())
+        .await
+        .is_err());
+    let escape = rushwind_oss::MultipartUploadId("../../escape".to_string());
+    assert!(
+        store
+            .multipart_put("k", &escape, 1, b"x".as_slice())
+            .await
+            .is_err(),
+        "a traversal-shaped id never resolves"
+    );
+}

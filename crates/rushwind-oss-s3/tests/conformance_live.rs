@@ -217,3 +217,89 @@ async fn presigned_get_is_executable_without_credentials() {
         .await
         .expect("cleanup delete");
 }
+
+/// The multipart face against a real MinIO: begin, two parts (the
+/// first sized like a real non-final part), complete, and the object
+/// reads back as the concatenated whole. Then the abort face: begin,
+/// put, abort, and the object never existed.
+#[tokio::test]
+async fn multipart_lifecycle_assembles_and_aborts() {
+    let storage = S3Storage::new(config()).expect("storage builds");
+    storage.create_bucket().await.expect("bucket setup");
+
+    // A non-final part carries the 5 MiB minimum AWS's protocol asks of
+    // every part but the last.
+    let big = vec![b'a'; 5 * 1024 * 1024];
+    let tail = b"tail".to_vec();
+
+    let upload = storage
+        .multipart_begin("probe/multipart.bin")
+        .await
+        .expect("begin mints an upload");
+    let first = storage
+        .multipart_put("probe/multipart.bin", &upload, 1, &big)
+        .await
+        .expect("part 1 lands");
+    let second = storage
+        .multipart_put("probe/multipart.bin", &upload, 2, &tail)
+        .await
+        .expect("part 2 lands");
+    assert!(
+        !first.is_empty() && !second.is_empty(),
+        "both parts carry tokens"
+    );
+    assert_ne!(first, second, "distinct parts carry distinct tokens");
+
+    let tokens = vec![(1usize, first), (2usize, second)];
+    storage
+        .multipart_complete("probe/multipart.bin", &upload, &tokens)
+        .await
+        .expect("complete assembles");
+
+    let mut expected = big.clone();
+    expected.extend_from_slice(&tail);
+    let fetched = storage
+        .get("probe/multipart.bin")
+        .await
+        .expect("object reads");
+    assert_eq!(
+        fetched.len(),
+        expected.len(),
+        "the assembled object is whole"
+    );
+    assert!(fetched.starts_with(&big), "part 1 rides first");
+    assert!(fetched.ends_with(&tail), "part 2 closes the object");
+
+    storage
+        .delete("probe/multipart.bin")
+        .await
+        .expect("cleanup delete");
+
+    // The abort face: an in-flight upload leaves nothing behind.
+    let upload = storage
+        .multipart_begin("probe/abandoned.bin")
+        .await
+        .expect("begin mints an upload");
+    storage
+        .multipart_put("probe/abandoned.bin", &upload, 1, b"junk".as_slice())
+        .await
+        .expect("part lands");
+    storage
+        .multipart_abort("probe/abandoned.bin", &upload)
+        .await
+        .expect("abort discards");
+    assert!(
+        matches!(
+            storage.get("probe/abandoned.bin").await,
+            Err(rushwind_oss::StorageError::NotFound)
+        ),
+        "an aborted upload never created the object"
+    );
+    assert!(
+        storage
+            .multipart_put("probe/abandoned.bin", &upload, 1, b"x".as_slice())
+            .await
+            .is_err(),
+        "parts on an aborted upload refuse"
+    );
+}

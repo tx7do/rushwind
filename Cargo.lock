@@ -7286,6 +7286,7 @@ dependencies = [
 name = "rushwind-oss-s3"
 version = "0.0.1"
 dependencies = [
+ "futures",
  "reqwest 0.12.28",
  "rushwind-oss",
  "rushwind-transport",

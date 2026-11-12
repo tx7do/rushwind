@@ -27,8 +27,12 @@
 use std::time::Duration;
 
 use rushwind_oss::BoxFuture;
-use rushwind_oss::{ListedObject, ObjectStorage, PresignMethod, StorageConfig, StorageError};
-use rusty_s3::actions::ListObjectsV2;
+use rushwind_oss::{
+    ListedObject, MultipartUploadId, ObjectStorage, PresignMethod, StorageConfig, StorageError,
+};
+use rusty_s3::actions::{
+    AbortMultipartUpload, CompleteMultipartUpload, CreateMultipartUpload, ListObjectsV2, UploadPart,
+};
 use rusty_s3::{Bucket, Credentials};
 use rusty_s3::{S3Action, UrlStyle};
 
@@ -128,6 +132,36 @@ impl S3Storage {
 
     /// S3's own hard cap on a single list page.
     const MAX_LIST_PAGE: usize = 1000;
+
+    /// Validates a multipart part number against S3's 1..=10000 bound.
+    fn validate_part_number(part_number: usize) -> Result<u16, StorageError> {
+        u16::try_from(part_number)
+            .ok()
+            .filter(|part| (1..=10000).contains(part))
+            .ok_or_else(|| {
+                StorageError::InvalidPart(format!("part number {part_number} is outside 1..=10000"))
+            })
+    }
+
+    /// The complete face's tokens: ascending part numbers, contiguous
+    /// from 1 — the assembly order and the numbering rule in one check.
+    fn ordered_part_tokens(parts: &[(usize, String)]) -> Result<Vec<String>, StorageError> {
+        if parts.is_empty() {
+            return Err(StorageError::InvalidPart(
+                "complete needs at least one part".to_string(),
+            ));
+        }
+        let contiguous = parts
+            .iter()
+            .enumerate()
+            .all(|(index, (number, _))| *number == index + 1);
+        if !contiguous {
+            return Err(StorageError::InvalidPart(
+                "parts must be numbered contiguously from 1 in ascending order".to_string(),
+            ));
+        }
+        Ok(parts.iter().map(|(_, token)| token.clone()).collect())
+    }
 }
 
 impl ObjectStorage for S3Storage {
@@ -302,6 +336,169 @@ impl ObjectStorage for S3Storage {
                 .sign(expires),
         };
         Ok(url.to_string())
+    }
+
+    fn multipart_begin<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<MultipartUploadId, StorageError>> {
+        Box::pin(async move {
+            Self::validate_key(key)?;
+            let action =
+                CreateMultipartUpload::new(&self.inner.bucket, Some(&self.inner.credentials), key);
+            let url = action.sign(SIGNATURE_VALIDITY);
+            let response = self
+                .inner
+                .http
+                .post(url)
+                .send()
+                .await
+                .map_err(|e| StorageError::Failed(format!("s3 multipart begin {key}: {e}")))?;
+            if !response.status().is_success() {
+                return Err(StorageError::Failed(format!(
+                    "s3 multipart begin {key}: HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            let text = response
+                .text()
+                .await
+                .map_err(|e| StorageError::Failed(format!("s3 multipart begin {key}: {e}")))?;
+            let parsed = CreateMultipartUpload::parse_response(&text)
+                .map_err(|e| StorageError::Failed(format!("s3 multipart parse: {e}")))?;
+            Ok(MultipartUploadId(parsed.upload_id().to_string()))
+        })
+    }
+
+    fn multipart_put<'a>(
+        &'a self,
+        key: &'a str,
+        upload: &'a MultipartUploadId,
+        part_number: usize,
+        body: &'a [u8],
+    ) -> BoxFuture<'a, Result<String, StorageError>> {
+        Box::pin(async move {
+            Self::validate_key(key)?;
+            let part = Self::validate_part_number(part_number)?;
+            if body.is_empty() {
+                return Err(StorageError::EmptyObjectBody);
+            }
+            let action = UploadPart::new(
+                &self.inner.bucket,
+                Some(&self.inner.credentials),
+                key,
+                part,
+                &upload.0,
+            );
+            let url = action.sign(SIGNATURE_VALIDITY);
+            let response = self
+                .inner
+                .http
+                .put(url)
+                .body(body.to_vec())
+                .send()
+                .await
+                .map_err(|e| StorageError::Failed(format!("s3 multipart put {key}/{part}: {e}")))?;
+            if response.status().as_u16() == 404 {
+                return Err(StorageError::NotFound);
+            }
+            if !response.status().is_success() {
+                return Err(StorageError::Failed(format!(
+                    "s3 multipart put {key}/{part}: HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            // The part's token is S3's ETag; the quotes ride the wire and
+            // come off here so the caller echoes a bare token.
+            let etag = response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim_matches('"').to_string())
+                .ok_or_else(|| {
+                    StorageError::Failed(format!(
+                        "s3 multipart put {key}/{part}: no ETag on the response"
+                    ))
+                })?;
+            Ok(etag)
+        })
+    }
+
+    fn multipart_complete<'a>(
+        &'a self,
+        key: &'a str,
+        upload: &'a MultipartUploadId,
+        parts: &'a [(usize, String)],
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move {
+            Self::validate_key(key)?;
+            let etags = Self::ordered_part_tokens(parts)?;
+            let action = CompleteMultipartUpload::new(
+                &self.inner.bucket,
+                Some(&self.inner.credentials),
+                key,
+                &upload.0,
+                etags.iter().map(String::as_str),
+            );
+            let url = action.sign(SIGNATURE_VALIDITY);
+            let response = self
+                .inner
+                .http
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/xml")
+                .body(action.body())
+                .send()
+                .await
+                .map_err(|e| StorageError::Failed(format!("s3 multipart complete {key}: {e}")))?;
+            if response.status().as_u16() == 404 {
+                return Err(StorageError::NotFound);
+            }
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| String::from("<unreadable body>"));
+                return Err(StorageError::Failed(format!(
+                    "s3 multipart complete {key}: HTTP {status}: {body}"
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    fn multipart_abort<'a>(
+        &'a self,
+        key: &'a str,
+        upload: &'a MultipartUploadId,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move {
+            Self::validate_key(key)?;
+            let action = AbortMultipartUpload::new(
+                &self.inner.bucket,
+                Some(&self.inner.credentials),
+                key,
+                &upload.0,
+            );
+            let url = action.sign(SIGNATURE_VALIDITY);
+            let response = self
+                .inner
+                .http
+                .delete(url)
+                .send()
+                .await
+                .map_err(|e| StorageError::Failed(format!("s3 multipart abort {key}: {e}")))?;
+            if response.status().as_u16() == 404 {
+                return Err(StorageError::NotFound);
+            }
+            if !response.status().is_success() {
+                return Err(StorageError::Failed(format!(
+                    "s3 multipart abort {key}: HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            Ok(())
+        })
     }
 }
 

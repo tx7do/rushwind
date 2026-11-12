@@ -497,6 +497,39 @@ impl rushwind_oss::ObjectStorage for MockObjectStorage {
     > {
         Box::pin(async { Ok(Vec::new()) })
     }
+    fn multipart_begin<'a>(
+        &'a self,
+        _key: &'a str,
+    ) -> rushwind_oss::BoxFuture<
+        'a,
+        Result<rushwind_oss::MultipartUploadId, rushwind_oss::StorageError>,
+    > {
+        Box::pin(async { Ok(rushwind_oss::MultipartUploadId("mock".to_string())) })
+    }
+    fn multipart_put<'a>(
+        &'a self,
+        _key: &'a str,
+        _upload: &'a rushwind_oss::MultipartUploadId,
+        _part_number: usize,
+        _body: &'a [u8],
+    ) -> rushwind_oss::BoxFuture<'a, Result<String, rushwind_oss::StorageError>> {
+        Box::pin(async { Ok("0".to_string()) })
+    }
+    fn multipart_complete<'a>(
+        &'a self,
+        _key: &'a str,
+        _upload: &'a rushwind_oss::MultipartUploadId,
+        _parts: &'a [(usize, String)],
+    ) -> rushwind_oss::BoxFuture<'a, Result<(), rushwind_oss::StorageError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn multipart_abort<'a>(
+        &'a self,
+        _key: &'a str,
+        _upload: &'a rushwind_oss::MultipartUploadId,
+    ) -> rushwind_oss::BoxFuture<'a, Result<(), rushwind_oss::StorageError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// A config-source mock answering from a fixed map; one instance

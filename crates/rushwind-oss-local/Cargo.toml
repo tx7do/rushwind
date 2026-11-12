@@ -14,5 +14,5 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "io-util"] }
 rushwind-oss = { workspace = true }
