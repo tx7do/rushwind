@@ -32,6 +32,7 @@ rushwind-transport-webtransport = { path = "crates/rushwind-transport-webtranspo
 rushwind-transport-h3 = { path = "crates/rushwind-transport-h3", version = "0.0.1" }
 rushwind-transport-mqtt = { path = "crates/rushwind-transport-mqtt", version = "0.0.1" }
 rushwind-transport-cron = { path = "crates/rushwind-transport-cron", version = "0.0.1" }
+tonic = "0.14"
 rushwind-registry = { path = "crates/rushwind-registry", version = "0.0.1" }
 rushwind-registry-etcd = { path = "crates/rushwind-registry-etcd", version = "0.0.1" }
 rushwind-registry-consul = { path = "crates/rushwind-registry-consul", version = "0.0.1" }

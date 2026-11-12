@@ -7853,6 +7853,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-transport-grpc"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "futures",
+ "h2",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "rushwind-testkit",
+ "rushwind-transport",
+ "tokio",
+ "tonic",
+ "tower",
+]
+
+[[package]]
 name = "rushwind-transport-h3"
 version = "0.0.1"
 dependencies = [

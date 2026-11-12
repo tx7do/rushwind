@@ -6,6 +6,8 @@
 
 九项一次落地（各带单元/一致性测试，fmt/clippy -D warnings 全仓干净）：
 
+- **gRPC 传输**（`rushwind-transport-grpc`）：tonic 0.14 的 `Routes` 接进 `Server` 生命周期契约——监听器构造期急切绑定（bind 失败在注册点暴露、`:0` 经 `endpoint()` 回 `grpc://host:port` 的 OS 分配端口），`serve_with_incoming_shutdown` 的优雅排水随停机信号、排空在途 RPC 后按 axum 适配器同一条映射规则以 `Cancelled` 协作退出，`stop()` 为空（栈的排水全程承载）；crate 保持 corpus-free——自身不带 proto，部署经 proto-build 的 tonic generator（已在位）编译服务、覆写默认 Unimplemented stub、装配进 Routes。测试无 codegen：测试服务是手写的单方法 unary echo（tonic-build 生成形状的最小化），客户端是裸 h2 手工帧（每个分帧字节显式可见）——真实 RPC 字节精确往返、空消息帧、停机信号下在途 RPC 完成后排水到协作退出、共享生命周期一致性套件全过。
+- **vector 外部引擎第一块：qdrant**（`rushwind-vector-qdrant`）：REST API 手写 reqwest 无 SDK（house 的 S3/STOMP/Apollo 先例）；metric 契约对 qdrant"每命名向量固定 distance"现实的解法是按 metric 后缀的三份命名向量（`{field}__cosine/euclidean/dot`，服务端 top-k 对每个 metric 都正确，3× 存储代价写明；既有裸字段集合走单 metric 模式，跨 metric 查询拒绝而非静默重排）；维度纪律读服务端 collection info（无客户端影子状态）；自由字符串 id 经手写 SHA-1→UUID 形状确定性映射（参考向量钉死）+ payload 回带原 id（替换命中同一点、搜索可逆）；cosine 分数直通（qdrant 即返回相似度）、euclid 经 distance_to_score 转换；引擎侧排序带 id 升序平局决胜，与 memory 引擎逐位一致。共享一致性套件 + 6 个 wire 钉子全过。
 - **http-binding 二进制 proto 请求体解码**：`ResolvedCodec::Proto` 从透传改为 `DynamicMessage::decode` 真绑定，失败与其他 codec 同类回 400 `body unmarshal %s`（解码器自己的 prose）；空体仍跳过绑定（参考解码器的精确次序）。此前"需要二进制线格式的接口先别开"的告警解除。
 - **oss 契约扩面（list + presign）**：契约加 `list(prefix, after, limit)`（升序键 + 严格 after 游标 + limit 页；零 limit = `InvalidLimit`）与 `presign(key, method, expires)`（缺省实现 = `Unsupported`——只有签名权威引擎可覆写）。s3 引擎两件都实现（ListObjectsV2 + `encoding-type=url` + `start-after` + max-keys 钳 1000；presign 即引擎本就说着的 query-string 签名），oss-local 实现 list（目录遍历 + 平台分隔符归一）、presign 诚实拒绝（file:// 无签名权威）；live 套件补 list/presign 用例（含"无凭据客户端可执行 presigned GET"钉子）。
 - **ratelimit 引擎族 +2**：`rushwind-ratelimit-slidingwindow`（滑动窗口日志：任意滑动窗内至多 limit 次准入、边界精确无固定窗双预算缝、日志内存以 limit 为界）与 `rushwind-ratelimit-leakybucket`（漏桶整流：背漏恒速排出、空闲不攒额度——与令牌桶的突发语义相对），两者都带 `with_clock` 注入钟与 close-唤醒 waiter。
@@ -24,7 +26,7 @@ testkit 套件增量：storage 一致性套件增 iexact 钉子（折叠大小�
 不依赖上游三仓的独立功能面，六个模块一次落地（各带一致性/单元套件，fmt/clippy -D warnings 干净）：
 
 - **密码哈希域**（`rushwind-password` + argon2/bcrypt/scrypt/pbkdf2 四引擎）：PHC 自描述串，验证恒由存量哈希内嵌参数驱动（bcrypt 的 MCF 同理），`needs_rehash` 承担升级闭环；Ok(false)（错密码）与 Err(InvalidHash)（坏行）严格分面；argon2 0.5 实际未实现 `PasswordVerifier`（文档示例陈旧），四引擎统一走"解析→内嵌参数重导出→常数时间比较"骨架。bcrypt 的 72 字节截断是算法本身行为，文档与钉子测试都如实钉住。
-- **向量检索域**（`rushwind-vector` + memory 参考引擎）：移植 go-crud `vector` 模块语义——score 恒为越大越相似（余弦 `1−d`/L2 `1/(1+d)`/点积原值）、TopK 非分页、维度纪律（首个 upsert 定维、不一致拒绝）、pgvector 文本编解码、零向量 fail-neutral（余弦距离 1.0 而非 NaN）。契约零依赖（类型+纯函数）；外部引擎族（qdrant/milvus/weaviate/neo4j）仍按需立项，契约已可插拔。
+- **向量检索域**（`rushwind-vector` + memory 参考引擎；qdrant 外部引擎 2026-11-12 补齐，见下）：移植 go-crud `vector` 模块语义——score 恒为越大越相似（余弦 `1−d`/L2 `1/(1+d)`/点积原值）、TopK 非分页、维度纪律（首个 upsert 定维、不一致拒绝）、pgvector 文本编解码、零向量 fail-neutral（余弦距离 1.0 而非 NaN）。契约零依赖（类型+纯函数）；外部引擎族（qdrant/milvus/weaviate/neo4j）仍按需立项，契约已可插拔。
 - **分布式锁域**（`rushwind-lock` + memory/redis 引擎）：try-once 获取（等待是调用方重试策略，契约不隐藏活跃性问题）、所有权 token、TTL 强制（零 TTL 拒绝 InvalidTtl——liveness 全靠它）、属主校验的 release/extend（Ok(false) = 互斥已失效，绝不误删后继者的锁）。redis 引擎 = `SET NX PX` + token 比对 Lua；live 套件接进 CI broker 任务的 redis 容器，顺手把从未接线的 cache-redis live 套件也补上。
 - **config 编译期嵌入源**（`rushwind-config-embedded`）：`include_bytes!`/`include_str!` 喂静态键→字节树；不可 watch 是链接期事实的诚实答案。
 - **config/apollo 源**（`rushwind-config-apollo`）：手写 reqwest（house 的 S3/STOMP 手写先例）——configs REST 读（configurations 规范化为键序 JSON，404=缺席）+ notifications/v2 长轮询（304 窗口语义、长轮询超时=窗口+读超时、防即时应答服务器的热自旋 gap）；mock server 测试，无 SDK 依赖。
@@ -72,7 +74,7 @@ testkit 新增三个特性门控套件：`password`（8 测试：三分面验证
 
 | 域 | Rust crates | 状态 |
 |:---|:---|:---|
-| transport | rushwind-transport + axum/mqtt/quic/ws/webtransport/h3 | 完成（原有；webtransport/h3 后补） |
+| transport | rushwind-transport + axum/mqtt/quic/ws/webtransport/h3/grpc | 完成（原有；webtransport/h3 后补；grpc 2026-11-12 补齐——tonic Routes 接入生命周期，共享一致性套件全过） |
 | storage | rushwind-storage + 12 引擎 | 完成（原有） |
 | registry | rushwind-registry + 8 引擎 | 完成 |
 | security (authn/authz) | rushwind-authn(-*) / rushwind-authz(-*) | 完成 |
@@ -95,7 +97,7 @@ testkit 新增三个特性门控套件：`password`（8 测试：三分面验证
 | 域 | 推迟原因 |
 |:---|:---|
 | workflow | 契约仅 Client.Close + Worker.Stop/IsRunning；四个引擎（argo/conductor/goworkflows/temporal）都是重型外部系统的 SDK 适配器，各自独立成项 |
-| vector 外部引擎 | 契约 + memory 参考引擎已落地（2026-11-11）；qdrant/milvus/weaviate/neo4j 外部引擎仍按需立项，各自独立成项 |
+| vector 外部引擎 | 契约 + memory 参考引擎已落地（2026-11-11）；**qdrant 已落地（2026-11-12，REST 手写 reqwest + mock 套件，过共享一致性套件）**；milvus/weaviate/neo4j 仍按需立项，各自独立成项 |
 | pprof | pprof 是特定运行时的剖析机制，不跨运行时通用；Rust 生态对应物是 pprof-rs（Linux perf，本仓 CI 含 Windows 无法验证）与 tokio-console |
 | log | 独立日志门面包装；工作区标准是 `tracing`，重复封装无收益 |
 | ratelimit/sentinel | 无维护良好的 Rust SDK；直接阈值+拒绝规则可映射到 token-bucket 引擎 |

@@ -1,0 +1,27 @@
+[package]
+name = "rushwind-transport-grpc"
+description = "gRPC transport for the RushWind server lifecycle contract: a tonic (0.14) server serving caller-supplied Routes over an eagerly-bound listener, graceful drain riding the shutdown signal."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-transport = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "sync"] }
+
+[dev-dependencies]
+rushwind-testkit = { workspace = true }
+bytes = "1"
+futures = { workspace = true }
+h2 = "0.4"
+http-body = "1"
+http = "1"
+http-body-util = "0.1"
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }
+tower = { version = "0.5", features = ["util"] }

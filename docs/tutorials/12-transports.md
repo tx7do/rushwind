@@ -89,6 +89,20 @@ app.run(StopSignal::new()).await?;
 
 特性：**处理器串行执行是刻意的背压**（QoS 1 会在 broker 侧排队）；无限重连（退避 100ms→5s 封顶），每代连接重放全部订阅；通配符过滤永不匹配 `$` 开头的系统主题；每订阅可单独 `subscribe_with_qos_handler` 覆盖默认处理器。
 
+## gRPC：tonic 的 Routes 接进生命周期
+
+`rushwind-transport-grpc` 把 tonic 0.14 的 `Routes` 表接进 `Server` 契约——与 axum 适配器同一条映射规则（构造期急切绑定、排水在 start 里、`stop()` 为空）：
+
+```rust
+use rushwind_transport_grpc::GrpcServer;
+use tonic::service::Routes;
+
+// 服务面来自 proto-build 的 tonic generator：编译域 proto、覆写 stub、装配进 Routes。
+let server = GrpcServer::new("0.0.0.0:50051".parse()?, Routes::new(my_service))?;
+```
+
+crate 自身不带 proto（corpus-free）：生成器已在 `rushwind-proto-build` 里（`tonic` 特性），部署一行接线。端点回 `grpc://host:port`。
+
 ## cron：分钟对齐的定时服务器
 
 `rushwind-transport-cron` 把定时任务做成 `Server`，与 HTTP/QUIC 服务同生命周期：

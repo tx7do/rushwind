@@ -43,6 +43,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-transport-quic` | QUIC 适配器：quinn 接受循环接入生命周期，全套会话链；`stop()` 为真实释放（Endpoint::close） |
 | `crates/rushwind-transport-webtransport` | WebTransport 适配器：wtransport 端点接入生命周期，全套会话链（会话请求时刻的 HTTP 族门链、原子准入、握手截止），`stop()` 为真实释放 |
 | `crates/rushwind-transport-h3` | HTTP/3 适配器：h3/h3-quinn 请求服务接入生命周期，请求时刻门链（拒绝映射为状态响应）与连接级原子准入，`stop()` 为真实释放 |
+| `crates/rushwind-transport-grpc` | gRPC 传输：tonic 0.14 服务调用方提供的 `Routes`（proto-build 的 tonic generator 编译域服务，部署覆写 stub），监听器构造期急切绑定、优雅排水随停机信号，端点 `grpc://host:port` |
 | `crates/rushwind-transport-mqtt` | MQTT 消费桥：订阅外部 broker（每订阅 handler 注册 + 规范通配分发），重连退避 + 订阅重建，串行泵入 handler |
 | `crates/rushwind-transport-sse` | SSE 通知传输：`/events` 线契约（CORS 预检、三源 token、401 纯文本错误行、反跨用户流检查、按用户过滤广播流）+ 进程内 Hub + bootstrap 工厂，授权经 `Gate` trait 插拔 |
 
