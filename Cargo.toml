@@ -71,6 +71,7 @@ rushwind-config-consul = { path = "crates/rushwind-config-consul", version = "0.
 rushwind-config-embedded = { path = "crates/rushwind-config-embedded", version = "0.0.1" }
 rushwind-config-apollo = { path = "crates/rushwind-config-apollo", version = "0.0.1" }
 rushwind-config-nacos = { path = "crates/rushwind-config-nacos", version = "0.0.1" }
+rushwind-config-kubernetes = { path = "crates/rushwind-config-kubernetes", version = "0.0.1" }
 rushwind-broker-nats = { path = "crates/rushwind-broker-nats", version = "0.0.1" }
 rushwind-broker-rabbitmq = { path = "crates/rushwind-broker-rabbitmq", version = "0.0.1" }
 rushwind-broker-stomp = { path = "crates/rushwind-broker-stomp", version = "0.0.1" }

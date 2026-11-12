@@ -7036,6 +7036,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-config-kubernetes"
+version = "0.0.1"
+dependencies = [
+ "reqwest 0.12.28",
+ "rushwind-config",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-config-nacos"
 version = "0.0.1"
 dependencies = [

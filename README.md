@@ -123,6 +123,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-config-embedded` | 编译期嵌入源：`include_bytes!`/`include_str!` 喂进的静态键→字节树，零 I/O、不可 watch（链接期即定） |
 | `crates/rushwind-config-apollo` | Apollo 配置源：configs REST 读（canonical JSON、404=缺席）+ notifications/v2 长轮询 watch，手写 reqwest 无 SDK |
 | `crates/rushwind-config-nacos` | Nacos 配置源：v1 cs/configs REST 读（原文直传、404=缺席、可选 tenant/accessToken）+ 轮询 watch，手写 reqwest 无 SDK |
+| `crates/rushwind-config-kubernetes` | Kubernetes ConfigMap 配置源：v1 configmaps REST 读（canonical key-sorted JSON、404=缺席、可选 namespace/bearer token）+ 轮询 watch，手写 reqwest 无 SDK |
 
 ### 注册中心域
 
