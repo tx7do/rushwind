@@ -93,6 +93,7 @@ rushwind-authn-apikey = { path = "crates/rushwind-authn-apikey", version = "0.0.
 rushwind-authn-basicauth = { path = "crates/rushwind-authn-basicauth", version = "0.0.1" }
 rushwind-authn-hmac = { path = "crates/rushwind-authn-hmac", version = "0.0.1" }
 rushwind-authn-jwt = { path = "crates/rushwind-authn-jwt", version = "0.0.1" }
+rushwind-authn-oidc = { path = "crates/rushwind-authn-oidc", version = "0.0.1" }
 rushwind-authn-noop = { path = "crates/rushwind-authn-noop", version = "0.0.1" }
 rushwind-authn-presharedkey = { path = "crates/rushwind-authn-presharedkey", version = "0.0.1" }
 rushwind-authz = { path = "crates/rushwind-authz", version = "0.0.1" }

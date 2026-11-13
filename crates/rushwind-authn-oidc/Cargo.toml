@@ -1,0 +1,22 @@
+[package]
+name = "rushwind-authn-oidc"
+description = "OpenID Connect engine for the RushWind authentication contract: discovery + JWKS fetched over reqwest, verification local against the cached keys (sync, gate-chain eligible), refresh explicit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-authn = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }

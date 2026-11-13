@@ -60,7 +60,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::TryStreamExt;
-use rushwind_broker::{BoxFuture, Broker, BrokerError, Event, Handler, Message, Subscriber};
+use rushwind_broker::{
+    AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, NackAction, Subscriber,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -120,6 +122,8 @@ impl SubscriptionFlow {
 /// A Pulsar-backed broker over pulsar-rs.
 pub struct PulsarBroker {
     inner: Arc<Inner>,
+    /// The subscription acknowledgment policy (see [`AckMode`]).
+    ack_mode: AckMode,
 }
 
 /// The bootstrap factory's settings wire shape for
@@ -129,6 +133,8 @@ pub struct PulsarSettings {
     /// The Pulsar service URL (`pulsar://host:port`). Absent falls
     /// back to the default localhost service.
     pub addr: Option<String>,
+    /// The acknowledgment policy; absent reads as [`AckMode::Auto`].
+    pub ack_mode: Option<AckMode>,
 }
 
 /// Dials the Pulsar service and returns the client with its
@@ -160,6 +166,13 @@ impl PulsarBroker {
     /// `pulsar://127.0.0.1:6650`). An empty address falls back to
     /// the default localhost service.
     pub async fn connect(addr: &str) -> Result<Self, BrokerError> {
+        Self::with_ack_mode(addr, AckMode::Auto).await
+    }
+
+    /// Connects under an explicit acknowledgment policy —
+    /// [`AckMode::Manual`] routes the native ack/nack (by message id,
+    /// through the pump's settlement channel) to the handler's hooks.
+    pub async fn with_ack_mode(addr: &str, ack_mode: AckMode) -> Result<Self, BrokerError> {
         let addr = if addr.is_empty() { DEFAULT_ADDR } else { addr };
         let (client, producer) = establish(addr).await?;
         Ok(Self {
@@ -170,6 +183,7 @@ impl PulsarBroker {
                 connected: AtomicBool::new(true),
                 subscriptions: Mutex::new(HashMap::new()),
             }),
+            ack_mode,
         })
     }
 
@@ -179,7 +193,11 @@ impl PulsarBroker {
     pub async fn from_settings(settings: serde_json::Value) -> Result<Self, BrokerError> {
         let settings: PulsarSettings = serde_json::from_value(settings)
             .map_err(|e| BrokerError::Failed(format!("settings parse: {e}")))?;
-        Self::connect(settings.addr.as_deref().unwrap_or("")).await
+        Self::with_ack_mode(
+            settings.addr.as_deref().unwrap_or(""),
+            settings.ack_mode.unwrap_or_default(),
+        )
+        .await
     }
 }
 
@@ -303,6 +321,15 @@ impl Broker for PulsarBroker {
             });
             let task_done = flow.done.clone();
             let handler = Arc::clone(&handler);
+            // Manual mode's settlement channel: the consumer is `&mut
+            // self` on its ack/nack, so the pump stays its sole owner
+            // and the handlers' settle hooks ride commands back to it —
+            // no lock, no waiting on the consumer's receive path.
+            let (settle_tx, mut settle_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(pulsar::proto::MessageIdData, NackAction)>(
+                );
+            let ack_mode = self.ack_mode;
+            let record_topic = topic.to_string();
             let task = tokio::spawn(async move {
                 let mut consumer = consumer;
                 loop {
@@ -311,17 +338,77 @@ impl Broker for PulsarBroker {
                             let _ = consumer.close().await;
                             return;
                         }
+                        settle = settle_rx.recv() => match settle {
+                            Some((msg_id, action)) => {
+                                let outcome = match action {
+                                    NackAction::Requeue => {
+                                        consumer.nack_with_id(&record_topic, msg_id).await
+                                    }
+                                    NackAction::Drop => {
+                                        consumer.ack_with_id(&record_topic, msg_id).await
+                                    }
+                                };
+                                if let Err(e) = outcome {
+                                    // A failed settlement is the
+                                    // redelivery timer's business; the
+                                    // loop continues.
+                                    let _ = e;
+                                }
+                                continue;
+                            }
+                            None => {
+                                let _ = consumer.close().await;
+                                return;
+                            }
+                        },
                         delivery = consumer.try_next() => delivery,
                     };
                     match delivery {
-                        Ok(Some(record)) => {
-                            let event = to_event(&record);
-                            tokio::spawn(handler(event));
-                            // Auto-ack semantics:
-                            // every delivery is acknowledged once
-                            // dispatched.
-                            let _ = consumer.ack(&record).await;
-                        }
+                        Ok(Some(record)) => match ack_mode {
+                            AckMode::Auto => {
+                                let event = to_event(&record);
+                                tokio::spawn(handler(event));
+                                // Auto-ack semantics:
+                                // every delivery is acknowledged once
+                                // dispatched.
+                                let _ = consumer.ack(&record).await;
+                            }
+                            AckMode::Manual => {
+                                // Each hook owns its own sender/id copies —
+                                // the outer pair stays live for the rest of
+                                // the pump loop.
+                                let ack_tx = settle_tx.clone();
+                                let ack_id = record.message_id().clone();
+                                let nack_tx = settle_tx.clone();
+                                let nack_id = record.message_id().clone();
+                                let event = Event::settle_with(
+                                    record.topic.clone(),
+                                    to_event(&record).message().clone(),
+                                    move || {
+                                        Box::pin(async move {
+                                            // The success settle maps onto
+                                            // the Drop action: the pump
+                                            // routes Drop to the native
+                                            // ack — the message will not
+                                            // redeliver.
+                                            ack_tx.send((ack_id, NackAction::Drop)).map_err(|e| {
+                                                BrokerError::Failed(format!("pulsar settle: {e}"))
+                                            })
+                                        })
+                                            as BoxFuture<'static, Result<(), BrokerError>>
+                                    },
+                                    move |action| {
+                                        Box::pin(async move {
+                                            nack_tx.send((nack_id, action)).map_err(|e| {
+                                                BrokerError::Failed(format!("pulsar settle: {e}"))
+                                            })
+                                        })
+                                            as BoxFuture<'static, Result<(), BrokerError>>
+                                    },
+                                );
+                                tokio::spawn(handler(event));
+                            }
+                        },
                         Ok(None) | Err(_) => {
                             // The stream ended: closed consumer or an
                             // error. The pump ends with it.

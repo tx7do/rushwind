@@ -48,7 +48,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rushwind_broker::{BoxFuture, Broker, BrokerError, Event, Handler, Message, Subscriber};
+use rushwind_broker::{
+    AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, NackAction, Subscriber,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -78,12 +80,24 @@ pub struct StompBroker {
     shared: Arc<Shared>,
     /// Per-generation connection-task shutdown.
     shutdown: Mutex<Option<Arc<Notify>>>,
+    /// The subscription acknowledgment policy. `Manual` subscribes
+    /// with STOMP's `ack:client` mode and hands the native ACK/NACK
+    /// frames (keyed by the server's per-message ack id) to the
+    /// handler's hooks.
+    ack_mode: AckMode,
 }
 
 impl StompBroker {
     /// Connects to the STOMP listener at `addr` (`host:port`),
     /// anonymous (no login/passcode headers).
     pub fn new(addr: impl Into<String>) -> Self {
+        Self::with_ack_mode(addr, AckMode::Auto)
+    }
+
+    /// Connects under an explicit acknowledgment policy —
+    /// [`AckMode::Manual`] subscribes `ack:client` and routes the
+    /// server's ACK/NACK frames through the handler's hooks.
+    pub fn with_ack_mode(addr: impl Into<String>, ack_mode: AckMode) -> Self {
         Self {
             shared: Arc::new(Shared {
                 addr: addr.into(),
@@ -94,15 +108,19 @@ impl StompBroker {
                 generation: AtomicU64::new(0),
             }),
             shutdown: Mutex::new(None),
+            ack_mode,
         }
     }
 
     /// Constructs from the bootstrap factory's settings wire shape:
-    /// `addr` (required).
+    /// `addr` (required), `ack_mode` (optional).
     pub fn from_settings(settings: serde_json::Value) -> Result<Self, BrokerError> {
         let settings: StompSettings = serde_json::from_value(settings)
             .map_err(|e| BrokerError::Failed(format!("settings parse: {e}")))?;
-        Ok(Self::new(settings.addr))
+        Ok(Self::with_ack_mode(
+            settings.addr,
+            settings.ack_mode.unwrap_or_default(),
+        ))
     }
 }
 
@@ -112,6 +130,8 @@ impl StompBroker {
 pub struct StompSettings {
     /// The STOMP listener address as `host:port`.
     pub addr: String,
+    /// The acknowledgment policy; absent reads as [`AckMode::Auto`].
+    pub ack_mode: Option<AckMode>,
 }
 
 /// The in-memory queue depth for outbound frames. A publisher blocks
@@ -268,6 +288,7 @@ async fn write_frame(writer: &mut OwnedWriteHalf, frame: &[u8]) -> Result<(), Br
 /// MESSAGE routing. A broken connection re-dials with a doubling
 /// backoff capped at thirty seconds; a superseded generation exits.
 async fn connection_loop(
+    ack_mode: AckMode,
     shared: Arc<Shared>,
     shutdown: Arc<Notify>,
     generation: u64,
@@ -325,7 +346,7 @@ async fn connection_loop(
                     &[
                         ("id", id.clone()),
                         ("destination", format!("/topic/{topic}")),
-                        ("ack", "auto".to_string()),
+                        ("ack", ack_header(ack_mode).to_string()),
                     ],
                     &[],
                 ) {
@@ -355,7 +376,7 @@ async fn connection_loop(
                 },
                 read = read_frame(&mut reader) => match read {
                     Ok(frame) => {
-                        route_message(&shared, frame).await;
+                        route_message(&shared, frame, ack_mode).await;
                         false
                     }
                     Err(_) => true,
@@ -372,9 +393,22 @@ async fn connection_loop(
     }
 }
 
+/// The SUBSCRIBE ack header per mode: `auto` settles at the server,
+/// `client` hands each MESSAGE's ack id to the consumer.
+fn ack_header(mode: AckMode) -> &'static str {
+    match mode {
+        AckMode::Auto => "auto",
+        AckMode::Manual => "client",
+    }
+}
+
 /// Routes an inbound MESSAGE frame to its subscription's handler —
-/// the destination is the event topic, the body the payload.
-async fn route_message(shared: &Shared, frame: Frame) {
+/// the destination is the event topic, the body the payload. Under
+/// [`AckMode::Manual`] the frame's server-issued ack id rides the
+/// event's hooks: ack sends the ACK frame, and the nack hook sends
+/// NACK for requeue (the server re-queues per its own policy) or ACK
+/// for drop (settling the poison message without redelivery).
+async fn route_message(shared: &Shared, frame: Frame, ack_mode: AckMode) {
     if frame.command != "MESSAGE" {
         return;
     }
@@ -395,7 +429,63 @@ async fn route_message(shared: &Shared, frame: Frame) {
     let Some((topic, handler)) = found.await else {
         return;
     };
-    let event = Event::new(topic, Message::from_payload(frame.body));
+    if ack_mode == AckMode::Auto {
+        let event = Event::new(topic, Message::from_payload(frame.body));
+        tokio::spawn(handler(event));
+        return;
+    }
+    // Manual: the server-issued ack id rides the event's hooks.
+    let Some(ack_id) = frame
+        .headers
+        .iter()
+        .find(|(name, _)| name == "ack")
+        .map(|(_, value)| value.clone())
+    else {
+        // `ack:client` deliveries always carry the ack id; a server
+        // that omits it has handed us an unsettleable frame — deliver
+        // it as an auto event rather than silently swallow it.
+        let event = Event::new(topic, Message::from_payload(frame.body));
+        tokio::spawn(handler(event));
+        return;
+    };
+    let frames_tx = shared.frames.lock().await.clone();
+    let Some(frames_tx) = frames_tx else {
+        return;
+    };
+    let ack_frames_tx = frames_tx.clone();
+    let ack_ack_id = ack_id.clone();
+    let event = Event::settle_with(
+        topic,
+        Message::from_payload(frame.body),
+        move || {
+            let frames_tx = ack_frames_tx.clone();
+            let ack_id = ack_ack_id.clone();
+            Box::pin(async move {
+                let frame = encode_frame("ACK", &[("id", ack_id)], &[])
+                    .map_err(|e| BrokerError::Failed(format!("stomp ack frame: {e}")))?;
+                frames_tx
+                    .send(frame)
+                    .await
+                    .map_err(|e| BrokerError::Failed(format!("stomp ack: {e}")))
+            }) as BoxFuture<'static, Result<(), BrokerError>>
+        },
+        move |action| {
+            let frames_tx = frames_tx.clone();
+            let ack_id = ack_id.clone();
+            Box::pin(async move {
+                let command = match action {
+                    NackAction::Requeue => "NACK",
+                    NackAction::Drop => "ACK",
+                };
+                let frame = encode_frame(command, &[("id", ack_id)], &[])
+                    .map_err(|e| BrokerError::Failed(format!("stomp settle frame: {e}")))?;
+                frames_tx
+                    .send(frame)
+                    .await
+                    .map_err(|e| BrokerError::Failed(format!("stomp settle: {e}")))
+            }) as BoxFuture<'static, Result<(), BrokerError>>
+        },
+    );
     tokio::spawn(handler(event));
 }
 
@@ -422,8 +512,9 @@ impl Broker for StompBroker {
             *self.shared.frames.lock().await = Some(frames_tx.clone());
 
             let shared = Arc::clone(&self.shared);
+            let ack_mode = self.ack_mode;
             tokio::spawn(async move {
-                connection_loop(shared, shutdown, generation, frames_rx).await;
+                connection_loop(ack_mode, shared, shutdown, generation, frames_rx).await;
             });
 
             // The task's first handshake drives the connect; wait for
@@ -517,7 +608,7 @@ impl Broker for StompBroker {
                 &[
                     ("id", subscription_id.clone()),
                     ("destination", destination.clone()),
-                    ("ack", "auto".to_string()),
+                    ("ack", ack_header(self.ack_mode).to_string()),
                 ],
                 &[],
             )?;

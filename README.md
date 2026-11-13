@@ -96,6 +96,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-authn-basicauth` | Basic-Auth 引擎：RFC 7617 凭证对静态用户表或验证回调 |
 | `crates/rushwind-authn-hmac` | HMAC 引擎：keyID.timestamp.signature 签名校验，时钟偏移窗口 |
 | `crates/rushwind-authn-jwt` | JWT 引擎：HS/RS/PS/ES/EdDSA 族的铸造与验证 |
+| `crates/rushwind-authn-oidc` | OpenID Connect 引擎：discovery + JWKS 构造期拉取并按 kid 缓存，验证本地同步（门链可用），refresh 显式/后台任务，iss/aud/exp 严格钉死，minting 拒绝 |
 | `crates/rushwind-authn-noop` | Noop 引擎：全放行、铸造空凭证 |
 | `crates/rushwind-authn-presharedkey` | 预共享 key 引擎：集合成员校验、铸造为随机抽取 |
 | `crates/rushwind-authn-session` | 会话引擎：不透明会话 ID + 可插拔 SessionStore |

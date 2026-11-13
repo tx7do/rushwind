@@ -40,7 +40,11 @@
 //!
 //! - One exchange (`amq.topic`); per-call exchange selection
 //!   and custom exchange registration are not available.
-//! - Deliveries auto-acknowledge; the event ack is a no-op.
+//! - Acknowledgment follows [`AckMode`]: `Auto` (the default)
+//!   acknowledges at dispatch and the event hooks are no-ops;
+//!   `Manual` subscribes without auto-settlement and hands the
+//!   delivery's native AMQP acker to both hooks — ack on success,
+//!   nack with `requeue` per the [`NackAction`] on poison.
 //! - The delivery mode (persistent/transient) is not configurable —
 //!   AMQP's unset default treats deliveries as transient.
 //!
@@ -63,12 +67,14 @@ use std::time::Duration;
 use futures::StreamExt;
 use lapin::message::Delivery;
 use lapin::options::{
-    BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, QueueBindOptions,
+    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions, QueueBindOptions,
     QueueDeclareOptions,
 };
 use lapin::types::FieldTable;
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, Consumer};
-use rushwind_broker::{BoxFuture, Broker, BrokerError, Event, Handler, Message, Subscriber};
+use rushwind_broker::{
+    AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, NackAction, Subscriber,
+};
 use tokio::sync::{watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -224,6 +230,11 @@ impl Inner {
 /// A RabbitMQ-backed broker over AMQP 0-9-1.
 pub struct RabbitmqBroker {
     inner: Arc<Inner>,
+    /// The subscription acknowledgment policy. `Auto` (the default)
+    /// acknowledges at dispatch; `Manual` hands the native ack/nack to
+    /// the handler through the event's hooks — the poison-message
+    /// settlement face.
+    ack_mode: AckMode,
 }
 
 /// The bootstrap factory's settings wire shape for
@@ -232,12 +243,21 @@ pub struct RabbitmqBroker {
 pub struct RabbitmqSettings {
     /// The AMQP connection URL.
     pub url: String,
+    /// The acknowledgment policy; absent reads as [`AckMode::Auto`].
+    pub ack_mode: Option<AckMode>,
 }
 
 impl RabbitmqBroker {
     /// Connects to RabbitMQ at `url` (e.g.
     /// `amqp://guest:guest@127.0.0.1:5672`).
     pub async fn connect(url: &str) -> Result<Self, BrokerError> {
+        Self::with_ack_mode(url, AckMode::Auto).await
+    }
+
+    /// Connects under an explicit acknowledgment policy —
+    /// [`AckMode::Manual`] hands the native ack/nack to handlers
+    /// through the event's hooks (the poison-message settlement face).
+    pub async fn with_ack_mode(url: &str, ack_mode: AckMode) -> Result<Self, BrokerError> {
         let connection = Connection::connect(url, ConnectionProperties::default())
             .await
             .map_err(|e| BrokerError::Failed(format!("rabbitmq connect {url}: {e}")))?;
@@ -251,21 +271,22 @@ impl RabbitmqBroker {
                 redial: Mutex::new(()),
                 subscriptions: Mutex::new(HashMap::new()),
             }),
+            ack_mode,
         })
     }
 
     /// Constructs from the bootstrap factory's settings wire shape:
-    /// `url` (required).
+    /// `url` (required), `ack_mode` (optional).
     pub async fn from_settings(settings: serde_json::Value) -> Result<Self, BrokerError> {
         let settings: RabbitmqSettings = serde_json::from_value(settings)
             .map_err(|e| BrokerError::Failed(format!("settings parse: {e}")))?;
-        Self::connect(&settings.url).await
+        Self::with_ack_mode(&settings.url, settings.ack_mode.unwrap_or_default()).await
     }
 }
 
 /// Opens the consume path on `connection`: an anonymous, exclusive,
 /// auto-delete queue bound to the exchange with the topic as the
-/// routing key, consumed with automatic acks.
+/// routing key, consumed per the engine's [`AckMode`].
 async fn open_consumer(
     connection: &Connection,
     topic: &str,
@@ -311,9 +332,12 @@ async fn open_consumer(
 }
 
 /// Dispatches one delivery: fire-and-forget handler spawn (a handler
-/// error or panic cannot kill the reader loop), then the automatic
-/// acknowledgment.
-async fn dispatch(delivery: Delivery, handler: &Handler) {
+/// error or panic cannot kill the reader loop). Under [`AckMode::Auto`]
+/// the automatic acknowledgment rides the spawn; under
+/// [`AckMode::Manual`] the delivery's native acker/nacker ride the
+/// event's hooks instead and nothing settles until the handler does —
+/// a handler error can nack the poison message back to the queue.
+async fn dispatch(delivery: Delivery, handler: &Handler, mode: AckMode) {
     let routing_key = delivery.routing_key.to_string();
     let payload = delivery.data.clone();
     let mut message = Message::from_payload(payload);
@@ -327,9 +351,49 @@ async fn dispatch(delivery: Delivery, handler: &Handler) {
             }
         }
     }
-    let event = Event::new(routing_key, message);
-    tokio::spawn(handler(event));
-    let _ = delivery.ack(BasicAckOptions::default()).await;
+    match mode {
+        AckMode::Auto => {
+            let event = Event::new(routing_key, message);
+            tokio::spawn(handler(event));
+            let _ = delivery.ack(BasicAckOptions::default()).await;
+        }
+        AckMode::Manual => {
+            // Both hooks carry clones of the delivery's own acker — the
+            // AMQP settlement handle for this exact delivery tag. The
+            // handler acks on success; on poison it nacks, requeue per
+            // the action, and the broker's redelivery takes over.
+            let ack_acker = delivery.acker.clone();
+            let event = Event::settle_with(
+                routing_key,
+                message,
+                move || {
+                    let acker = ack_acker.clone();
+                    Box::pin(async move {
+                        acker
+                            .ack(BasicAckOptions::default())
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| BrokerError::Failed(format!("rabbitmq ack: {e}")))
+                    }) as BoxFuture<'static, Result<(), BrokerError>>
+                },
+                move |action| {
+                    let acker = delivery.acker.clone();
+                    let requeue = action == NackAction::Requeue;
+                    Box::pin(async move {
+                        acker
+                            .nack(BasicNackOptions {
+                                requeue,
+                                ..BasicNackOptions::default()
+                            })
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| BrokerError::Failed(format!("rabbitmq nack: {e}")))
+                    }) as BoxFuture<'static, Result<(), BrokerError>>
+                },
+            );
+            tokio::spawn(handler(event));
+        }
+    }
 }
 
 /// Closes the subscription's current channel: the close cancels the
@@ -494,6 +558,7 @@ impl Broker for RabbitmqBroker {
             let inner_for_task = Arc::clone(&self.inner);
             let shared_for_task = Arc::clone(&shared);
             let topic_for_task = topic.to_string();
+            let ack_mode = self.ack_mode;
             let reader = tokio::spawn(async move {
                 let inner = inner_for_task;
                 let shared = shared_for_task;
@@ -513,7 +578,7 @@ impl Broker for RabbitmqBroker {
                             }
                             _ = generation.changed() => break,
                             delivery = consumer.next() => match delivery {
-                                Some(Ok(delivery)) => dispatch(delivery, &handler).await,
+                                Some(Ok(delivery)) => dispatch(delivery, &handler, ack_mode).await,
                                 // The stream ended: channel or
                                 // connection gone.
                                 _ => break,

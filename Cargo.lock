@@ -6688,6 +6688,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-authn-oidc"
+version = "0.0.1"
+dependencies = [
+ "jsonwebtoken",
+ "reqwest 0.12.28",
+ "rushwind-authn",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-authn-presharedkey"
 version = "0.0.1"
 dependencies = [

@@ -141,6 +141,29 @@ impl Message {
 /// native delivery needs one.
 pub type Acker = Box<dyn FnOnce() -> BoxFuture<'static, Result<(), BrokerError>> + Send>;
 
+/// The acknowledgment policy a subscription runs under — the second
+/// poison-message prerequisite the upstream asked the contract to
+/// carry. `Auto` (every engine's default) acknowledges the delivery
+/// the moment it is dispatched: handler errors cannot redeliver, and
+/// [`Event::nack`] is a documented no-op. `Manual` hands settlement to
+/// the handler — the [`Event::ack`]/
+/// [`Event::nack`](Event::nack) hooks carry the engine's native
+/// settlement, so a handler that errors can requeue or drop the
+/// poison message. Engines whose native delivery has no
+/// acknowledgment surface (core NATS, Redis pub/sub) stay `Auto`
+/// structurally: their options accept the mode and document that
+/// manual settlement has nothing to settle onto.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AckMode {
+    /// Settle on dispatch — the historical behavior, every engine's
+    /// default.
+    #[default]
+    Auto,
+    /// Settle by the handler, through the event's ack/nack hooks.
+    Manual,
+}
+
 /// What a rejection asks the engine to do with the delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NackAction {
@@ -189,6 +212,25 @@ impl Event {
             message,
             acker: Some(Box::new(acker)),
             nacker: None,
+        }
+    }
+
+    /// Builds an event carrying **both** settlement hooks — the
+    /// manual-ack shape: the handler settles by outcome (ack on
+    /// success, nack with an [`NackAction`] on poison). Exactly one
+    /// settlement fires; whichever hook the handler consumes is the
+    /// one the delivery settles through.
+    pub fn settle_with(
+        topic: impl Into<String>,
+        message: Message,
+        acker: impl FnOnce() -> BoxFuture<'static, Result<(), BrokerError>> + Send + 'static,
+        nacker: impl FnOnce(NackAction) -> BoxFuture<'static, Result<(), BrokerError>> + Send + 'static,
+    ) -> Self {
+        Self {
+            topic: topic.into(),
+            message,
+            acker: Some(Box::new(acker)),
+            nacker: Some(Box::new(nacker)),
         }
     }
 

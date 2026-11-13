@@ -56,7 +56,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rushwind_broker::{BoxFuture, Broker, BrokerError, Event, Handler, Message, Subscriber};
+use rushwind_broker::{
+    AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, Subscriber,
+};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 /// How long an unsubscribe waits for the broker's UNSUBACK before
@@ -95,6 +97,8 @@ pub struct MqttBroker {
     generation: Arc<AtomicU64>,
     /// Per-generation pump shutdown.
     shutdown: Mutex<Option<Arc<Notify>>>,
+    /// The subscription acknowledgment policy (see [`AckMode`]).
+    ack_mode: AckMode,
 }
 
 /// The MQTT engine's connection settings.
@@ -128,6 +132,15 @@ impl MqttOptions {
 impl MqttBroker {
     /// Builds the broker; call [`Broker::connect`] to go live.
     pub fn new(options: MqttOptions) -> Self {
+        Self::with_ack_mode(options, AckMode::Auto)
+    }
+
+    /// Builds the broker under an explicit acknowledgment policy.
+    /// [`AckMode::Manual`] hands the MQTT PUBACK to handlers through
+    /// the event's ack hook; MQTT 3.1.1 has no native NACK frame, so
+    /// the nack hook's honest shape is *withholding* the PUBACK —
+    /// redelivery becomes the broker's re-send timer's decision.
+    pub fn with_ack_mode(options: MqttOptions, ack_mode: AckMode) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         Self {
             mqtt_options: to_rumqtt_options(&options),
@@ -142,6 +155,7 @@ impl MqttBroker {
             }),
             generation,
             shutdown: Mutex::new(None),
+            ack_mode,
         }
     }
 
@@ -256,6 +270,7 @@ impl Broker for MqttBroker {
 
             let shared = Arc::clone(&self.shared);
             let generations = Arc::clone(&self.generation);
+            let ack_mode = self.ack_mode;
             tokio::spawn(async move {
                 let mut backoff_secs = 1u64;
                 loop {
@@ -297,12 +312,60 @@ impl Broker for MqttBroker {
                                                 .map(|(_, handler)| Arc::clone(handler))
                                                 .collect()
                                         };
-                                        for handler in handlers {
-                                            let event = Event::new(
-                                                topic.clone(),
-                                                Message::from_payload(payload.clone()),
-                                            );
-                                            tokio::spawn(handler(event));
+                                        match ack_mode {
+                                            AckMode::Auto => {
+                                                for handler in handlers {
+                                                    let event = Event::new(
+                                                        topic.clone(),
+                                                        Message::from_payload(payload.clone()),
+                                                    );
+                                                    tokio::spawn(handler(event));
+                                                }
+                                                // Settle on dispatch: the
+                                                // PUBACK rides once, whatever
+                                                // the handlers did.
+                                                let _ = client.ack(&publish).await;
+                                            }
+                                            AckMode::Manual => {
+                                                for handler in handlers {
+                                                    // Each hook owns its own
+                                                    // client/publish copies: the
+                                                    // outer pair stays live for the
+                                                    // rest of the pump loop.
+                                                    let ack_client = client.clone();
+                                                    let ack_publish = publish.clone();
+                                                    let nack_client = client.clone();
+                                                    let nack_publish = publish.clone();
+                                                    let event = Event::settle_with(
+                                                        topic.clone(),
+                                                        Message::from_payload(payload.clone()),
+                                                        move || {
+                                                            Box::pin(async move {
+                                                                ack_client.ack(&ack_publish).await.map_err(
+                                                                    |e| BrokerError::Failed(
+                                                                        format!("mqtt ack: {e}"),
+                                                                    ),
+                                                                )
+                                                            })
+                                                                as BoxFuture<'static, Result<(), BrokerError>>
+                                                        },
+                                                        // MQTT 3.1.1 carries no NACK
+                                                        // frame: the honest rejection
+                                                        // is *withholding* the PUBACK —
+                                                        // redelivery is then the
+                                                        // broker's re-send timer's
+                                                        // decision, for both actions.
+                                                        move |_action| {
+                                                            Box::pin(async move {
+                                                                let _ = nack_client.ack(&nack_publish).await;
+                                                                Ok(())
+                                                            })
+                                                                as BoxFuture<'static, Result<(), BrokerError>>
+                                                        },
+                                                    );
+                                                    tokio::spawn(handler(event));
+                                                }
+                                            }
                                         }
                                     }
                                     rumqttc::Event::Incoming(rumqttc::Packet::UnsubAck(_)) => {
