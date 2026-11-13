@@ -10,27 +10,83 @@
 [![Rust](https://img.shields.io/badge/Rust-1.81+-DEA584?logo=rust)](https://www.rust-lang.org/)
 [![CI](https://github.com/tx7do/rushwind/actions/workflows/ci.yml/badge.svg)](https://github.com/tx7do/rushwind/actions/workflows/ci.yml)
 
+**Rust 微服务框架——框架核心与全套插件，一个仓库。**
+
 </div>
 
 ---
+
+## RushWind 是什么
+
+多数生态把框架和插件分仓：框架仓只管生命周期与契约，传输、存储、消息这些"插件"散落在外部仓，版本各自漂移、门禁各自为政。RushWind 二合一：**同一个 workspace 里，框架核心与全部插件域一起演进**——同一个一致性套件标准、同一条 "`cargo test` 全绿即合规" 的验收线。
+
+- **框架半**：生命周期编排核心 + 传输契约层 + 九个协议栈适配器（axum / WebSocket / QUIC / WebTransport / HTTP/3 / gRPC / MQTT / SSE / cron）。
+- **插件半**：20 个能力域——存储、向量检索、安全（认证/鉴权/密码哈希）、配置、注册中心、可观测（指标/追踪/健康检查）、弹性（重试/限流/熔断）、缓存、分布式锁、消息、事务、任务队列、编码、脚本、AI、对象存储。
+
+二合一不等于全家桶——单仓是开发视图，不是链接视图：你不用的引擎不会进你的依赖树，域与域之间只通过契约 crate 相连。核心依旧不含日志、不含注册中心、不含配置中心：那些是积木，不是底板。
 
 ## 设计哲学
 
 > **不是全家桶，而是积木盒。**
 
-RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心定义契约——传输 trait、停机信号、实例模型——每一个具体协议栈都是独立的适配器 crate，由使用者按需拼装。核心不含日志、不含注册中心、不含配置中心：那些是积木，不是底板。
+框架核心只做一件事：**可靠的多服务器生命周期编排**——并发启动、级联停机、分阶段限时、结果观察。契约先行：每个能力域都是一份契约 crate，每个具体引擎、每个协议栈都是独立的适配器 crate，由使用者按需拼装。
 
-一切按 Rust 的所有权、取消与错误模型原生设计，契约语义与预算、停机行为的规范细节见 [docs/architecture.md](./docs/architecture.md)。数据访问层是同一哲学的延伸：`rushwind-storage` 用一套 Repository 契约驾驭多种存储引擎——每引擎一个适配器 crate，按需引入。
+一切按 Rust 的所有权、取消与错误模型原生设计；契约语义与预算、停机行为的规范细节见 [docs/architecture.md](./docs/architecture.md)。数据访问层是同一哲学的延伸：`rushwind-storage` 用一套 Repository 契约驾驭多种存储引擎——每引擎一个适配器 crate，按需引入。
 
-## 当前状态
+## 快速开始
 
-能力面已全部落地：**124 个 crate + 8 个示例**，覆盖生命周期编排与传输、HTTP、存储、安全（含密码哈希）、配置、注册中心、可观测、弹性、缓存、消息、事务、任务、编码、脚本、AI、对象存储、向量检索、分布式锁等全部能力域。每个域 = 一份契约 crate + 按需引入的引擎矩阵；引擎与适配器一律过一致性套件，`cargo test` 全绿即合规。各域独立演进，按 Rust 生态自身的节奏生长。
+依赖四个 crate：`rushwind-core`、`rushwind-transport`、`rushwind-transport-axum`、`rushwind-http`（外加 tokio 与 axum）。三十行跑起第一个带统一中间件栈的 HTTP 服务：
 
-路线图上仅剩：kcp（存量互操作时）、`rushwind-protocols` 独立仓。
+```rust
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::routing::get;
+use axum::Router;
+use rushwind_core::App;
+use rushwind_http::HttpEdge;
+use rushwind_transport::StopSignal;
+use rushwind_transport_axum::AxumServer;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // HttpEdge：默认请求中间件栈（panic 恢复 / 请求 ID / 访问日志）
+    let router = HttpEdge::new().wrap(
+        Router::new().route("/hello", get(|| async { "hello rushwind" })),
+    );
+    let server = AxumServer::new(SocketAddr::from(([127, 0, 0, 1], 0)), router)?;
+    println!("listening on {}", server.endpoint()?);
+
+    // App：编排者——并发启动、级联停机、每阶段独立预算
+    let app = App::builder()
+        .name("hello-rushwind")
+        .version("0.1.0")
+        .erased_server(Arc::new(server))
+        .stop_timeout(Duration::from_secs(5))
+        .build();
+
+    // Ctrl+C / SIGTERM / app.stop() 都走到体面停机
+    app.run(StopSignal::new()).await?;
+    Ok(())
+}
+```
+
+完整走法（含生命周期三原语 `Server` / `StopSignal` / `App` 的解释）见教程 [01 · 生命周期与第一个服务](./docs/tutorials/01-hello-rushwind.md)，全系列 13 章见 [docs/tutorials](./docs/tutorials/README.md)。可运行的完整示例见 [examples/](./examples)。项目长大后无需手写装配：`rushwind-bootstrap` 把各域引擎、HTTP 服务器与 cron 传输从一份 YAML 装配进单一生命周期（教程 [02 · 装配器与配置](./docs/tutorials/02-bootstrap-and-config.md)，完整示例 [`examples/bootstrap-demo`](./examples/bootstrap-demo)）。
+
+## 实例与生态
+
+框架之外的三个官方仓，构成 RushWind 的开发链。单体与微服务两种部署形态，各有一个从零可跑的参考实现：
+
+| 仓库 | 定位 |
+|:---|:---|
+| [rushwind-toolkit](https://github.com/tx7do/rushwind-toolkit) | 生态工具箱：`rush` CLI + `rush-gen` 核心库——领域实体后端全链生成、数据库内省反推实体规格、前端 CRUD 页面生成、项目脚手架（memory/sqlite/postgres 三变体）、契约清单校验、差分台架 |
+| [rushwind-admin](https://github.com/tx7do/rushwind-admin) | 单体的实现实例：契约驱动的企业级管理后台——单体后端（REST + SSE）对接 Vue3 Vben / Vue3 Element Plus / React19 三套前端，多租户 RBAC、审计留存、TOTP MFA 等保 2.0 合规 |
+| [rushwind-cms](https://github.com/tx7do/rushwind-cms) | 最简的 3 服务微服务实现实例：Rust 全栈 Headless CMS——core-service（领域层，gRPC 对内）+ admin / app 两个 BFF（REST + SSE 对外），同一 proto 契约同时产出 REST 与 gRPC 两面 |
 
 ## 仓库布局
 
-按域分组。契约 crate 不预设引擎；引擎与适配器按需引入，各自过一致性套件。
+前两节是框架（编排 + 传输契约 + HTTP 面），其后是插件域——每个域一份契约 crate + 按需引入的引擎矩阵，各自过一致性套件。
 
 ### 核心与传输
 
@@ -40,12 +96,13 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-transport` | 契约层：`Server` trait、`StopSignal`、`Instance`、`ServerError` |
 | `crates/rushwind-transport-axum` | axum 适配器：`Router` 接入生命周期，优雅停机映射见架构文档 |
 | `crates/rushwind-transport-ws` | WS 会话路由构建器：门链 + 准入策略 + 会话停机总线，契约见会话中间件文档 [session-middleware.md](./docs/session-middleware.md) |
-| `crates/rushwind-transport-quic` | QUIC 适配器：quinn 接受循环接入生命周期，全套会话链；`stop()` 为真实释放（Endpoint::close） |
+| `crates/rushwind-transport-quic` | QUIC 适配器：quinn 接受循环接入生命周期，全套会话链（对端地址准入、按远端 IP 会话配额）；`stop()` 为真实释放（Endpoint::close） |
 | `crates/rushwind-transport-webtransport` | WebTransport 适配器：wtransport 端点接入生命周期，全套会话链（会话请求时刻的 HTTP 族门链、原子准入、握手截止），`stop()` 为真实释放 |
 | `crates/rushwind-transport-h3` | HTTP/3 适配器：h3/h3-quinn 请求服务接入生命周期，请求时刻门链（拒绝映射为状态响应）与连接级原子准入，`stop()` 为真实释放 |
 | `crates/rushwind-transport-grpc` | gRPC 传输：tonic 0.14 服务调用方提供的 `Routes`（proto-build 的 tonic generator 编译域服务，部署覆写 stub），监听器构造期急切绑定、优雅排水随停机信号，端点 `grpc://host:port` |
 | `crates/rushwind-transport-mqtt` | MQTT 消费桥：订阅外部 broker（每订阅 handler 注册 + 规范通配分发），重连退避 + 订阅重建，串行泵入 handler |
 | `crates/rushwind-transport-sse` | SSE 通知传输：`/events` 线契约（CORS 预检、三源 token、401 纯文本错误行、反跨用户流检查、按用户过滤广播流）+ 进程内 Hub + bootstrap 工厂，授权经 `Gate` trait 插拔 |
+| `crates/rushwind-transport-cron` | cron 传输：分钟对齐的周期调度器接入 `Server` 生命周期，cron 表达式命中整分即触发注册的作业 |
 
 ### HTTP 面
 
@@ -65,6 +122,7 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-storage-memory` | 内存参考引擎：过滤器/排序/游标的语义基准，零依赖 |
 | `crates/rushwind-storage-seaorm` | SeaORM 引擎：SQLite/PostgreSQL/MySQL 三后端同启，三方言 SQL 快照钉死渲染，SQLite 过一致性套件，live 套件跑 CI 容器 |
 | `crates/rushwind-storage-seaorm-support` | 类型化实体服务桥：`PagingRequest` select 装配（query 语法过滤/orderBy/三态切片、按列型绑定）、SeaORM 失败→信封、实体时间↔proto Timestamp |
+| `crates/rushwind-storage-seaorm-migration` | SeaORM 服务的 schema 迁移机械：从实体定义生成建表语句，以带追踪的 sea-orm-migration 应用 |
 | `crates/rushwind-storage-mongodb` | MongoDB 引擎：FilterExpr→BSON 翻译离线单测，LIKE 族编译为转义正则，live 套件跑 CI 容器 |
 | `crates/rushwind-storage-elasticsearch` | Elasticsearch 引擎：REST + refresh-on-write，`.keyword` 精确匹配，bulk 原子批写 |
 | `crates/rushwind-storage-opensearch` | OpenSearch 引擎：ES 线格式薄复用（wire 兼容） |
@@ -83,8 +141,8 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 
 | 位置 | 职责 |
 |:---|:---|
-| `crates/rushwind-vector` | 向量检索契约（RAG/语义检索）：统一 `VectorQuery`、score 恒为越大越相似（余弦 `1−d`/L2 `1/(1+d)`/点积原值）、TopK 非分页、维度纪律、pgvector 文本编解码——纯类型与纯函数（移植 go-crud vector 语义） |
-| `crates/rushwind-vector-memory` | 内存参考引擎：暴力 top-k + 维度固定/拒绝，外部引擎适配器的语义基准；外部引擎族（qdrant/milvus/weaviate 等）按需立项 |
+| `crates/rushwind-vector` | 向量检索契约（RAG/语义检索）：统一 `VectorQuery`、score 恒为越大越相似（余弦 `1−d`/L2 `1/(1+d)`/点积原值）、TopK 非分页、维度纪律、pgvector 文本编解码——纯类型与纯函数 |
+| `crates/rushwind-vector-memory` | 内存参考引擎：暴力 top-k + 维度固定/拒绝，外部引擎适配器的语义基准，附 criterion benchmark（搜索成本基线） |
 | `crates/rushwind-vector-qdrant` | Qdrant 引擎：REST 上手写 reqwest 无 SDK——按 metric 后缀的命名向量（`{field}__cosine/euclidean/dot`，服务端 top-k 对每个契约 metric 都正确，代价 3× 存储；既有的裸字段单 metric 集合走单 metric 模式）、维度纪律读服务端配置、自由字符串 id 经确定性 SHA-1→UUID 映射 + payload 回带原 id |
 | `crates/rushwind-vector-milvus` | Milvus 引擎：v2 RESTful 手写 reqwest——metric 后缀三集合（服务端 top-k 对每个契约 metric 正确）、维度纪律读 describe、listCollections 扫描式跨字段删除 |
 | `crates/rushwind-vector-weaviate` | Weaviate 引擎：REST batch + GraphQL nearVector 手写 reqwest——metric 后缀三类（CamelCase 净化）、引擎侧维度注册表（Weaviate schema 不报维度）、dot 面如实声明为保序余弦面 |
@@ -185,20 +243,20 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-lock-memory` | 进程内引擎：TTL 惰性过期的 map + token 校验——单进程部署与测试，语义与分布式引擎同套件 |
 | `crates/rushwind-lock-redis` | Redis 引擎：`SET NX PX` 获取 + token 比对的 Lua 原子 release/extend，live 套件走 CI redis 容器 |
 
-### 消息、事务与任务
+### 消息、事务与任务域
 
 | 位置 | 职责 |
 |:---|:---|
-| `crates/rushwind-broker` | 消息契约：`Broker` / `Subscriber` trait、Message/Event 形状、JSON handler 助手 |
-| `crates/rushwind-broker-kafka` | Kafka 引擎：samsa 纯 Rust 协议客户端上的每 topic 生产者 + 消费组订阅（免 librdkafka C 工具链） |
-| `crates/rushwind-broker-pulsar` | Pulsar 引擎：pulsar-rs 多 topic 生产者 + Shared 消费者，固定订阅名 |
+| `crates/rushwind-broker` | 消息契约：`Broker` / `Subscriber` trait、Message/Event 形状、JSON handler 助手、`AckMode::{Auto, Manual}` 与 `Event::settle_with` 双钩结算、`NackAction::{Requeue, Drop}`、`with_error_handler` 错误观察点 |
+| `crates/rushwind-broker-kafka` | Kafka 引擎：samsa 纯 Rust 协议客户端上的每 topic 生产者 + 消费组订阅（免 librdkafka C 工具链）；批量自动提交位移，无 ack 面（文档如实声明） |
+| `crates/rushwind-broker-pulsar` | Pulsar 引擎：pulsar-rs 多 topic 生产者 + Shared 消费者，固定订阅名；Manual 结算经 mpsc 回泵（ack_with_id/nack_with_id） |
 | `crates/rushwind-broker-gcpubsub` | Google Cloud Pub/Sub 引擎：v1 REST 手写 reqwest——publish/pull/acknowledge，manual 结算走 ack deadline 清零（零即立即可重投），token 由部署供给与刷新 |
 | `crates/rushwind-broker-sqs` | Amazon SQS 引擎：Query API 手写 reqwest + 手写 SigV4（参考向量钉死签名链）——SendMessage/ReceiveMessage/DeleteMessage/ChangeMessageVisibility，manual 结算 = 删除或可见性归零 |
-| `crates/rushwind-broker-rabbitmq` | RabbitMQ 引擎：lapin 上的 AMQP 0-9-1 发布/订阅，走 amq.topic 交换机 |
-| `crates/rushwind-broker-nats` | NATS 引擎：async-nats 上的 core-NATS 发布/订阅 |
-| `crates/rushwind-broker-redis` | Redis 引擎：每 topic 专属订阅连接上的 pub/sub |
-| `crates/rushwind-broker-mqtt` | MQTT 引擎：rumqttc 上的发布/订阅，重连自动重订阅 |
-| `crates/rushwind-broker-stomp` | STOMP 引擎：裸 TCP 上的极简 STOMP 1.2 客户端，对接 RabbitMQ stomp 插件 |
+| `crates/rushwind-broker-rabbitmq` | RabbitMQ 引擎：lapin 上的 AMQP 0-9-1 发布/订阅，走 amq.topic 交换机；AMQP acker/nacker 直挂结算双钩，nack 按 `NackAction` requeue |
+| `crates/rushwind-broker-nats` | NATS 引擎：async-nats 上的 core-NATS 发布/订阅；at-most-once，无 ack 面（文档如实声明） |
+| `crates/rushwind-broker-redis` | Redis 引擎：每 topic 专属订阅连接上的 pub/sub；无确认面（文档如实声明） |
+| `crates/rushwind-broker-mqtt` | MQTT 引擎：rumqttc 上的发布/订阅，重连自动重订阅；PUBACK 挂 ack 钩，nack 钩为"扣住 PUBACK"（MQTT 3.1.1 无 NACK 帧） |
+| `crates/rushwind-broker-stomp` | STOMP 引擎：裸 TCP 上的极简 STOMP 1.2 客户端，对接 RabbitMQ stomp 插件；`ack:client` 订阅，ACK/NACK 帧原生两动作 |
 | `crates/rushwind-transaction` | 分布式事务契约：引擎之上的最小客户端面 |
 | `crates/rushwind-transaction-dtm` | DTM 引擎：DTM HTTP 协议（reqwest）上的 saga / TCC / 二阶段消息 / XA |
 | `crates/rushwind-apalis-postgres` | 任务队列的 Postgres 存储后端（apalis）：SKIP LOCKED 认领、可见性超时、孤儿恢复 |
@@ -222,22 +280,22 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | 位置 | 职责 |
 |:---|:---|
 | `crates/rushwind-script` | 脚本引擎契约：能力拆分 trait 族（loader / executor / global / function / module / watch 六能力聚合，sandbox / runtime-hook / sync / quota 四能力独立），probe 方法即能力探测面，`ScriptValue` 数据桥，名称键工厂注册表，`EnginePool` / `AutoGrowEnginePool`，`Manager`；源契约 `ScriptSource` / `SignalStream` 与本地载体、组合（memory、file mtime 轮询、静态树 + 前缀、双策略多源聚合、TTL 失效监视缓存、变换链） |
-| `crates/rushwind-script-wasm` | Wasm 引擎：wasmi 纯解释器上的模块实例化与 `_start` 导出调用，空导入面，其余能力恒拒 |
+| `crates/rushwind-script-wasm` | Wasm 引擎：wasmi 纯解释器上的模块实例化与 `_start` 导出调用、标量全局存取、按签名严格编组的导出函数调用；异步宿主函数诚实拒绝（同步解释器无桥），其余能力恒拒 |
 | `crates/rushwind-script-cel` | CEL 引擎：cel-rust 表达式编译与求值，`ScriptValue` 变量桥，map 扁平化为前缀全局变量 |
 | `crates/rushwind-script-lua` | Lua 引擎：mlua vendored Lua 5.4，标准库白名单沙箱、宿主函数注册、指令配额钩子真中断与事后超时检查、watch 重载 |
 | `crates/rushwind-script-javascript` | JavaScript 引擎：boa 运行于专属 actor 线程（命令通道 + 一次性应答，串行执行），全局/模块/脚本函数桥接、结果数组语义、配额事后检查 |
 | `crates/rushwind-script-starlark` | Starlark 引擎：starlark-rust 标准方言模块求值、宿主环境注入、脚本函数调用、JSON 序列化值读回、watch 重排队 |
 | `crates/rushwind-script-config` | 配置源桥：任意配置域 `Source` 适配为脚本 `ScriptSource`——缺席映射为未找到、错误分类桥（NotWatchable→能力不支持）、信号流直通 |
 
-### AI 与对象存储
+### AI 与对象存储域
 
 | 位置 | 职责 |
 |:---|:---|
-| `crates/rushwind-ai` | AI 模型契约：chat 补全 + 流式（含拼装完整的工具调用事件）+ embeddings 三面 trait |
-| `crates/rushwind-ai-openai` | OpenAI 兼容引擎：reqwest 上的 chat / 流式 / embeddings，通吃 OpenAI、Qwen、Ollama |
+| `crates/rushwind-ai` | AI 模型契约：chat 补全 + 流式（含拼装完整的工具调用事件）+ embeddings 三面 trait，对象安全（`Arc<dyn …>` 是部署形状） |
+| `crates/rushwind-ai-openai` | OpenAI 兼容引擎：reqwest 上的 chat / 流式 / embeddings（SSE 工具调用 delta 按 index 拼装），通吃 OpenAI、Qwen、Ollama |
 | `crates/rushwind-oss` | 对象存储契约：S3 兼容存储上的 put/get/delete/list 与 presign，外加 multipart 上传四面（begin/put/complete/abort，部分号 1..=10000、连续组装；presign 仅签名权威引擎可用，缺省 Unsupported） |
 | `crates/rushwind-oss-s3` | S3 引擎：reqwest 上的 SigV4 签名 REST，覆盖 AWS S3 与 MinIO |
-| `crates/rushwind-oss-local` | 本地盘引擎：每 bucket 一实例、目录随 put 物化、缺失读 NotFound、删除幂等、键穿越拒绝 |
+| `crates/rushwind-oss-local` | 本地盘引擎：每 bucket 一实例、目录随 put 物化、缺失读 NotFound、删除幂等、键穿越拒绝；multipart 以暂存目录实现 |
 
 ### 装配与测试
 
@@ -257,6 +315,9 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `examples/mqtt-ingest` | MQTT 消费演示：对接外部 broker，信号驱动的干净退出 |
 | `examples/bootstrap-demo` | 装配演示：一份 YAML + memory 引擎工厂 + 路由包，起完整服务 |
 | `examples/storage-basics` | 同一段 Repository 代码跑内存与 SQLite 双引擎，输出逐行一致 |
+| `examples/vector-multi-engine` | 向量检索演示：同一段检索代码跑内存 + qdrant/milvus/weaviate/neo4j 四外部引擎（各自 `VECTOR_*_URL` 环境变量启用） |
+| `examples/broker-manual-ack` | `AckMode::Manual` 端到端演示（MQTT）：well-formed 消息 ack、毒 payload nack 重投、错误观察点不杀订阅 |
+| `examples/oss-multipart` | 分片上传演示：乱序部分按部分号组装、abort 零残留、S3 半场铸 presigned GET 免凭据拉取 |
 | `examples/apalis-postgres-demo` | 任务队列演示：Postgres 存储上的投递/调度/消费全程（认领、重试退避、死信、孤儿恢复） |
 
 ## 生命周期
@@ -277,6 +338,17 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 
 每一阶段的预算都在**该阶段开始的时刻**现取现造，绝不继承自更早的上下文。忽略停机信号的 Server 在排水截止时被**丢弃**（Rust 的 drop 即取消），挂死的 `stop()` 被截止切断并记录 `Timeout`。规范细节见 [docs/architecture.md](./docs/architecture.md)。
 
+## 文档与教程
+
+| 文档 | 内容 |
+|:---|:---|
+| [docs/architecture.md](./docs/architecture.md) | 架构与契约语义规范：预算、停机映射、一致性套件用例清单 |
+| [docs/http-edge.md](./docs/http-edge.md) | HTTP 边缘与中间件栈设计 |
+| [docs/session-middleware.md](./docs/session-middleware.md) | WS/QUIC 会话中间件契约 |
+| [docs/security-authn-authz.md](./docs/security-authn-authz.md) | 认证/鉴权层契约与威胁面速记 |
+| [docs/threat-model.md](./docs/threat-model.md) | 威胁模型 |
+| [docs/tutorials](./docs/tutorials/README.md) | 13 章系列教程：生命周期 → 装配与配置 → 存储契约 → 查询语法 → HTTP 服务栈 → 认证鉴权 → 消息 → 缓存 → 注册发现与韧性 → 可观测 → 脚本 → 多协议传输 → 测试 |
+
 ## 给适配器作者
 
 新传输 = 实现 `Server` + 过一致性套件，两件事：
@@ -293,17 +365,7 @@ rushwind_testkit::rushwind_conformance_suite!(crate::your_server_factory);
 rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo);
 ```
 
-`cargo test` 全绿即合规，CI 对每个适配器 crate 强制执行。契约语义与套件用例清单见 [docs/architecture.md](./docs/architecture.md)。
-
-## 开发门禁
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
-
-CI 在 Linux/Windows/macOS 三平台矩阵上执行同一套门禁。全 workspace `#![forbid(unsafe_code)]`。
+`cargo test` 全绿即合规。契约语义与套件用例清单见 [docs/architecture.md](./docs/architecture.md)，贡献流程见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
 ## 安全
 
