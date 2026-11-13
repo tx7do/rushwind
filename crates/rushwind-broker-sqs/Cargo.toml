@@ -1,0 +1,25 @@
+[package]
+name = "rushwind-broker-sqs"
+description = "Amazon SQS engine for the RushWind broker contract: the Query API over hand-written reqwest with hand-rolled SigV4 — SendMessage/ReceiveMessage/DeleteMessage/ChangeMessageVisibility, no SDK."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-broker = { workspace = true }
+rushwind-transport = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+hmac = "0.12"
+sha2 = "0.10"
+form_urlencoded = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }

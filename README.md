@@ -192,6 +192,8 @@ RushWind 只做一件事：**可靠的多服务器生命周期编排**。核心�
 | `crates/rushwind-broker` | 消息契约：`Broker` / `Subscriber` trait、Message/Event 形状、JSON handler 助手 |
 | `crates/rushwind-broker-kafka` | Kafka 引擎：samsa 纯 Rust 协议客户端上的每 topic 生产者 + 消费组订阅（免 librdkafka C 工具链） |
 | `crates/rushwind-broker-pulsar` | Pulsar 引擎：pulsar-rs 多 topic 生产者 + Shared 消费者，固定订阅名 |
+| `crates/rushwind-broker-gcpubsub` | Google Cloud Pub/Sub 引擎：v1 REST 手写 reqwest——publish/pull/acknowledge，manual 结算走 ack deadline 清零（零即立即可重投），token 由部署供给与刷新 |
+| `crates/rushwind-broker-sqs` | Amazon SQS 引擎：Query API 手写 reqwest + 手写 SigV4（参考向量钉死签名链）——SendMessage/ReceiveMessage/DeleteMessage/ChangeMessageVisibility，manual 结算 = 删除或可见性归零 |
 | `crates/rushwind-broker-rabbitmq` | RabbitMQ 引擎：lapin 上的 AMQP 0-9-1 发布/订阅，走 amq.topic 交换机 |
 | `crates/rushwind-broker-nats` | NATS 引擎：async-nats 上的 core-NATS 发布/订阅 |
 | `crates/rushwind-broker-redis` | Redis 引擎：每 topic 专属订阅连接上的 pub/sub |

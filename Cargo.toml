@@ -46,6 +46,8 @@ rushwind-registry-polaris = { path = "crates/rushwind-registry-polaris", version
 rushwind-broker = { path = "crates/rushwind-broker", version = "0.0.1" }
 rushwind-broker-mqtt = { path = "crates/rushwind-broker-mqtt", version = "0.0.1" }
 rushwind-broker-redis = { path = "crates/rushwind-broker-redis", version = "0.0.1" }
+rushwind-broker-gcpubsub = { path = "crates/rushwind-broker-gcpubsub", version = "0.0.1" }
+rushwind-broker-sqs = { path = "crates/rushwind-broker-sqs", version = "0.0.1" }
 rushwind-cache = { path = "crates/rushwind-cache", version = "0.0.1" }
 rushwind-cache-redis = { path = "crates/rushwind-cache-redis", version = "0.0.1" }
 rushwind-ai = { path = "crates/rushwind-ai", version = "0.0.1" }

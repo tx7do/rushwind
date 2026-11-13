@@ -1,0 +1,23 @@
+[package]
+name = "rushwind-broker-gcpubsub"
+description = "Google Cloud Pub/Sub engine for the RushWind broker contract: the v1 REST API over hand-written reqwest — publish/pull/acknowledge, manual settlement via ack deadlines, no SDK."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-broker = { workspace = true }
+rushwind-transport = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }

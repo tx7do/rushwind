@@ -6900,6 +6900,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-broker-gcpubsub"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "reqwest 0.12.28",
+ "rushwind-broker",
+ "rushwind-transport",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-broker-kafka"
 version = "0.0.1"
 dependencies = [
@@ -6979,6 +6992,21 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "rushwind-broker-sqs"
+version = "0.0.1"
+dependencies = [
+ "form_urlencoded",
+ "hmac 0.12.1",
+ "reqwest 0.12.28",
+ "rushwind-broker",
+ "rushwind-transport",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]
