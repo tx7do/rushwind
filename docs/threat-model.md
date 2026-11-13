@@ -48,7 +48,7 @@ before/after 钩子是应用注册的任意代码，运行在停机预算内。�
 
 **残余**：
 - 认证前每连接字节预算（QUIC 层认证前的飞行字节计量，及 tcp 的先认证字节流）
-- 每远端配额（HTTP 族依赖 ConnectInfo 管道；quic 对端地址已可见，计量结构待设计）
+- 每远端配额的 HTTP 族落地（依赖 ConnectInfo 管道；quic 已交付——`max_sessions_per_remote` 按 peer IP 原子计数，2026-11-13）
 
 axum-ws 路径上握手超时不可执行（hyper 的升级即时完成，无可观察的握手窗口）；残余项等其执行点落地时随语义进 `SessionPolicy`——契约不收编死字段。
 

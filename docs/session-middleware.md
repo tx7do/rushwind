@@ -21,7 +21,7 @@
 | 会话上限准入 | 升级回调入口的原子准入检查；竞态通过者直接关闭 | 连接建立时刻的原子准入检查；超限连接显式 `Connection::close` | 连接建立时刻的原子准入检查；超限连接显式 `Connection::close`（wtransport `Connection::close`） | 连接建立时刻的原子准入检查；超限连接显式 `Connection::close` | **N/A** | 待定 |
 | 握手超时 | N/A（hyper 的升级即时完成，无可观察的握手窗口） | `Connecting` future 与截止竞速，超时即丢弃、握手中断 | 会话请求 future（QUIC 握手 + 请求到达）与截止竞速，超时即丢弃 | `Connecting` future 与截止竞速，超时即丢弃、握手中断 | **N/A**（broker 侧由连接超时与 keepalive 覆盖） | 待交付 |
 | 未认证字节预算 | N/A（升级完成前无帧） | 待交付（QUIC 层认证前的飞行字节计量） | 待交付（QUIC 层认证前的飞行字节计量） | 待交付（QUIC 层认证前的飞行字节计量） | **N/A**（订阅即认证后） | 待交付 |
-| 每远端配额 | 不可用（HTTP 族监听器暂不暴露对端地址；ConnectInfo 管道是前置条件） | 不可用（同 axum-ws） | 不可用（同 axum-ws） | 待交付（对端地址已可见，见下行） | **N/A**（对端是 broker 本身） | 待交付 |
+| 每远端配额 | 不可用（HTTP 族监听器暂不暴露对端地址；ConnectInfo 管道是前置条件） | 不可用（同 axum-ws） | 不可用（同 axum-ws） | **已交付（2026-11-13）**：`SessionPolicy::max_sessions_per_remote` + `SessionCounter::admit_with_remote` 按 peer IP 原子计数，空闲条目从映射表摘除（表不随对端数增长） | **N/A**（对端是 broker 本身） | 待交付 |
 | 对端地址可见性（`Handshake.remote`） | `None` | `None` | `None` | `Some(peer)`——门可据实裁决；`gates_observe_peer_address` 用例固定 | **N/A**（无门；对端是 broker 本身） | 各自协议提供则填 |
 
 mqtt 消费桥是矩阵里的第三种形态：它不是"面向不可信客户端的服务器"，而是**通往预信任基础设施的单条消费连接**——会话中间件的全部机制对它都是 N/A，其安全边界是 broker 连接配置（凭证/TLS）与应用层对不可信 payload 的处理。契约只收编当下可执行的字段：`SessionPolicy` 目前含会话上限与握手超时（quic 路径上两者均有真实执行点），字节预算与每远端配额等其执行点落地时随语义一起定义。

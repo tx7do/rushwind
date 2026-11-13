@@ -1,0 +1,18 @@
+[package]
+name = "oss-multipart"
+description = "RushWind oss demo: multipart upload (begin/put/complete/abort) against the local engine plus presigned URLs from the S3 engine (set OSS_S3_* to run that half)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-oss = { workspace = true }
+rushwind-oss-local = { workspace = true }
+rushwind-oss-s3 = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

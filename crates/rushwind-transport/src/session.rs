@@ -13,9 +13,10 @@
 //! session-shutdown bus live in `docs/session-middleware.md` in the
 //! repository root.
 
-use std::net::SocketAddr;
+use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// A transport-neutral snapshot of one session handshake, as visible to
@@ -119,6 +120,7 @@ impl GateChain {
 #[derive(Default)]
 pub struct SessionPolicy {
     max_concurrent_sessions: Option<usize>,
+    max_sessions_per_remote: Option<usize>,
     handshake_timeout: Option<Duration>,
 }
 
@@ -139,6 +141,23 @@ impl SessionPolicy {
     /// The configured simultaneous-session cap, if any.
     pub fn get_max_concurrent_sessions(&self) -> Option<usize> {
         self.max_concurrent_sessions
+    }
+
+    /// Caps the number of simultaneously live sessions **per peer IP**
+    /// (the port varies per connection; the count is per address). One
+    /// peer cannot crowd the route's whole budget. Enforceable only
+    /// where the transport exposes the peer address — raw transports
+    /// (QUIC today) enforce it, HTTP-family listeners cannot until
+    /// connect-info plumbing lands, and a `None` remote makes the cap
+    /// inert there.
+    pub fn max_sessions_per_remote(mut self, n: usize) -> Self {
+        self.max_sessions_per_remote = Some(n);
+        self
+    }
+
+    /// The configured per-peer cap, if any.
+    pub fn get_max_sessions_per_remote(&self) -> Option<usize> {
+        self.max_sessions_per_remote
     }
 
     /// Bounds the wall-clock budget a single handshake may consume.
@@ -164,6 +183,10 @@ impl SessionPolicy {
 /// cap can never leak slots.
 pub struct SessionCounter {
     live: Arc<AtomicUsize>,
+    /// The per-peer live counts, keyed by IP (the port varies per
+    /// connection). Shared with the emitted guards so their drop can
+    /// remove idle entries; the lock guards only the count swap.
+    per_remote: Arc<Mutex<BTreeMap<IpAddr, Arc<AtomicUsize>>>>,
 }
 
 impl Default for SessionCounter {
@@ -177,6 +200,7 @@ impl SessionCounter {
     pub fn new() -> Self {
         Self {
             live: Arc::new(AtomicUsize::new(0)),
+            per_remote: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -185,6 +209,48 @@ impl SessionCounter {
     /// check is [`SessionCounter::admit`].
     pub fn at_cap(&self, cap: Option<usize>) -> bool {
         cap.is_some_and(|cap| self.live.load(Ordering::Relaxed) >= cap)
+    }
+
+    /// Attempts admission under both caps at once: the route-wide
+    /// `total_cap` and the per-peer-IP `per_remote_cap`. The remote's
+    /// IP drives the per-peer count; `None` (HTTP-family transports
+    /// before connect-info plumbing) makes that cap inert. Returns the
+    /// total guard and, when the per-peer cap applies, its guard —
+    /// both decrement on drop. `None` total means uncapped: the
+    /// per-peer cap may still refuse a peer that crowded the route.
+    pub fn admit_with_remote(
+        &self,
+        total_cap: Option<usize>,
+        per_remote_cap: Option<usize>,
+        remote: Option<SocketAddr>,
+    ) -> Option<(SessionCounterGuard, Option<PerRemoteGuard>)> {
+        let total = self.admit(total_cap)?;
+        let per_remote = match (per_remote_cap, remote) {
+            (Some(cap), Some(addr)) => {
+                let ip = addr.ip();
+                let counter = {
+                    let mut peers = self.per_remote.lock().expect("per-remote map poisoned");
+                    Arc::clone(
+                        peers
+                            .entry(ip)
+                            .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+                    )
+                };
+                let prev = counter.fetch_add(1, Ordering::Relaxed);
+                if prev >= cap {
+                    counter.fetch_sub(1, Ordering::Relaxed);
+                    drop(total);
+                    return None;
+                }
+                Some(PerRemoteGuard {
+                    peers: Arc::clone(&self.per_remote),
+                    ip,
+                    live: Some(Arc::clone(&counter)),
+                })
+            }
+            _ => None,
+        };
+        Some((total, per_remote))
     }
 
     /// Attempts admission under `cap`, returning a guard that decrements
@@ -211,6 +277,30 @@ impl SessionCounter {
 /// variant decrements the counter on drop; the uncapped variant is inert.
 pub struct SessionCounterGuard {
     live: Option<Arc<AtomicUsize>>,
+}
+
+/// The per-peer-IP half of a per-remote admission: decrements the
+/// peer's live count on drop and drops the map entry once a peer is
+/// fully idle (the map cannot grow with the peer population).
+pub struct PerRemoteGuard {
+    peers: Arc<Mutex<BTreeMap<IpAddr, Arc<AtomicUsize>>>>,
+    ip: IpAddr,
+    live: Option<Arc<AtomicUsize>>,
+}
+
+impl Drop for PerRemoteGuard {
+    fn drop(&mut self) {
+        if let Some(live) = &self.live {
+            let remaining = live.fetch_sub(1, Ordering::Relaxed);
+            if remaining <= 1 {
+                // Idle peer: drop the entry so the map stays bounded.
+                self.peers
+                    .lock()
+                    .expect("per-remote map poisoned")
+                    .remove(&self.ip);
+            }
+        }
+    }
 }
 
 impl Drop for SessionCounterGuard {
@@ -323,5 +413,69 @@ mod tests {
             assert!(counter.admit(None).is_some());
         }
         assert!(!counter.at_cap(None));
+    }
+
+    #[test]
+    fn per_remote_cap_refuses_one_peer_but_not_another() {
+        let counter = SessionCounter::new();
+        let peer_a: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let peer_a2: std::net::SocketAddr = "10.0.0.1:5001".parse().unwrap();
+        let peer_b: std::net::SocketAddr = "10.0.0.2:5000".parse().unwrap();
+
+        // Peer A fills its per-IP budget (2).
+        let guard_a1 = counter
+            .admit_with_remote(None, Some(2), Some(peer_a))
+            .expect("peer a slot 1");
+        let _guard_a2 = counter
+            .admit_with_remote(None, Some(2), Some(peer_a2))
+            .expect("peer a slot 2 (same IP, other port)");
+        assert!(
+            counter
+                .admit_with_remote(None, Some(2), Some(peer_a))
+                .is_none(),
+            "peer a is at its per-IP cap"
+        );
+        // Peer B is unaffected — the cap is per IP.
+        assert!(
+            counter
+                .admit_with_remote(None, Some(2), Some(peer_b))
+                .is_some(),
+            "peer b admits freely"
+        );
+        drop(guard_a1);
+        // Peer A's released slot admits again.
+        assert!(counter
+            .admit_with_remote(None, Some(2), Some(peer_a))
+            .is_some());
+    }
+
+    #[test]
+    fn per_remote_cap_composes_with_the_total_cap() {
+        let counter = SessionCounter::new();
+        let peer_a: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let peer_b: std::net::SocketAddr = "10.0.0.2:5000".parse().unwrap();
+
+        let _a = counter
+            .admit_with_remote(Some(2), Some(1), Some(peer_a))
+            .expect("peer a");
+        let _b = counter
+            .admit_with_remote(Some(2), Some(1), Some(peer_b))
+            .expect("peer b — the total cap has room");
+        // The total cap is now full: a third peer refuses even though
+        // its own per-IP budget is untouched.
+        let peer_c: std::net::SocketAddr = "10.0.0.3:5000".parse().unwrap();
+        assert!(counter
+            .admit_with_remote(Some(2), Some(1), Some(peer_c))
+            .is_none());
+    }
+
+    #[test]
+    fn a_none_remote_makes_the_per_remote_cap_inert() {
+        let counter = SessionCounter::new();
+        // HTTP-family transports before connect-info plumbing: the cap
+        // cannot apply, admission succeeds repeatedly.
+        for _ in 0..5 {
+            assert!(counter.admit_with_remote(None, Some(1), None).is_some());
+        }
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "broker-manual-ack"
+description = "RushWind broker demo: AckMode::Manual settlement — the handler acks successes and nacks poison messages (requeue), with the error-handler observation point alongside."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-broker = { workspace = true }
+rushwind-broker-mqtt = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }

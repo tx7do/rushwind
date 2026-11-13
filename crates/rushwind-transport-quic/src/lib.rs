@@ -225,13 +225,16 @@ impl Server for QuicServer {
                     },
                 };
 
-                // Atomic admission check at connection establishment;
-                // over-cap connections are closed explicitly.
-                let guard = match state
-                    .counter
-                    .admit(state.policy.get_max_concurrent_sessions())
-                {
-                    Some(guard) => guard,
+                // Atomic admission check at connection establishment —
+                // the route-wide cap and (the peer address being visible
+                // on this transport) the per-peer cap together; over-cap
+                // connections are closed explicitly.
+                let (guard, _per_remote) = match state.counter.admit_with_remote(
+                    state.policy.get_max_concurrent_sessions(),
+                    state.policy.get_max_sessions_per_remote(),
+                    handshake.remote,
+                ) {
+                    Some(guards) => guards,
                     None => {
                         connection.close(0u8.into(), b"session capacity reached");
                         continue;

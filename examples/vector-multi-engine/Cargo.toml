@@ -1,0 +1,20 @@
+[package]
+name = "vector-multi-engine"
+description = "RushWind vector demo: one search code path over the in-memory reference engine and the external adapters (qdrant/milvus/weaviate/neo4j shapes), scores bigger-is-more-similar everywhere."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-vector = { workspace = true }
+rushwind-vector-memory = { workspace = true }
+rushwind-vector-qdrant = { workspace = true }
+rushwind-vector-milvus = { workspace = true }
+rushwind-vector-weaviate = { workspace = true }
+rushwind-vector-neo4j = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

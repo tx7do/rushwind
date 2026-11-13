@@ -1285,6 +1285,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "broker-manual-ack"
+version = "0.0.1"
+dependencies = [
+ "rushwind-broker",
+ "rushwind-broker-mqtt",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "bson"
 version = "2.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5297,6 +5307,17 @@ checksum = "49203cdcae0030493bad186b28da2fa25645fa276a51b6fec8010d281e02ef79"
 dependencies = [
  "dlv-list",
  "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "oss-multipart"
+version = "0.0.1"
+dependencies = [
+ "reqwest 0.12.28",
+ "rushwind-oss",
+ "rushwind-oss-local",
+ "rushwind-oss-s3",
+ "tokio",
 ]
 
 [[package]]
@@ -10554,6 +10575,19 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vector-multi-engine"
+version = "0.0.1"
+dependencies = [
+ "rushwind-vector",
+ "rushwind-vector-memory",
+ "rushwind-vector-milvus",
+ "rushwind-vector-neo4j",
+ "rushwind-vector-qdrant",
+ "rushwind-vector-weaviate",
+ "tokio",
+]
 
 [[package]]
 name = "version_check"
