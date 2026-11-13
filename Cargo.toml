@@ -13,6 +13,7 @@ repository = "https://github.com/tx7do/rushwind"
 tokio = "1"
 futures = "0.3"
 futures-core = "0.3"
+criterion = { version = "0.7", features = ["async_tokio"] }
 tokio-util = "0.7"
 rushwind-transport = { path = "crates/rushwind-transport", version = "0.0.1" }
 rushwind-core = { path = "crates/rushwind-core", version = "0.0.1" }
@@ -107,6 +108,9 @@ rushwind-password-pbkdf2 = { path = "crates/rushwind-password-pbkdf2", version =
 rushwind-vector = { path = "crates/rushwind-vector", version = "0.0.1" }
 rushwind-vector-memory = { path = "crates/rushwind-vector-memory", version = "0.0.1" }
 rushwind-vector-qdrant = { path = "crates/rushwind-vector-qdrant", version = "0.0.1" }
+rushwind-vector-milvus = { path = "crates/rushwind-vector-milvus", version = "0.0.1" }
+rushwind-vector-weaviate = { path = "crates/rushwind-vector-weaviate", version = "0.0.1" }
+rushwind-vector-neo4j = { path = "crates/rushwind-vector-neo4j", version = "0.0.1" }
 # Distributed locks: contract + engines.
 rushwind-lock = { path = "crates/rushwind-lock", version = "0.0.1" }
 rushwind-lock-memory = { path = "crates/rushwind-lock-memory", version = "0.0.1" }

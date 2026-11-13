@@ -16,5 +16,10 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 rushwind-testkit = { workspace = true, features = ["vector"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[bench]]
+name = "search"
+harness = false
