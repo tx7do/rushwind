@@ -74,6 +74,8 @@ pub trait Limiter: Send + Sync {
 
 - **`ratelimit-tokenbucket`**：经典令牌桶，启动即满桶（突发先给足）。`rate`/`burst` ≤ 0 是构造错误。`wait` 精确等待令牌缺口（每令牌 1/rate 秒）。
 - **`ratelimit-bbr`**：BBR 自适应——按最小 RTT/QPS 窗口推算最大并发在途数。**请求结束必须调 `done(rtt)`**，否则在途槽泄漏、限流器逐渐失真。
+- **`ratelimit-slidingwindow`**：滑动窗口日志——任意滑动窗内至多 `limit` 次，边界精确（无固定窗双预算缝），日志内存以 `limit` 为界。
+- **`ratelimit-leakybucket`**：漏桶整流——背漏恒速排出、准入按 `drain_rate` 节流、空闲不攒额度（与令牌桶的突发语义相对）。两者都带注入钟（测试零真实 sleep）。
 
 ```rust
 let limiter = TokenBucket::new(TokenBucketOptions { rate: 50.0, burst: 20.0 })?;
