@@ -47,7 +47,7 @@ let handler = json_handler(|event: Event, payload: OrderCreated| async move {
 broker.subscribe("orders", handler).await?;   // json_handler 返回的就是 Handler
 ```
 
-## 七种引擎的取舍
+## 十种引擎的取舍
 
 | 引擎 | 构造 | 通配订阅 | header 载体 | request/response | 语义要点 |
 |:---|:---|:---|:---|:---|:---|

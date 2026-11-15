@@ -1,6 +1,6 @@
 # 06 · 认证与鉴权
 
-> 本章目标：掌握 `Authenticator`/`Engine` 两份安全契约、七种认证引擎与三种鉴权引擎的取舍，以及 HTTP 面上的装配规则与两大坑。
+> 本章目标：掌握 `Authenticator`/`Engine` 两份安全契约、八种认证引擎与三种鉴权引擎的取舍，以及 HTTP 面上的装配规则与两大坑。
 
 前置：[05 · HTTP 服务栈](05-http-edge.md)。
 
@@ -18,7 +18,7 @@ pub trait Authenticator: Send + Sync {
 
 `AuthClaims` 是 JSON 包（带 `get_subject`/`get_scopes` 等类型化读取器）。`create_identity` 是"铸造"：JWT 引擎签 token、session 引擎建会话返回会话 ID——引擎既能验也能发。
 
-## 七种认证引擎
+## 八种认证引擎
 
 | 引擎 | 凭据形态 | 身份来源 | 典型场景 |
 |:---|:---|:---|:---|

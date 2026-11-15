@@ -1,6 +1,6 @@
 # 02 · 装配器与配置
 
-> 本章目标：学会两条装配路径——代码里的 `App::builder` 与配置驱动的 `Bootstrap`；掌握配置域的 `Source` 契约、五种来源与回退链。
+> 本章目标：学会两条装配路径——代码里的 `App::builder` 与配置驱动的 `Bootstrap`；掌握配置域的 `Source` 契约、八种来源与回退链。
 
 前置：[01 · 生命周期与第一个服务](01-hello-rushwind.md)。
 
@@ -107,7 +107,7 @@ pub trait Source: Send + Sync {
 }
 ```
 
-三种能力、五种实现：
+三种能力、八种实现：
 
 | 实现 | load | 推送监听 | 说明 |
 |:---|:---|:---|:---|
@@ -116,6 +116,10 @@ pub trait Source: Send + Sync {
 | `config-consul` | Consul KV | ✓（阻塞查询） | 缺 key（404）= `Ok(None)`；live |
 | `config-etcd` | etcd KV | ✓（原生 watch） | 缺 key = `Ok(None)`；live |
 | `config-http` | HTTP GET | 轮询（默认 30s） | 404 = `Ok(None)`，其余非 2xx = `Err` |
+| `config-embedded` | 编译期嵌入 | ✗ | 链接期事实 |
+| `config-apollo` | Apollo Server REST | 长轮询 | canonical key-sorted JSON；404 = `Ok(None)` |
+| `config-nacos` | Nacos v1 cs/configs REST | 轮询（默认 30s） | 原文直传；404 = `Ok(None)`；tenant/accessToken |
+| `config-kubernetes` | K8s ConfigMap REST | 轮询（默认 30s） | `data` map 规范化 key-sorted JSON；404 = `Ok(None)`；namespace/token |
 
 每个引擎都有 `from_settings(serde_json::Value)`，对应 bootstrap 工厂的 settings 线格式：
 
