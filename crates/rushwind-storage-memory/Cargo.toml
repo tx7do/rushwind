@@ -14,5 +14,10 @@ workspace = true
 rushwind-storage = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 rushwind-testkit = { workspace = true, features = ["storage"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[bench]]
+name = "crud"
+harness = false

@@ -7858,6 +7858,7 @@ dependencies = [
 name = "rushwind-storage-memory"
 version = "0.0.1"
 dependencies = [
+ "criterion",
  "rushwind-storage",
  "rushwind-testkit",
  "tokio",
