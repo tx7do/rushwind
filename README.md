@@ -258,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `crates/rushwind-workflow` | 工作流契约：上游 Client.Close + Worker.Stop/IsRunning 生命周期 + submit/status/cancel/run 实用面，manifest 不透明 |
 | `crates/rushwind-workflow-memory` | 工作流参考引擎：in-process 状态存储，complete() 驱动相位，worker 轮询至终态（语义基线） |
 | `crates/rushwind-workflow-argo` | Argo Workflows 引擎：Argo Server REST 手写 reqwest——submit(POST manifest)/status(phase 映射)/cancel(terminate)，worker 轮询至终态 |
+| `crates/rushwind-workflow-temporal` | Temporal 引擎：gRPC-gateway HTTP API 手写 reqwest——start/describe/terminate，gRPC 枚举相位映射（TimedOut→Failed），id 由调用方铸造 |
 | `crates/rushwind-broker-rabbitmq` | RabbitMQ 引擎：lapin 上的 AMQP 0-9-1 发布/订阅，走 amq.topic 交换机；AMQP acker/nacker 直挂结算双钩，nack 按 `NackAction` requeue |
 | `crates/rushwind-broker-nats` | NATS 引擎：async-nats 上的 core-NATS 发布/订阅；at-most-once，无 ack 面（文档如实声明） |
 | `crates/rushwind-broker-redis` | Redis 引擎：每 topic 专属订阅连接上的 pub/sub；无确认面（文档如实声明） |
