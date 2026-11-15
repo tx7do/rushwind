@@ -1,6 +1,8 @@
 //! The shared test corpus: an echo server builder (the raw TCP session
 //! echoes every byte back) and a blocking client helper.
 
+#![allow(dead_code)]
+
 use std::net::SocketAddr;
 
 use rushwind_transport_tcp::TcpServer;

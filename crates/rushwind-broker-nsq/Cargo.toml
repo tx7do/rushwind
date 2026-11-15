@@ -1,0 +1,22 @@
+[package]
+name = "rushwind-broker-nsq"
+description = "NSQ engine for the RushWind broker contract: the nsqd binary TCP protocol (v2) hand-written over tokio — PUB/SUB/FIN/REQ, both settlement faces native, no SDK."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-broker = { workspace = true }
+rushwind-transport = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+base64 = "0.22"
+tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros", "io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }
