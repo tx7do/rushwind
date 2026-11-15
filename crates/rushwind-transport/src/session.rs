@@ -79,6 +79,14 @@ pub struct GateChain {
     gates: Vec<Arc<dyn HandshakeGate>>,
 }
 
+impl Clone for GateChain {
+    fn clone(&self) -> Self {
+        Self {
+            gates: self.gates.clone(),
+        }
+    }
+}
+
 impl Default for GateChain {
     fn default() -> Self {
         Self::new()
@@ -86,6 +94,14 @@ impl Default for GateChain {
 }
 
 impl GateChain {
+    /// Creates an empty chain. An empty chain accepts every handshake —
+    /// mount gates explicitly on auth-sensitive routes.
+    /// The registered gate names, in evaluation order — diagnostics
+    /// for transports whose Debug surfaces the chain.
+    pub fn gate_names(&self) -> Vec<String> {
+        self.gates.iter().map(|gate| gate.name()).collect()
+    }
+
     /// Creates an empty chain. An empty chain accepts every handshake —
     /// mount gates explicitly on auth-sensitive routes.
     pub fn new() -> Self {
@@ -117,7 +133,7 @@ impl GateChain {
 /// separate from any post-auth application-level limiting. Fields exist
 /// only for the controls a concrete transport can actually enforce; see
 /// `docs/session-middleware.md` for the per-transport enforcement matrix.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SessionPolicy {
     max_concurrent_sessions: Option<usize>,
     max_sessions_per_remote: Option<usize>,

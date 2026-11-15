@@ -8105,6 +8105,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-transport-tcp"
+version = "0.0.1"
+dependencies = [
+ "futures",
+ "rushwind-core",
+ "rushwind-testkit",
+ "rushwind-transport",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-transport-webtransport"
 version = "0.0.1"
 dependencies = [

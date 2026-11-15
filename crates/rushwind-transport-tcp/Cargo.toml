@@ -1,0 +1,21 @@
+[package]
+name = "rushwind-transport-tcp"
+description = "Raw TCP transport for the RushWind server lifecycle contract: an accept-loop server carrying the session middleware face — gate chain on the peer address, route-wide and per-remote quotas, native socket sessions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-transport = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
+
+[dev-dependencies]
+rushwind-core = { workspace = true }
+rushwind-testkit = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }

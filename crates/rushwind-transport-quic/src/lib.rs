@@ -229,7 +229,10 @@ impl Server for QuicServer {
                 // the route-wide cap and (the peer address being visible
                 // on this transport) the per-peer cap together; over-cap
                 // connections are closed explicitly.
-                let (guard, _per_remote) = match state.counter.admit_with_remote(
+                // Both guards ride the session's spawned task: dropping
+                // either at the accept-loop iteration's end would free
+                // the slots while the session is still live.
+                let (guard, per_remote) = match state.counter.admit_with_remote(
                     state.policy.get_max_concurrent_sessions(),
                     state.policy.get_max_sessions_per_remote(),
                     handshake.remote,
@@ -250,6 +253,7 @@ impl Server for QuicServer {
                 let session_handler = (state.session)(connection);
                 tokio::spawn(async move {
                     let _guard = guard;
+                    let _per_remote = per_remote;
                     tokio::select! {
                         _ = session_stop.wait() => {
                             handle.close(0u8.into(), b"server shutting down");
