@@ -253,6 +253,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `crates/rushwind-broker-gcpubsub` | Google Cloud Pub/Sub 引擎：v1 REST 手写 reqwest——publish/pull/acknowledge，manual 结算走 ack deadline 清零（零即立即可重投），token 由部署供给与刷新 |
 | `crates/rushwind-broker-sqs` | Amazon SQS 引擎：Query API 手写 reqwest + 手写 SigV4（参考向量钉死签名链）——SendMessage/ReceiveMessage/DeleteMessage/ChangeMessageVisibility，manual 结算 = 删除或可见性归零 |
 | `crates/rushwind-broker-nsq` | NSQ 引擎：nsqd v2 二进制协议手写 tokio（无 SDK）——PUB/SUB/FIN/REQ，Identify 关心跳，Manual 结算 = FIN(成功)/REQ 0(立即重投)，头走 JSON 信封（payload base64） |
+| `crates/rushwind-workflow` | 工作流契约：上游 Client.Close + Worker.Stop/IsRunning 生命周期 + submit/status/cancel/run 实用面，manifest 不透明 |
+| `crates/rushwind-workflow-memory` | 工作流参考引擎：in-process 状态存储，complete() 驱动相位，worker 轮询至终态（语义基线） |
+| `crates/rushwind-workflow-argo` | Argo Workflows 引擎：Argo Server REST 手写 reqwest——submit(POST manifest)/status(phase 映射)/cancel(terminate)，worker 轮询至终态 |
 | `crates/rushwind-broker-rabbitmq` | RabbitMQ 引擎：lapin 上的 AMQP 0-9-1 发布/订阅，走 amq.topic 交换机；AMQP acker/nacker 直挂结算双钩，nack 按 `NackAction` requeue |
 | `crates/rushwind-broker-nats` | NATS 引擎：async-nats 上的 core-NATS 发布/订阅；at-most-once，无 ack 面（文档如实声明） |
 | `crates/rushwind-broker-redis` | Redis 引擎：每 topic 专属订阅连接上的 pub/sub；无确认面（文档如实声明） |

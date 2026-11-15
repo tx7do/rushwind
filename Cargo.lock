@@ -8217,6 +8217,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-workflow"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "rushwind-workflow-argo"
+version = "0.0.1"
+dependencies = [
+ "reqwest 0.12.28",
+ "rushwind-workflow",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rushwind-workflow-memory"
+version = "0.0.1"
+dependencies = [
+ "rushwind-testkit",
+ "rushwind-workflow",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rust-ini"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
