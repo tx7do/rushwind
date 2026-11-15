@@ -54,7 +54,22 @@ pub(crate) fn condition_json(
     condition: &Condition,
     mapped: FieldMapper,
 ) -> Result<Json, rushwind_storage::StorageError> {
-    let field = mapped(&condition.field);
+    // The point-path face: key steps join the field's dotted path
+    // (Elasticsearch walks objects natively); numeric steps have no
+    // face — arrays are implicit in ES, there is no positional
+    // indexing to translate — so they refuse rather than silently
+    // matching every element.
+    let field = match &condition.json_path {
+        Some(path) => {
+            if path.split('.').any(|step| step.parse::<usize>().is_ok()) {
+                return Err(rushwind_storage::StorageError::Unsupported(
+                    "json_path array indexes have no Elasticsearch face".into(),
+                ));
+            }
+            mapped(&format!("{}.{}", condition.field, path))
+        }
+        None => mapped(&condition.field),
+    };
     let field_borrow = field.as_str();
     let first = || condition.values.first().cloned().unwrap_or(Value::Null);
     let scalar = |value: &Value| match value {

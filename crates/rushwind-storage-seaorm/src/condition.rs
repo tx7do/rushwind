@@ -130,6 +130,11 @@ pub(crate) fn translate(node: &FilterNode, backend: DbBackend) -> Result<Conditi
                 let operand = cond.values.first().cloned().unwrap_or(Value::Null);
                 return json_condition(&cond.field, cond.op, &operand, backend);
             }
+            // The point-path face: the extraction expression replaces
+            // the plain column reference, per dialect.
+            if let Some(path) = &cond.json_path {
+                return Ok(json_path_condition(cond, path, backend));
+            }
             let col = Expr::col(Alias::new(&cond.field));
             let first = || cond.values.first().cloned().unwrap_or(Value::Null);
             let pattern = |fmt: fn(&str) -> String| match first().as_str() {
@@ -391,4 +396,260 @@ fn sqlite_element_sql(field: &str, element: &Value) -> Result<Condition, Storage
         )),
         _ => Ok(sqlite_each_membership(field, element)),
     }
+}
+
+/// The point-path face: the dotted path extracts a subvalue out of the
+/// column's JSON document, and the operator rides the extraction.
+///
+/// - SQLite: `json_extract("col", '$.a[0]')` — dynamic typing makes
+///   every comparison honest (numbers numeric, text textual).
+/// - MySQL: `JSON_UNQUOTE(JSON_EXTRACT(...))` — the unquote keeps
+///   string comparisons textual (numbers compare natively).
+/// - PostgreSQL: the JSON chain — every step `->` (JSON), values
+///   bound as `CAST(? AS jsonb)` so jsonb's own equality/ordering
+///   carries the operator; the pattern family extracts text
+///   (`->>` final step) since patterns apply to text.
+fn json_path_condition(
+    cond: &rushwind_storage::Condition,
+    path: &str,
+    backend: DbBackend,
+) -> Condition {
+    use rushwind_storage::Op;
+    let column = cond.field.clone();
+    let operand = || cond.values.first().cloned().unwrap_or(Value::Null);
+    let text_op = matches!(
+        cond.op,
+        Op::Like
+            | Op::NotLike
+            | Op::Ilike
+            | Op::Iexact
+            | Op::Contains
+            | Op::StartsWith
+            | Op::EndsWith
+    );
+    match backend {
+        DbBackend::Postgres => {
+            // JSON chain: keys quote, indexes don't; the final step
+            // extracts text for the pattern family, JSON otherwise.
+            let mut chain = format!("\"{}\"", column);
+            let steps = path.split('.');
+            let last = steps.clone().count().saturating_sub(1);
+            for (position, step) in steps.enumerate() {
+                let operator = if position == last && text_op {
+                    "->>"
+                } else {
+                    "->"
+                };
+                if step.parse::<usize>().is_ok() {
+                    chain.push_str(&format!("{operator}{step}"));
+                } else {
+                    chain.push_str(&format!("{operator}'{step}'"));
+                }
+            }
+            let pattern = |fmt: fn(&str) -> String| match cond.values.first() {
+                Some(Value::Text(s)) => fmt(s),
+                _ => String::new(),
+            };
+            match cond.op {
+                Op::Eq => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) = CAST(? AS jsonb)"),
+                    [sea_value(&operand())],
+                )),
+                Op::NotEq => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) <> CAST(? AS jsonb) OR ({chain}) IS NULL"),
+                    [sea_value(&operand())],
+                )),
+                Op::In => Condition::all().add(Expr::cust_with_values(
+                    format!(
+                        "({chain}) IN ({})",
+                        cond.values
+                            .iter()
+                            .map(|_| "?".to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    cond.values.iter().map(sea_value).collect::<Vec<_>>(),
+                )),
+                Op::NotIn => Condition::all().add(Expr::cust_with_values(
+                    format!(
+                        "({chain}) NOT IN ({}) OR ({chain}) IS NULL",
+                        cond.values
+                            .iter()
+                            .map(|_| "?".to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    cond.values.iter().map(sea_value).collect::<Vec<_>>(),
+                )),
+                Op::Gt => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) > CAST(? AS jsonb)"),
+                    [sea_value(&operand())],
+                )),
+                Op::Gte => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) >= CAST(? AS jsonb)"),
+                    [sea_value(&operand())],
+                )),
+                Op::Lt => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) < CAST(? AS jsonb)"),
+                    [sea_value(&operand())],
+                )),
+                Op::Lte => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) <= CAST(? AS jsonb)"),
+                    [sea_value(&operand())],
+                )),
+                Op::Between => {
+                    let lo = cond.values.first().cloned().unwrap_or(Value::Null);
+                    let hi = cond.values.get(1).cloned().unwrap_or(Value::Null);
+                    Condition::all().add(Expr::cust_with_values(
+                        format!("({chain}) >= CAST(? AS jsonb) AND ({chain}) <= CAST(? AS jsonb)"),
+                        [sea_value(&lo), sea_value(&hi)],
+                    ))
+                }
+                Op::NotBetween => {
+                    let lo = cond.values.first().cloned().unwrap_or(Value::Null);
+                    let hi = cond.values.get(1).cloned().unwrap_or(Value::Null);
+                    Condition::all().add(Expr::cust_with_values(
+                        format!("({chain}) < CAST(? AS jsonb) OR ({chain}) > CAST(? AS jsonb)"),
+                        [sea_value(&lo), sea_value(&hi)],
+                    ))
+                }
+                Op::Like => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) LIKE ?"),
+                    [pattern(|s| s.to_owned())],
+                )),
+                Op::NotLike => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) NOT LIKE ?"),
+                    [pattern(|s| s.to_owned())],
+                )),
+                Op::Ilike => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) ILIKE ?"),
+                    [pattern(|s| s.to_lowercase())],
+                )),
+                Op::Iexact => Condition::all().add(Expr::cust_with_values(
+                    format!("LOWER({chain}) = ?"),
+                    [match cond.values.first() {
+                        Some(Value::Text(s)) => sea_orm::sea_query::Value::from(s.to_lowercase()),
+                        _ => sea_orm::sea_query::Value::from(String::new()),
+                    }],
+                )),
+                Op::Contains => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) LIKE ?"),
+                    [pattern(|s| format!("%{s}%"))],
+                )),
+                Op::StartsWith => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) LIKE ?"),
+                    [pattern(|s| format!("{s}%"))],
+                )),
+                Op::EndsWith => Condition::all().add(Expr::cust_with_values(
+                    format!("({chain}) LIKE ?"),
+                    [pattern(|s| format!("%{s}"))],
+                )),
+                Op::IsNull => Condition::all().add(Expr::cust(format!("({chain}) IS NULL"))),
+                Op::IsNotNull => Condition::all().add(Expr::cust(format!("({chain}) IS NOT NULL"))),
+                _ => Condition::all(),
+            }
+        }
+        DbBackend::MySql => {
+            let path_literal = sqlite_path(path);
+            let expression = format!("JSON_UNQUOTE(JSON_EXTRACT(\"{column}\", '{path_literal}'))");
+            let col = Expr::cust(expression.clone());
+            let first = || cond.values.first().cloned().unwrap_or(Value::Null);
+            let pattern = |fmt: fn(&str) -> String| match cond.values.first() {
+                Some(Value::Text(s)) => fmt(s),
+                _ => String::new(),
+            };
+            match cond.op {
+                Op::Eq => col.eq(bind(&first())),
+                Op::NotEq => col.ne(bind(&first())),
+                Op::Gt => col.gt(bind(&first())),
+                Op::Gte => col.gte(bind(&first())),
+                Op::Lt => col.lt(bind(&first())),
+                Op::Lte => col.lte(bind(&first())),
+                Op::In => col.is_in(cond.values.iter().map(bind).collect::<Vec<Expr>>()),
+                Op::NotIn => col.is_not_in(cond.values.iter().map(bind).collect::<Vec<Expr>>()),
+                Op::IsNull => col.is_null(),
+                Op::IsNotNull => col.is_not_null(),
+                Op::Between => {
+                    let lo = cond.values.first().cloned().unwrap_or(Value::Null);
+                    let hi = cond.values.get(1).cloned().unwrap_or(Value::Null);
+                    col.between(bind(&lo), bind(&hi))
+                }
+                Op::NotBetween => {
+                    let lo = cond.values.first().cloned().unwrap_or(Value::Null);
+                    let hi = cond.values.get(1).cloned().unwrap_or(Value::Null);
+                    col.not_between(bind(&lo), bind(&hi))
+                }
+                Op::Like => col.like(pattern(|s| s.to_owned())),
+                Op::NotLike => col.not_like(pattern(|s| s.to_owned())),
+                Op::Ilike => Expr::from(Func::lower(col)).like(pattern(|s| s.to_lowercase())),
+                Op::Iexact => Expr::from(Func::lower(col)).eq(pattern(|s| s.to_lowercase())),
+                Op::Contains => col.like(pattern(|s| format!("%{s}%"))),
+                Op::StartsWith => col.like(pattern(|s| format!("{s}%"))),
+                Op::EndsWith => col.like(pattern(|s| format!("%{s}"))),
+                // The containment pair never reaches here (the
+                // contract refuses them with a json_path).
+                _ => unreachable!("json_path carries no containment ops"),
+            }
+            .into()
+        }
+        _ => {
+            let path_literal = sqlite_path(path);
+            let expression = format!("json_extract(\"{}\", '{path_literal}')", cond.field);
+            let col = Expr::cust(expression.clone());
+            let first = || cond.values.first().cloned().unwrap_or(Value::Null);
+            let pattern = |fmt: fn(&str) -> String| match cond.values.first() {
+                Some(Value::Text(s)) => fmt(s),
+                _ => String::new(),
+            };
+            match cond.op {
+                Op::Eq => col.eq(bind(&first())),
+                Op::NotEq => col.ne(bind(&first())),
+                Op::Gt => col.gt(bind(&first())),
+                Op::Gte => col.gte(bind(&first())),
+                Op::Lt => col.lt(bind(&first())),
+                Op::Lte => col.lte(bind(&first())),
+                Op::In => col.is_in(cond.values.iter().map(bind).collect::<Vec<Expr>>()),
+                Op::NotIn => col.is_not_in(cond.values.iter().map(bind).collect::<Vec<Expr>>()),
+                Op::IsNull => col.is_null(),
+                Op::IsNotNull => col.is_not_null(),
+                Op::Between => {
+                    let lo = cond.values.first().cloned().unwrap_or(Value::Null);
+                    let hi = cond.values.get(1).cloned().unwrap_or(Value::Null);
+                    col.between(bind(&lo), bind(&hi))
+                }
+                Op::NotBetween => {
+                    let lo = cond.values.first().cloned().unwrap_or(Value::Null);
+                    let hi = cond.values.get(1).cloned().unwrap_or(Value::Null);
+                    col.not_between(bind(&lo), bind(&hi))
+                }
+                Op::Like => col.like(pattern(|s| s.to_owned())),
+                Op::NotLike => col.not_like(pattern(|s| s.to_owned())),
+                Op::Ilike => Expr::from(Func::lower(col)).like(pattern(|s| s.to_lowercase())),
+                Op::Iexact => Expr::from(Func::lower(col)).eq(pattern(|s| s.to_lowercase())),
+                Op::Contains => col.like(pattern(|s| format!("%{s}%"))),
+                Op::StartsWith => col.like(pattern(|s| format!("{s}%"))),
+                Op::EndsWith => col.like(pattern(|s| format!("%{s}"))),
+                // The containment pair never reaches here (the
+                // contract refuses them with a json_path).
+                _ => unreachable!("json_path carries no containment ops"),
+            }
+            .into()
+        }
+    }
+}
+
+/// The SQLite/MySQL JSON path literal for a dotted contract path
+/// (`a.b.0` → `$.a.b[0]`; the steps are validate-checked barewords
+/// and indexes, so no escaping is needed).
+fn sqlite_path(path: &str) -> String {
+    let mut out = String::from("$");
+    for step in path.split('.') {
+        if step.parse::<usize>().is_ok() {
+            out.push_str(&format!("[{step}]"));
+        } else {
+            out.push('.');
+            out.push_str(step);
+        }
+    }
+    out
 }

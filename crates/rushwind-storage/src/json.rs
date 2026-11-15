@@ -46,6 +46,29 @@ pub fn encode(value: &crate::Value) -> String {
     }
 }
 
+/// Encodes one parsed JSON model value as canonical minified text —
+/// the canonical face of a document extracted mid-path (objects need
+/// their text to ride back as [`crate::Value::Json`]).
+pub fn encode_model(value: &Json) -> String {
+    match value {
+        Json::Null => "null".to_string(),
+        Json::Bool(b) => b.to_string(),
+        Json::Num(n) => encode_number(*n),
+        Json::Str(s) => encode_string(s),
+        Json::Arr(items) => {
+            let rendered: Vec<String> = items.iter().map(encode_model).collect();
+            format!("[{}]", rendered.join(","))
+        }
+        Json::Obj(entries) => {
+            let rendered: Vec<String> = entries
+                .iter()
+                .map(|(key, value)| format!("{}:{}", encode_string(key), encode_model(value)))
+                .collect();
+            format!("{{{}}}", rendered.join(","))
+        }
+    }
+}
+
 /// Renders an f64 without a spurious `.0`-style tail — integral
 /// values stay integral in JSON (the contract's round trip keeps
 /// Int/Real apart).

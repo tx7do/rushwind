@@ -135,9 +135,6 @@ fn condition_to_filter(condition: &FilterCondition) -> Result<ContractFilterExpr
     if !condition.date_part.is_empty() {
         return Err(unsupported("date_part"));
     }
-    if !condition.json_path.is_empty() {
-        return Err(unsupported("json_path"));
-    }
     let field = condition.field.as_str();
     let op = condition.op();
     let mut values = Vec::new();
@@ -152,7 +149,18 @@ fn condition_to_filter(condition: &FilterCondition) -> Result<ContractFilterExpr
             .collect::<Result<Vec<_>, StorageError>>()?,
     );
 
-    let cond = |op: Op, values: Vec<Value>| ContractFilterExpr::cond(field, op, values);
+    // The point-path face: a non-empty json_path targets the value
+    // the path extracts inside the column's JSON document (the
+    // contract's validate checks the path's shape and the column's
+    // kind).
+    let json_path = condition.json_path.trim().to_string();
+    let cond = |op: Op, values: Vec<Value>| {
+        let mut condition = rushwind_storage::Condition::new(field, op, values);
+        if !json_path.is_empty() {
+            condition = condition.with_json_path(json_path.clone());
+        }
+        ContractFilterExpr::from(rushwind_storage::FilterNode::Cond(condition))
+    };
 
     Ok(match op {
         Operator::Unspecified => {

@@ -141,6 +141,11 @@ pub struct Condition {
     pub op: Op,
     /// The operands.
     pub values: Vec<Value>,
+    /// The dotted path inside the column's JSON document (`a.b.0` —
+    /// bareword keys and numeric array indexes). `None` targets the
+    /// column itself; a path targets the value the path extracts (a
+    /// missing path reads NULL, exactly as an absent column does).
+    pub json_path: Option<String>,
 }
 
 impl Condition {
@@ -150,7 +155,15 @@ impl Condition {
             field: field.into(),
             op,
             values: values.into_iter().collect(),
+            json_path: None,
         }
+    }
+
+    /// Targets the dotted path inside the column's JSON document
+    /// instead of the column itself.
+    pub fn with_json_path(mut self, path: impl Into<String>) -> Self {
+        self.json_path = Some(path.into());
+        self
     }
 }
 
@@ -232,7 +245,10 @@ impl FilterExpr {
     }
 
     fn eval_cond(condition: &Condition, row: &crate::record::Record) -> bool {
-        let value = row.get(&condition.field).cloned().unwrap_or(Value::Null);
+        let mut value = row.get(&condition.field).cloned().unwrap_or(Value::Null);
+        if let Some(path) = &condition.json_path {
+            value = extract_json_path(&value, path).unwrap_or(Value::Null);
+        }
         let first = || condition.values.first().cloned().unwrap_or(Value::Null);
         let text_arg = |fmt: fn(&str) -> String| match first().as_str() {
             Some(s) => Value::Text(fmt(s)),
@@ -311,11 +327,40 @@ impl FilterExpr {
                             cond.values.len()
                         )));
                     }
-                    if cond.op.is_text_only() && column.kind != ColumnKind::Text {
+                    // The pattern family applies to text columns — or
+                    // to whatever a json_path extracts (the extracted
+                    // value's kind lives in the document, not the
+                    // schema; the operand kind check below keeps the
+                    // operands textual).
+                    if cond.op.is_text_only()
+                        && column.kind != ColumnKind::Text
+                        && cond.json_path.is_none()
+                    {
                         return Err(StorageError::InvalidQuery(format!(
                             "operator {:#?} applies only to text columns, but {:?} is not",
                             cond.op, cond.field
                         )));
+                    }
+                    if let Some(path) = &cond.json_path {
+                        if column.kind != ColumnKind::Json {
+                            return Err(StorageError::InvalidQuery(format!(
+                                "json_path targets column {:?} of kind {:#?} — only json columns carry documents",
+                                cond.field, column.kind
+                            )));
+                        }
+                        if path_steps(path).is_none() {
+                            return Err(StorageError::InvalidQuery(format!(
+                                "json_path {path:?} is not a dotted path of bareword keys and array indexes"
+                            )));
+                        }
+                    }
+                    if cond.json_path.is_some()
+                        && matches!(cond.op, Op::JsonContains | Op::ArrayContains)
+                    {
+                        return Err(StorageError::InvalidQuery(
+                            "JSON_CONTAINS/ARRAY_CONTAINS run on the whole document — no json_path"
+                                .into(),
+                        ));
                     }
                     if matches!(cond.op, Op::JsonContains | Op::ArrayContains)
                         && column.kind != ColumnKind::Json
@@ -453,6 +498,76 @@ fn json_contains(column: &Value, operand: &Value) -> bool {
         return false;
     };
     crate::json::contains(&hay, &needle)
+}
+
+/// Parses a dotted JSON path: bareword keys and numeric array
+/// indexes (`a.b.0`); `None` for anything else.
+fn path_steps(path: &str) -> Option<Vec<Step>> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut steps = Vec::new();
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        if let Ok(index) = segment.parse::<usize>() {
+            steps.push(Step::Index(index));
+        } else if segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            steps.push(Step::Key(segment.to_string()));
+        } else {
+            return None;
+        }
+    }
+    Some(steps)
+}
+
+/// One path step.
+enum Step {
+    Key(String),
+    Index(usize),
+}
+
+/// Extracts the value a JSON path names: objects walk bareword keys
+/// (the canonical text parses through the contract's own reader),
+/// arrays walk numeric indexes; a missing step is `None` — the
+/// caller reads it as NULL, exactly as an absent column.
+fn extract_json_path(value: &Value, path: &str) -> Option<Value> {
+    let steps = path_steps(path)?;
+    let mut current = value.clone();
+    for step in steps {
+        current = match (step, current) {
+            (Step::Key(key), Value::Json(text)) => {
+                let crate::json::Json::Obj(entries) = crate::json::parse(&text)? else {
+                    return None;
+                };
+                let (_, found) = entries.iter().find(|(k, _)| k == &key)?;
+                json_model_to_value(found)
+            }
+            (Step::Index(index), Value::Array(items)) => items.into_iter().nth(index)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// Converts one parsed JSON model value back into the contract's
+/// kinds (objects ride their canonical text; the model's encoder
+/// renders it).
+fn json_model_to_value(value: &crate::json::Json) -> Value {
+    match value {
+        crate::json::Json::Null => Value::Null,
+        crate::json::Json::Bool(b) => Value::Bool(*b),
+        crate::json::Json::Num(n) => Value::Real(*n),
+        crate::json::Json::Str(s) => Value::Text(s.clone()),
+        crate::json::Json::Arr(items) => {
+            Value::Array(items.iter().map(json_model_to_value).collect())
+        }
+        crate::json::Json::Obj(_) => Value::Json(crate::json::encode_model(value)),
+    }
 }
 
 /// Converts a contract value into the JSON reader's model. `Value::Json`

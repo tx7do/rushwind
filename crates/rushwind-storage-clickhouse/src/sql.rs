@@ -248,6 +248,11 @@ pub(crate) fn condition_sql(condition: &Condition) -> Result<String, StorageErro
                 "JSON_CONTAINS/ARRAY_CONTAINS have no ClickHouse face yet".into(),
             ))
         }
+        _ if condition.json_path.is_some() => {
+            return Err(StorageError::Unsupported(
+                "json_path has no ClickHouse face yet".into(),
+            ))
+        }
         // lowerUTF8 is ClickHouse's Unicode-aware LOWER; the operand
         // folds on the Rust side, as every SQL engine here does.
         Op::Iexact => format!(

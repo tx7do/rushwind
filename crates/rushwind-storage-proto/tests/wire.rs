@@ -195,6 +195,15 @@ fn unsupported_taxonomy_is_named_at_the_boundary() {
     assert_eq!(condition.op, Op::ArrayContains);
     assert_eq!(condition.values, vec![Value::Text("red".to_string())]);
 
+    // The point-path face rides protojson's jsonPath.
+    let expr = filter_expr_from_json(
+        r#"{"conditions": [{"field": "meta", "op": "EQ", "value": 1, "jsonPath": "k"}]}"#,
+    )
+    .expect("jsonPath maps");
+    let condition = leaf_of(&expr);
+    assert_eq!(condition.json_path.as_deref(), Some("k"));
+    assert_eq!(condition.values, vec![Value::Int(1)]);
+
     // The date_part/json_path extensions likewise.
     let err = filter_expr_from_json(
         r#"{"conditions": [{"field": "created_at", "op": "GTE", "value": 1, "datePart": "DAY"}]}"#,

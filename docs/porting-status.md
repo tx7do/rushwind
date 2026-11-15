@@ -26,7 +26,7 @@
 - **script-wasm 能力面**：`GlobalAccessor` 真实现（wasm 标量 Int/UInt/Float/Bool、`env` 导入模块链接进每次实例化、注册表为唯一事实来源）+ `FunctionRegistrar::call_function`（按名调用导出函数，参数按签名严格编组——Bool→整型参数、Int/UInt 范围检查绝不截断、Float→f64/f32；算术不符与未知导出按 Failed 拒绝）。`register_function` 维持拒绝并写明原因：契约 HostFunction 是异步的而 wasmi 同步执行，诚实的桥需要一个 reactor，行内 poll 会死锁任何等待运行时原语的宿主函数。
 - **config/nacos 源**（`rushwind-config-nacos`）：v1 cs/configs REST 读（原文直传、404=缺席、可选 tenant/accessToken），轮询 watch 沿 config-http 形状；mock server 套件钉读/缺席/构造守卫/watch 推送。
 - **broker 毒消息契约前置面**：`NackAction::{Requeue, Drop}` + `Event::nack`（`Nacker`；隐式 ack 引擎为文档化 no-op——投递已落定，无物可退回）与 `with_error_handler`（ErrorHandler 观察点：包装 Handler，错误到达观察者但仍以 Err 面目冒出，投递结算权留在引擎投递循环）。`BrokerError` 补 Clone。**各引擎翻转 manual-ack 仍按需立项**——七个投递循环的逐引擎翻转换来的是另一场战役（kafka seek、rabbitmq manual-ack、redelivery 上限与 live 套件重验）。
-- **storage IEXACT 操作符全矩阵**：契约 `Op::Iexact`（Unicode 折叠精确等值、text-only、一元）接进 wire（此前点名拒绝）、memory 评估器（折叠比较）、seaorm（`LOWER(col) = LOWER(?)`）、mongo（锚定折叠正则）、ES/OpenSearch（`term` 的 `case_insensitive`）、ClickHouse（`lowerUTF8`）；一致性套件与三方言快照各补钉子。REGEXP/IREGEXP 维持 wire 拒绝（前置：契约零依赖doctrine下的正则求值故事）；JSON_CONTAINS/ARRAY_CONTAINS 已于 2026-11-16 全矩阵落地（见架构文档操作符表）；json_path 维持拒绝（前置：各引擎的点路径翻译面，独立立项）。
+- **storage IEXACT 操作符全矩阵**：契约 `Op::Iexact`（Unicode 折叠精确等值、text-only、一元）接进 wire（此前点名拒绝）、memory 评估器（折叠比较）、seaorm（`LOWER(col) = LOWER(?)`）、mongo（锚定折叠正则）、ES/OpenSearch（`term` 的 `case_insensitive`）、ClickHouse（`lowerUTF8`）；一致性套件与三方言快照各补钉子。REGEXP/IREGEXP 维持 wire 拒绝（前置：契约零依赖doctrine下的正则求值故事）；JSON_CONTAINS/ARRAY_CONTAINS/json_path 已于 2026-11-16 全矩阵落地（见架构文档操作符表）。
 - **文档改齐**：security-authn-authz.md 的"bootstrap 尚不装配认证"过时口径更正（bootstrap 经命名实例工厂表装配 authn/authz 并按声明挂 with_authn/with_authorization*）。
 
 testkit 套件增量：storage 一致性套件增 iexact 钉子（折叠大小写不折叠形状）。
@@ -78,7 +78,7 @@ testkit 新增三个特性门控套件：`password`（8 测试：三分面验证
 **明确推迟**（feature 级，非缺陷）：
 
 - 向量检索契约模块（vector/）与 qdrant/milvus/weaviate/neo4j 四引擎：整个向量域未移植，按需立项。
-- JSONB 域（638881f 修的 JsonValue 绑定缺陷）：**JSON_CONTAINS/ARRAY_CONTAINS 已落地（2026-11-16，见架构文档操作符表）**——`Value` 协议 `Json`（规范文本）/`Array`（类型化元素）两种、契约零依赖手写 JSON 读取器承载 MySQL JSON_CONTAINS 语义、wire 收复合值（ListValue→Array / StructValue→Json）、seaorm 三方言 + mongo + ES/OpenSearch 的原生面、JSON 套件钉四组（等值/成员/EQ 往返/NULL）。**仍推迟：json_path 点路径字段扩展**（proto 字段已在、wire 点名拒绝，落地需要各引擎的点路径翻译面与契约定 Condition.json_path）——按需立项。
+- JSONB 域（638881f 修的 JsonValue 绑定缺陷）：**全部落地（2026-11-16，见架构文档操作符表）**——JSON_CONTAINS/ARRAY_CONTAINS 契约算子（`Value` 协议 `Json`/`Array` 两种、契约零依赖手写 JSON 读取器、wire 收复合值、三方言/mongo/ES 原生面）+ **json_path 点路径字段扩展**（契约 `Condition.json_path`、求值器路径抽取缺失读 NULL、wire 收 protojson `jsonPath`、seaorm 三方言抽取链/mongo 点路径原生/ES 键段、cassandra/influx 走 fetch+eval；ClickHouse 的 JSON 族面暂 Unsupported 并声明）；JSON 套件钉五组（等值/成员/EQ 往返/NULL/点路径抽取）。
 - 13→8 引擎口径差：上游新增 qdrant/milvus/weaviate/neo4j（向量），cassandra 仓库层补完对应 Rust 面为契约优先设计（scylla 驱动typed 行反序列化天然规避三缺陷）。
 
 ## 已完成域

@@ -151,7 +151,13 @@ fn like_regex(condition: &Condition) -> Result<Bson, StorageError> {
 /// Translates one leaf condition into its MongoDB predicate document.
 pub(crate) fn condition_to_doc(condition: &Condition) -> Result<Document, StorageError> {
     use Value::Null;
-    let field = condition.field.as_str();
+    // The point-path face: mongo's dotted paths walk documents AND
+    // array indexes natively, so the field and the path simply join.
+    let field = match &condition.json_path {
+        Some(path) => format!("{}.{}", condition.field, path),
+        None => condition.field.clone(),
+    };
+    let field = field.as_str();
     let first = || condition.values.first().cloned().unwrap_or(Null);
     let text_shape = |fmt: fn(&str) -> String| match first() {
         Value::Text(s) => Ok(derived_regex(&Value::Text(s), fmt)?),

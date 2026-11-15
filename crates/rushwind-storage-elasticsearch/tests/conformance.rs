@@ -60,3 +60,7 @@ async fn fresh_tenant_repo() -> Arc<dyn Repository> {
 }
 
 rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant: crate::fresh_tenant_repo);
+
+// The JSON/Array kinds' operator faces + the point-path face —
+// adopted here; the containers' CI runs them.
+rushwind_testkit::rushwind_storage_json_suite!(crate::fresh_repo);

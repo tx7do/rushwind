@@ -378,6 +378,7 @@ fn negate(node: &FilterNode) -> Result<FilterExpr, StorageError> {
                 field: condition.field.clone(),
                 op,
                 values: condition.values.clone(),
+                json_path: condition.json_path.clone(),
             }))
         }
     })

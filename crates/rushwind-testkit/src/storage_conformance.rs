@@ -1384,6 +1384,14 @@ macro_rules! rushwind_storage_json_suite {
                     .collect()
             }
 
+            /// One leaf condition with a dotted json_path.
+            fn cond_path(field: &str, op: Op, values: Vec<Value>, path: &str) -> FilterExpr {
+                FilterExpr::from($crate::rushwind_storage::FilterNode::Cond(
+                    $crate::rushwind_storage::Condition::new(field, op, values)
+                        .with_json_path(path),
+                ))
+            }
+
             #[tokio::test]
             async fn array_contains_matches_top_level_elements() {
                 let repo = fresh_repo().await;
@@ -1470,6 +1478,47 @@ macro_rules! rushwind_storage_json_suite {
                     vec![2i64],
                     "the empty array EQ"
                 );
+            }
+
+            #[tokio::test]
+            async fn json_path_extracts_and_compares() {
+                let repo = fresh_repo().await;
+                seed(&repo).await;
+                // Key steps walk the document; the operator rides the
+                // extracted scalar (missing paths read NULL).
+                let eq = ListQuery::default().filtered(cond_path(
+                    "meta",
+                    Op::Eq,
+                    vec![Value::Int(1)],
+                    "k",
+                ));
+                assert_eq!(ids_of(&repo, &eq).await, vec![3i64], "charlie's k");
+                let eq_text = ListQuery::default().filtered(cond_path(
+                    "meta",
+                    Op::Eq,
+                    vec![Value::Text("two".into())],
+                    "kind",
+                ));
+                assert_eq!(ids_of(&repo, &eq_text).await, vec![3i64], "charlie's kind");
+                // A path into a key only Echo carries.
+                let not_null =
+                    ListQuery::default().filtered(cond_path("meta", Op::IsNotNull, vec![], "tags"));
+                assert_eq!(ids_of(&repo, &not_null).await, vec![5i64]);
+                let missing =
+                    ListQuery::default().filtered(cond_path("meta", Op::IsNull, vec![], "nope"));
+                assert_eq!(
+                    ids_of(&repo, &missing).await,
+                    vec![1i64, 2i64, 3i64, 4i64, 5i64],
+                    "missing paths read NULL on arrays, absent keys, and NULL"
+                );
+                // The pattern family rides the extracted text.
+                let contains = ListQuery::default().filtered(cond_path(
+                    "meta",
+                    Op::Contains,
+                    vec![Value::Text("wo".into())],
+                    "kind",
+                ));
+                assert_eq!(ids_of(&repo, &contains).await, vec![3i64]);
             }
 
             #[tokio::test]
