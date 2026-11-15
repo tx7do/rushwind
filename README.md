@@ -96,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `crates/rushwind-transport` | 契约层：`Server` trait、`StopSignal`、`Instance`、`ServerError` |
 | `crates/rushwind-transport-axum` | axum 适配器：`Router` 接入生命周期，优雅停机映射见架构文档 |
 | `crates/rushwind-transport-ws` | WS 会话路由构建器：门链 + 准入策略 + 会话停机总线，契约见会话中间件文档 [session-middleware.md](./docs/session-middleware.md) |
+| `crates/rushwind-transport-tcp` | 裸 TCP 传输：accept 时刻门链 + 总帽/per-remote 帽原子双检，字节预算如实记 N/A（引擎不碰读路径，TCP 流控即预算），会话类型 = 原生 TcpStream |
 | `crates/rushwind-transport-quic` | QUIC 适配器：quinn 接受循环接入生命周期，全套会话链（对端地址准入、按远端 IP 会话配额）；`stop()` 为真实释放（Endpoint::close） |
 | `crates/rushwind-transport-webtransport` | WebTransport 适配器：wtransport 端点接入生命周期，全套会话链（会话请求时刻的 HTTP 族门链、原子准入、握手截止），`stop()` 为真实释放 |
 | `crates/rushwind-transport-h3` | HTTP/3 适配器：h3/h3-quinn 请求服务接入生命周期，请求时刻门链（拒绝映射为状态响应）与连接级原子准入，`stop()` 为真实释放 |
