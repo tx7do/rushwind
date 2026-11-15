@@ -271,6 +271,7 @@ impl Server for H3Server {
                 let handle = connection.clone();
                 let conn_stop = stop.clone();
                 let conn_state = Arc::clone(&state);
+                let peer = connection.remote_address();
                 tokio::spawn(async move {
                     let _guard = guard;
 
@@ -323,7 +324,10 @@ impl Server for H3Server {
                                     )
                                 })
                                 .collect(),
-                            remote: None,
+                            // The peer address rides the QUIC connection —
+                            // gates and the per-remote quota see the real
+                            // peer on this transport.
+                            remote: Some(peer),
                         };
                         if let Err(rejection) = conn_state.gates.evaluate(&handshake) {
                             let status = StatusCode::from_u16(rejection.status)

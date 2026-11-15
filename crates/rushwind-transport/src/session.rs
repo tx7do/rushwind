@@ -211,6 +211,27 @@ impl SessionCounter {
         cap.is_some_and(|cap| self.live.load(Ordering::Relaxed) >= cap)
     }
 
+    /// The advisory per-IP check without admission: whether this peer
+    /// is at (or over) its configured live-session cap. The
+    /// authoritative check is [`SessionCounter::admit_with_remote`];
+    /// pre-admission refusals (an HTTP status before the upgrade)
+    /// probe here.
+    pub fn at_per_remote_cap(
+        &self,
+        per_remote_cap: Option<usize>,
+        remote: Option<SocketAddr>,
+    ) -> bool {
+        match (per_remote_cap, remote) {
+            (Some(cap), Some(addr)) => self
+                .per_remote
+                .lock()
+                .expect("per-remote map poisoned")
+                .get(&addr.ip())
+                .is_some_and(|live| live.load(Ordering::Relaxed) >= cap),
+            _ => false,
+        }
+    }
+
     /// Attempts admission under both caps at once: the route-wide
     /// `total_cap` and the per-peer-IP `per_remote_cap`. The remote's
     /// IP drives the per-peer count; `None` (HTTP-family transports

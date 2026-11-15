@@ -65,12 +65,21 @@ struct RouteState {
 }
 
 impl RouteState {
-    /// Whether the route is currently at its configured session cap.
-    /// Advisory only — the authoritative check happens atomically inside
-    /// [`SessionCounter::admit`].
-    fn at_capacity(&self) -> bool {
+    /// Whether the route is currently at one of its configured session
+    /// caps — the route-wide one, or (when the peer address is visible)
+    /// that peer's per-IP cap. Advisory only — the authoritative check
+    /// happens atomically inside
+    /// [`SessionCounter::admit_with_remote`].
+    fn at_capacity_with_remote(&self, remote: Option<std::net::SocketAddr>) -> bool {
+        // Both advisory probes: the route-wide cap and this peer's
+        // per-IP cap — a 429 answers before the upgrade; the
+        // authoritative check still runs atomically at admission
+        // (admit_with_remote).
         self.counter
             .at_cap(self.policy.get_max_concurrent_sessions())
+            || self
+                .counter
+                .at_per_remote_cap(self.policy.get_max_sessions_per_remote(), remote)
     }
 }
 
@@ -112,6 +121,15 @@ impl WsRoute {
         self
     }
 
+    /// Caps simultaneously live sessions **per peer IP** — one peer
+    /// cannot crowd the route's whole budget. Enforced at admission
+    /// through the ConnectInfo-stamped peer address (every AxumServer
+    /// mount carries it).
+    pub fn max_sessions_per_remote(mut self, n: usize) -> Self {
+        self.policy = self.policy.max_sessions_per_remote(n);
+        self
+    }
+
     /// Sets the session handler invoked for every accepted handshake. The
     /// handler runs until it returns, the socket closes, or the
     /// session-shutdown bus fires — whichever comes first.
@@ -150,46 +168,57 @@ impl WsRoute {
             bus: bus.clone(),
         });
         let handler_state = Arc::clone(&state);
-        let handler = move |upgrade: WebSocketUpgrade, headers: HeaderMap| async move {
-            let handshake = Handshake {
-                headers: headers
-                    .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.as_str().to_string(),
-                            value.to_str().unwrap_or_default().to_string(),
-                        )
-                    })
-                    .collect(),
-                remote: None,
-            };
-            if let Err(rej) = handler_state.gates.evaluate(&handshake) {
-                return rejection_response(rej);
-            }
-            if handler_state.at_capacity() {
-                return (StatusCode::TOO_MANY_REQUESTS, "session capacity reached").into_response();
-            }
-            let callback_state = Arc::clone(&handler_state);
-            upgrade
-                .on_upgrade(move |socket| {
-                    let state = callback_state;
-                    async move {
-                        let _guard = match state
-                            .counter
-                            .admit(state.policy.get_max_concurrent_sessions())
-                        {
-                            Some(g) => g,
-                            None => return,
-                        };
-                        let session_fut = (state.session)(socket);
-                        tokio::select! {
-                            _ = state.bus.wait() => {}
-                            _ = session_fut => {}
+        let handler =
+            move |upgrade: WebSocketUpgrade,
+                  headers: HeaderMap,
+                  connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>| async move {
+                // The peer address rides the ConnectInfo extension the
+                // server's make-service stamps in — every AxumServer
+                // mount carries it, so gates and the per-remote cap see
+                // the real peer on this transport.
+                let remote = Some(connect_info.0);
+                let handshake = Handshake {
+                    headers: headers
+                        .iter()
+                        .map(|(name, value)| {
+                            (
+                                name.as_str().to_string(),
+                                value.to_str().unwrap_or_default().to_string(),
+                            )
+                        })
+                        .collect(),
+                    remote,
+                };
+                if let Err(rej) = handler_state.gates.evaluate(&handshake) {
+                    return rejection_response(rej);
+                }
+                if handler_state.at_capacity_with_remote(remote) {
+                    return (StatusCode::TOO_MANY_REQUESTS, "session capacity reached")
+                        .into_response();
+                }
+                let callback_state = Arc::clone(&handler_state);
+                upgrade
+                    .on_upgrade(move |socket| {
+                        let state = callback_state;
+                        async move {
+                            let (_total_guard, _per_remote_guard) =
+                                match state.counter.admit_with_remote(
+                                    state.policy.get_max_concurrent_sessions(),
+                                    state.policy.get_max_sessions_per_remote(),
+                                    remote,
+                                ) {
+                                    Some(guards) => guards,
+                                    None => return,
+                                };
+                            let session_fut = (state.session)(socket);
+                            tokio::select! {
+                                _ = state.bus.wait() => {}
+                                _ = session_fut => {}
+                            }
                         }
-                    }
-                })
-                .into_response()
-        };
+                    })
+                    .into_response()
+            };
         Ok((get(handler), bus))
     }
 }

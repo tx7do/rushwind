@@ -205,6 +205,9 @@ impl Server for WebTransportServer {
                 // and the request receipt; the configured deadline, if
                 // any, races it and drops the attempt mid-flight on
                 // expiry.
+                // The peer address is visible before the handshake
+                // consumes the incoming session — capture it first.
+                let peer = incoming_session.remote_address();
                 let session_request = match state.policy.get_handshake_timeout() {
                     None => tokio::select! {
                         _ = stop.wait() => return Err(ServerError::Cancelled),
@@ -242,7 +245,10 @@ impl Server for WebTransportServer {
                 }
                 let handshake = Handshake {
                     headers,
-                    remote: None,
+                    // The peer address rides the IncomingSession (visible
+                    // before the QUIC handshake completes) — gates and
+                    // the per-remote quota see the real peer here.
+                    remote: Some(peer),
                 };
                 if state.gates.evaluate(&handshake).is_err() {
                     drop(session_request);

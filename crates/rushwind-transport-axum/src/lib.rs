@@ -144,9 +144,16 @@ impl Server for AxumServer {
                     bus.signal();
                 }
             };
-            let served = axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown)
-                .await;
+            // ConnectInfo plumbing: the make-service stamps every
+            // request with the peer's socket address, so session routes
+            // (and any handler extracting ConnectInfo) see the remote —
+            // the per-remote session quota's prerequisite.
+            let served = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown)
+            .await;
             match served {
                 // Per axum's contract the serve future returns Ok only
                 // after the shutdown signal fired and the drain completed —

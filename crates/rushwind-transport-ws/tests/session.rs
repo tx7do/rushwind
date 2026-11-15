@@ -246,3 +246,94 @@ async fn session_cap_refuses_second_session() {
     drop(holder);
     finish_lifecycle(trigger, run).await;
 }
+
+/// A gate capturing the handshake it saw — the per-remote pin reads
+/// the peer address the ConnectInfo pipeline now carries.
+struct PeerCapture(Arc<std::sync::Mutex<Option<Handshake>>>);
+
+impl HandshakeGate for PeerCapture {
+    fn name(&self) -> String {
+        "peer-capture".to_string()
+    }
+    fn inspect(&self, handshake: &Handshake) -> GateVerdict {
+        *self.0.lock().expect("capture lock") = Some(handshake.clone());
+        GateVerdict::Continue
+    }
+}
+
+/// The ConnectInfo pipeline: the gate's handshake snapshot carries the
+/// peer address on this transport — gates can rule on the real peer,
+/// and Handshake.remote is Some.
+#[tokio::test]
+async fn gates_observe_peer_address() {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let (route, bus) = WsRoute::new()
+        .gate(Arc::new(PeerCapture(seen.clone())))
+        .session_handler(echo)
+        .build()
+        .expect("route must build");
+    let (url, trigger, run) = spawn_lifecycle(Router::new().route("/ws", route), bus).await;
+
+    let (client, _resp) = timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url.as_str()),
+    )
+    .await
+    .expect("connect must complete")
+    .expect("connect must succeed");
+    // Give the upgrade handler a beat to run the gate.
+    sleep(Duration::from_millis(300)).await;
+
+    let seen = seen.lock().expect("capture lock").clone();
+    let Some(handshake) = seen else {
+        panic!("the gate never observed a handshake");
+    };
+    let Some(remote) = handshake.remote else {
+        panic!("the handshake must carry the peer address on this transport");
+    };
+    assert_eq!(remote.ip().to_string(), "127.0.0.1", "the loopback peer");
+    assert!(remote.port() > 0, "an ephemeral client port");
+    drop(client);
+    finish_lifecycle(trigger, run).await;
+}
+
+/// The per-remote quota: one peer (the loopback, as every test client)
+/// filling its per-IP budget is refused with 429 — the route-wide cap
+/// is not even reached.
+#[tokio::test]
+async fn per_remote_cap_refuses_the_second_session() {
+    let (route, bus) = WsRoute::new()
+        .max_sessions_per_remote(1)
+        .session_handler(echo)
+        .build()
+        .expect("route must build");
+    let (url, trigger, run) = spawn_lifecycle(Router::new().route("/ws", route), bus).await;
+
+    // Hold one live session from the loopback peer.
+    let (holder, _resp) = timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url.as_str()),
+    )
+    .await
+    .expect("connect must complete")
+    .expect("first session must be admitted");
+    sleep(Duration::from_millis(300)).await;
+
+    // The same peer's second session refuses — its per-IP budget is
+    // full even though the route-wide cap (unset) has room.
+    let refused = timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url.as_str()),
+    )
+    .await
+    .expect("attempt must complete");
+    match refused {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status().as_u16(), 429);
+        }
+        other => panic!("expected http 429 per-remote refusal, got {other:?}"),
+    }
+
+    drop(holder);
+    finish_lifecycle(trigger, run).await;
+}
