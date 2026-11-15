@@ -49,6 +49,7 @@ rushwind-broker-redis = { path = "crates/rushwind-broker-redis", version = "0.0.
 rushwind-broker-gcpubsub = { path = "crates/rushwind-broker-gcpubsub", version = "0.0.1" }
 rushwind-broker-sqs = { path = "crates/rushwind-broker-sqs", version = "0.0.1" }
 rushwind-broker-nsq = { path = "crates/rushwind-broker-nsq", version = "0.0.1" }
+rushwind-broker-memory = { path = "crates/rushwind-broker-memory", version = "0.0.1" }
 rushwind-workflow = { path = "crates/rushwind-workflow", version = "0.0.1" }
 rushwind-workflow-memory = { path = "crates/rushwind-workflow-memory", version = "0.0.1" }
 rushwind-workflow-argo = { path = "crates/rushwind-workflow-argo", version = "0.0.1" }

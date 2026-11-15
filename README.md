@@ -254,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `crates/rushwind-broker-gcpubsub` | Google Cloud Pub/Sub 引擎：v1 REST 手写 reqwest——publish/pull/acknowledge，manual 结算走 ack deadline 清零（零即立即可重投），token 由部署供给与刷新 |
 | `crates/rushwind-broker-sqs` | Amazon SQS 引擎：Query API 手写 reqwest + 手写 SigV4（参考向量钉死签名链）——SendMessage/ReceiveMessage/DeleteMessage/ChangeMessageVisibility，manual 结算 = 删除或可见性归零 |
 | `crates/rushwind-broker-nsq` | NSQ 引擎：nsqd v2 二进制协议手写 tokio（无 SDK）——PUB/SUB/FIN/REQ，Identify 关心跳，Manual 结算 = FIN(成功)/REQ 0(立即重投)，头走 JSON 信封（payload base64） |
+| `crates/rushwind-broker-memory` | 进程内参考 broker：精确主题 pub/sub，Manual 结算真实 in-flight 停驻 + REQ 式立即重投——broker 消费方代码的测试替身（语义基线） |
 | `crates/rushwind-workflow` | 工作流契约：上游 Client.Close + Worker.Stop/IsRunning 生命周期 + submit/status/cancel/run 实用面，manifest 不透明 |
 | `crates/rushwind-workflow-memory` | 工作流参考引擎：in-process 状态存储，complete() 驱动相位，worker 轮询至终态（语义基线） |
 | `crates/rushwind-workflow-argo` | Argo Workflows 引擎：Argo Server REST 手写 reqwest——submit(POST manifest)/status(phase 映射)/cancel(terminate)，worker 轮询至终态 |

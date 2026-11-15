@@ -6948,6 +6948,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-broker-memory"
+version = "0.0.1"
+dependencies = [
+ "rushwind-broker",
+ "rushwind-transport",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-broker-mqtt"
 version = "0.0.1"
 dependencies = [
