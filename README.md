@@ -255,6 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `crates/rushwind-broker-sqs` | Amazon SQS 引擎：Query API 手写 reqwest + 手写 SigV4（参考向量钉死签名链）——SendMessage/ReceiveMessage/DeleteMessage/ChangeMessageVisibility，manual 结算 = 删除或可见性归零 |
 | `crates/rushwind-broker-nsq` | NSQ 引擎：nsqd v2 二进制协议手写 tokio（无 SDK）——PUB/SUB/FIN/REQ，Identify 关心跳，Manual 结算 = FIN(成功)/REQ 0(立即重投)，头走 JSON 信封（payload base64） |
 | `crates/rushwind-broker-rocketmq` | RocketMQ 引擎：4.x remoting JSON 序列化模式手写 tokio（无 SDK）——SEND_MESSAGE/PULL_MESSAGE/UPDATE_CONSUMER_OFFSET，结算面 = 队列位移（Auto 逐批提交 / Manual 单批窗口），头走 \u0001/\u0002 properties 串；nameserver 路由不在面内（部署直供 broker 地址） |
+| `crates/rushwind-broker-azuresb` | Azure Service Bus 引擎：实体 HTTP REST 面手写 reqwest + 手写 SAS 签名（固定参考向量钉死签名链，token 或静态密钥两立场）——POST /messages 发送（载荷走体、属性走头、id 走 BrokerProperties 信封）、receive-and-delete / peek-lock 两种接收，Manual = complete/abandon（abandon 即 DeliveryCount++ 重投） |
 | `crates/rushwind-broker-memory` | 进程内参考 broker：精确主题 pub/sub，Manual 结算真实 in-flight 停驻 + REQ 式立即重投——broker 消费方代码的测试替身（语义基线） |
 | `crates/rushwind-workflow` | 工作流契约：上游 Client.Close + Worker.Stop/IsRunning 生命周期 + submit/status/cancel/run 实用面，manifest 不透明 |
 | `crates/rushwind-workflow-memory` | 工作流参考引擎：in-process 状态存储，complete() 驱动相位，worker 轮询至终态（语义基线） |
