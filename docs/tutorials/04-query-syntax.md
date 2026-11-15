@@ -48,7 +48,7 @@ let and_of = FilterExpr::all([
    - `ICONTAINS` → `ILIKE '%{v}%'`
    - `ISTARTS_WITH` → `ILIKE '{v}%'`
    - `IENDS_WITH` → `ILIKE '%{v}'`
-4. **尾巴在边界显式拒绝**：`REGEXP`/`IREGEXP`/`EXISTS`/`SEARCH` 返回 `StorageError::Unsupported`——绝不静默丢弃。`date_part` 字段同理。`IEXACT` 已是自有契约算子（2026-11-12 全矩阵落地：SQL 走 `LOWER(col) = LOWER(?)`、MongoDB 锚定折叠正则、ES/OpenSearch `term.case_insensitive`、ClickHouse `lowerUTF8`）；`JSON_CONTAINS`/`ARRAY_CONTAINS` 与 `json_path` 点路径也是自有契约面（2026-11-16 全矩阵落地：`Value::Json`/`Value::Array` 两种、契约零依赖 JSON 读取器、MySQL `JSON_CONTAINS`/PG `jsonb @>`/SQLite `json_tree`+`json_extract` 分解/MongoDB `$eq` 与点路径原生/ES 键段点路径的方言面；`Condition::with_json_path` 抽取子值后过算子，缺失读 NULL——拒绝面只剩 regex 族，前置是契约侧正则求值故事，与 ClickHouse 的 JSON 族面）。
+4. **尾巴在边界显式拒绝**：`REGEXP`/`IREGEXP`/`EXISTS`/`SEARCH` 返回 `StorageError::Unsupported`——绝不静默丢弃。`date_part` 字段同理。`IEXACT` 已是自有契约算子（2026-11-12 全矩阵落地：SQL 走 `LOWER(col) = LOWER(?)`、MongoDB 锚定折叠正则、ES/OpenSearch `term.case_insensitive`、ClickHouse `lowerUTF8`）；`JSON_CONTAINS`/`ARRAY_CONTAINS` 与 `json_path` 点路径也是自有契约面（2026-11-16 全矩阵落地：`Value::Json`/`Value::Array` 两种、契约零依赖 JSON 读取器、MySQL `JSON_CONTAINS`/PG `jsonb @>`/SQLite `json_tree`+`json_extract` 分解/MongoDB `$eq` 与点路径原生/ES 键段点路径的方言面；`Condition::with_json_path` 抽取子值后过算子，缺失读 NULL——拒绝面只剩 regex 族，前置是契约侧正则求值故事）。
 
 测试 `operator_names_cover_the_taxonomy` 保证 29 个成员每一个都有映射或显式报错，永不 panic。
 

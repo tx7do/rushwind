@@ -78,7 +78,7 @@ testkit 新增三个特性门控套件：`password`（8 测试：三分面验证
 **明确推迟**（feature 级，非缺陷）：
 
 - 向量检索契约模块（vector/）与 qdrant/milvus/weaviate/neo4j 四引擎：整个向量域未移植，按需立项。
-- JSONB 域（638881f 修的 JsonValue 绑定缺陷）：**全部落地（2026-11-16，见架构文档操作符表）**——JSON_CONTAINS/ARRAY_CONTAINS 契约算子（`Value` 协议 `Json`/`Array` 两种、契约零依赖手写 JSON 读取器、wire 收复合值、三方言/mongo/ES 原生面）+ **json_path 点路径字段扩展**（契约 `Condition.json_path`、求值器路径抽取缺失读 NULL、wire 收 protojson `jsonPath`、seaorm 三方言抽取链/mongo 点路径原生/ES 键段、cassandra/influx 走 fetch+eval；ClickHouse 的 JSON 族面暂 Unsupported 并声明）；JSON 套件钉五组（等值/成员/EQ 往返/NULL/点路径抽取）。
+- JSONB 域（638881f 修的 JsonValue 绑定缺陷）：**全部落地（2026-11-16，见架构文档操作符表）**——JSON_CONTAINS/ARRAY_CONTAINS 契约算子（`Value` 协议 `Json`/`Array` 两种、契约零依赖手写 JSON 读取器、wire 收复合值、三方言/mongo/ES 原生面）+ **json_path 点路径字段扩展**（契约 `Condition.json_path`、求值器路径抽取缺失读 NULL、wire 收 protojson `jsonPath`、seaorm 三方言抽取链/mongo 点路径原生/ES 键段、cassandra/influx 走 fetch+eval；**ClickHouse 面同 SQLite 形状落地（2026-11-16，JSON 函数分解 + 快照钉）**）；JSON 套件钉五组（等值/成员/EQ 往返/NULL/点路径抽取），memory/cache/seaorm 离线 + mongo/ES/OpenSearch/ClickHouse 经容器 CI。
 - 13→8 引擎口径差：上游新增 qdrant/milvus/weaviate/neo4j（向量），cassandra 仓库层补完对应 Rust 面为契约优先设计（scylla 驱动typed 行反序列化天然规避三缺陷）。
 
 ## 已完成域
