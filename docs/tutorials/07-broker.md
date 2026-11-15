@@ -47,7 +47,7 @@ let handler = json_handler(|event: Event, payload: OrderCreated| async move {
 broker.subscribe("orders", handler).await?;   // json_handler 返回的就是 Handler
 ```
 
-## 十种引擎的取舍
+## 十一种引擎的取舍
 
 | 引擎 | 构造 | 通配订阅 | header 载体 | request/response | 语义要点 |
 |:---|:---|:---|:---|:---|:---|
@@ -58,6 +58,10 @@ broker.subscribe("orders", handler).await?;   // json_handler 返回的就是 Ha
 | `broker-mqtt` | `MqttBroker::new(options)` + `connect` | `+`/`#` | ✗ | ✗ | QoS 1；重连后全量重订阅 |
 | `broker-redis` | `RedisBroker::connect(url)`（同步、惰性） | ✗ | ✗ | ✗ | pub/sub，至多一次，无持久化 |
 | `broker-stomp` | `StompBroker::new(addr)` + `connect` | ✗ | ✗ | ✗ | 手写 STOMP 1.2 客户端，指数退避重连并重放订阅 |
+| `broker-sqs` | `SqsBroker::new(options)`（queue_url 进 options） | ✗ | MessageAttributes | ✗ | Query API + 手写 SigV4；nack(Requeue) = 可见性归零、nack(Drop) = 删除 |
+| `broker-gcpubsub` | `GcpPubSubBroker::new(options)`（endpoint 进 options） | ✗ | attributes map | ✗ | v1 REST + 调用方供给 token；nack = ack deadline 归零即立即可重投 |
+| `broker-nsq` | `NsqBroker::new(options)`（nsqd addr 进 options） | ✗ | JSON 信封（payload base64） | ✗ | nsqd v2 二进制协议手写 tokio；nack(Requeue) = REQ 0 原生立即重投 |
+| `broker-rocketmq` | `RocketmqBroker::new(options)`（broker_addr 进 options） | ✗ | `\u0001`/`\u0002` properties 串 | ✗ | 4.x remoting JSON 模式手写 tokio，pull-only 单队列；结算面 = 队列位移，Manual 单批窗口 |
 
 全部引擎都有 `from_settings(serde_json::Value)`（bootstrap 工厂线格式），live 集成测试统一挂在 `live` 特性门后：
 
@@ -68,6 +72,9 @@ let nats = NatsBroker::connect("nats://127.0.0.1:4222").await?;
 let mqtt = MqttBroker::new(MqttOptions::new("127.0.0.1:1883"));
 mqtt.connect().await?;
 ```
+
+**外加 memory 参考 broker**（`broker-memory`，进程内测试替身）：精确主题 pub/sub，Manual 结算真实停驻（in-flight 表，ack 清除 / REQ 式重投回队首）——broker 消费方代码无需外部系统即可测试，也是各引擎语义的对照基线：
+
 
 ## 中间件
 
@@ -88,7 +95,7 @@ let broker = MiddlewareBroker::new(Arc::new(inner), publish_mw, subscriber_mw);
 - **RabbitMQ 每次发布开新信道并等 confirm**：高频发布场景在契约外自行池化或批量。
 - **退订要显式调用 `unsubscribe()`**：多个引擎的 Drop 退订只是尽力而为（锁被占就跳过）。
 - **`request` 只有 NATS 实现**，其余引擎返回 `Failed("request not implemented by this engine")`——选型时这是硬约束。
-- **毒消息面是契约级的两件套**：`Event::nack(NackAction::Requeue/Drop)`（隐式 ack 引擎是文档化 no-op）与 `with_error_handler(handler, observer)`——handler 错误到达观察者但仍以 `Err` 冒出，订阅不被杀死。当前七引擎全部隐式 ack；manual-ack 翻转按需立项。
+- **毒消息面是契约级的两件套**：`Event::nack(NackAction::Requeue/Drop)` 与 `with_error_handler(handler, observer)`——handler 错误到达观察者但仍以 `Err` 冒出，订阅不被杀死。**AckMode 已是全 fleet 的选项**（engine options / from_settings 的 `ack_mode`）：Auto 派发即结算；Manual 把结算柄交给 handler——pulsar/rabbitmq/mqtt/stomp/sqs/gcpubsub/nsq/rocketmq/memory 都有结算面；kafka（批量自动提交）/nats/redis（无原生确认面）的 options 不带 `ack_mode`，结构上保持 Auto。
 
 ## 动手练习
 
