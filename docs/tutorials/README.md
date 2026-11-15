@@ -25,7 +25,7 @@
 | 进阶 | [11 · 脚本引擎](11-script-engines.md) | 能力探测式脚本契约、五种引擎的能力与脾气 |
 | 进阶 | [12 · 多协议传输](12-transports.md) | WebSocket、QUIC、HTTP/3、WebTransport、MQTT 桥、定时任务 |
 | 运维 | [13 · 测试之道](13-testing.md) | 契约一致性测试、live 特性门、容器化验证环境 |
-| 进阶 | [14 · 工作流](14-workflow.md) | workflow 契约的生命周期面、memory 参考引擎与 Argo 适配器、worker 运行至终态 |
+| 进阶 | [14 · 工作流](14-workflow.md) | workflow 契约的生命周期面、memory 参考引擎与 argo/temporal/conductor 适配器、worker 运行至终态 |
 
 ## 贯穿全系列的四个心智模型
 

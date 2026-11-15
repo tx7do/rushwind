@@ -8274,6 +8274,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rushwind-workflow-conductor"
+version = "0.0.1"
+dependencies = [
+ "reqwest 0.12.28",
+ "rushwind-workflow",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rushwind-workflow-memory"
 version = "0.0.1"
 dependencies = [

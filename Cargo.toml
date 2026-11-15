@@ -56,6 +56,7 @@ rushwind-workflow = { path = "crates/rushwind-workflow", version = "0.0.1" }
 rushwind-workflow-memory = { path = "crates/rushwind-workflow-memory", version = "0.0.1" }
 rushwind-workflow-argo = { path = "crates/rushwind-workflow-argo", version = "0.0.1" }
 rushwind-workflow-temporal = { path = "crates/rushwind-workflow-temporal", version = "0.0.1" }
+rushwind-workflow-conductor = { path = "crates/rushwind-workflow-conductor", version = "0.0.1" }
 
 rushwind-cache = { path = "crates/rushwind-cache", version = "0.0.1" }
 rushwind-cache-redis = { path = "crates/rushwind-cache-redis", version = "0.0.1" }

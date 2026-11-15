@@ -47,6 +47,8 @@ let engine = rushwind_workflow_argo::ArgoWorkflowEngine::new(
 
 一个 manifest 要么带名字（`WorkflowSpec::named` 或清单里自己的 `generateName`），要么引擎拒绝——不发明它无法兑现的名字。
 
+`rushwind-workflow-temporal` 走 Temporal 的 gRPC-gateway HTTP API（手写 reqwest），`rushwind-workflow-conductor` 走 Conductor 服务器 REST（同样手写）。conductor 的诚实差异：**它的实例 id 可由服务端铸造**——`WorkflowSpec` 带名就钉进请求，不带名就提交后用返回的 id 当 handle；但 manifest 里的 `name`（工作流定义名）必须自己带——类型是调用方的知识，引擎不发明：
+
 ## worker：运行至终态
 
 `WorkflowWorker::run` 提交并轮询到终态相位；`stop` 翻转后所有在途 run 以 `Cancelled` 收场；`is_running` 反映存活计数：
