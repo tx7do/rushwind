@@ -11189,6 +11189,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "workflow-basics"
+version = "0.0.1"
+dependencies = [
+ "rushwind-workflow",
+ "rushwind-workflow-argo",
+ "rushwind-workflow-memory",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "write16"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

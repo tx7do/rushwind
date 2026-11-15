@@ -1,0 +1,18 @@
+[package]
+name = "workflow-basics"
+description = "RushWind workflow demo: one submit/status/cancel code path over the memory reference engine and the Argo Workflows adapter (set ARGO_SERVER to run that half), with a worker run-to-terminal and its stop switch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-workflow = { workspace = true }
+rushwind-workflow-memory = { workspace = true }
+rushwind-workflow-argo = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+serde_json = { workspace = true }
