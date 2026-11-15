@@ -122,7 +122,7 @@
 | `CONTAINS` `STARTS_WITH` `ENDS_WITH` | 同名直映 |
 | `ICONTAINS` `ISTARTS_WITH` `IENDS_WITH` | 折叠为 `Ilike` 模式（`%v%` / `v%` / `%v`）——每个 SQL 引擎已说着的方言 |
 | `IEXACT` | 自有契约算子 `Iexact`——SQL 引擎渲染 `LOWER(col) = LOWER(?)`，MongoDB 锚定大小写折叠正则，ES/OpenSearch `term` 的 `case_insensitive`，ClickHouse `lowerUTF8(col) = '…'` |
-| `REGEXP` `IREGEXP` `JSON_CONTAINS` `ARRAY_CONTAINS` `EXISTS` `SEARCH`；`date_part`/`json_path` 扩展 | **`Unsupported`**，在 wire 边界点名拒绝，绝不静默丢弃——regex 族需要契约侧的正则求值故事（契约刻意零依赖），JSON 族需要 `Value` 协议先有 JSON/Array 种类，两者都是独立前置项 |
+| `REGEXP` `IREGEXP` `EXISTS` `SEARCH`；`date_part`/`json_path` 扩展 | **`Unsupported`**，在 wire 边界点名拒绝，绝不静默丢弃——regex 族需要契约侧的正则求值故事（契约刻意零依赖），json_path 字段扩展需要各引擎的点路径翻译面，两者都是独立前置项。`JSON_CONTAINS`/`ARRAY_CONTAINS` 已是自有契约算子（2026-11-16 全矩阵落地）：`Value` 协议加了 `Json`（规范文本）/`Array`（类型化元素）两种，契约的 `Json::contains` 是手写的零依赖读取器（MySQL JSON_CONTAINS 语义：等值 / 对象键子集 / 数组元素包含）；SQL 面（seaorm）每方言各归其位——MySQL `JSON_CONTAINS`、PG `jsonb @>`、SQLite 用 `json_tree`/`json_each`/`json_extract` 把针值分解成等值 + 顶层元素成员 + 平键子集（更深嵌套如实 Unsupported）；MongoDB 走 `$eq`（数组元素成员/全等是 mongo 原生面，键子集无查询面——crate 文档声明）；ARRAY_CONTAINS 带 `json_type='array'` 守卫（对象列永不相等）；一致性套件（`rushwind_storage_json_suite!`）钉等值/成员/EQ 往返/NULL 四组 |
 
 三种分页经 `PaginationRequest` oneof 进入：`NoPaging` 映射为 `Offset{0, MAX_LIMIT}`（契约允许的最大窗口）。protojson 之外，契约 crate 还内建 **AIP 文本子集**解析器（`FilterExpr::from_aip`，零依赖手写）：`name = "bolt" AND (age >= 10 OR role IN ("a","b"))`，AND 优先于 OR、并列即隐式 AND、`NOT` 翻转有精确补运算的操作符——与 protojson 两条路汇入同一棵 [`FilterExpr`] 树，端到端测试钉死两条路在引擎上的结果一致。
 

@@ -24,6 +24,12 @@ pub enum Value {
     Real(f64),
     /// UTF-8 text.
     Text(String),
+    /// An ordered array of values (a JSON array column's payload).
+    Array(Vec<Value>),
+    /// A JSON document, carried as its canonical minified text (a JSON
+    /// object column's payload). Equality is the canonical text's —
+    /// callers compare equal-shaped documents by their minified forms.
+    Json(String),
 }
 
 impl Value {
@@ -40,6 +46,8 @@ impl Value {
             Value::Int(_) => "int",
             Value::Real(_) => "real",
             Value::Text(_) => "text",
+            Value::Array(_) => "array",
+            Value::Json(_) => "json",
         }
     }
 
@@ -47,9 +55,10 @@ impl Value {
     /// in-memory engines.
     ///
     /// Values of different kinds order by kind rank — `Null` < `Bool` <
-    /// numeric (`Int`/`Real`, compared as numbers) < `Text` — so the order
-    /// is always total even across kinds. Inside a kind the natural order
-    /// applies.
+    /// numeric (`Int`/`Real`, compared as numbers) < `Text` < `Array` <
+    /// `Json` — so the order is always total even across kinds. Inside a
+    /// kind the natural order applies (arrays lexicographically by
+    /// element; JSON by its canonical text).
     pub fn compare(&self, other: &Value) -> Ordering {
         fn rank(v: &Value) -> u8 {
             match v {
@@ -57,6 +66,8 @@ impl Value {
                 Value::Bool(_) => 1,
                 Value::Int(_) | Value::Real(_) => 2,
                 Value::Text(_) => 3,
+                Value::Array(_) => 4,
+                Value::Json(_) => 5,
             }
         }
         match (self, other) {
@@ -70,6 +81,16 @@ impl Value {
             }
             (Value::Real(a), Value::Real(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Array(a), Value::Array(b)) => {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    let ordering = x.compare(y);
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
+            (Value::Json(a), Value::Json(b)) => a.cmp(b),
             (a, b) => rank(a).cmp(&rank(b)),
         }
     }
@@ -102,6 +123,22 @@ impl Value {
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Extracts the element slice, if this is [`Value::Array`].
+    pub fn as_array(&self) -> Option<&[Value]> {
+        match self {
+            Value::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Extracts the canonical JSON text, if this is [`Value::Json`].
+    pub fn as_json(&self) -> Option<&str> {
+        match self {
+            Value::Json(text) => Some(text),
             _ => None,
         }
     }
@@ -152,6 +189,18 @@ impl From<&str> for Value {
 impl From<String> for Value {
     fn from(v: String) -> Self {
         Value::Text(v)
+    }
+}
+
+impl From<Vec<Value>> for Value {
+    fn from(v: Vec<Value>) -> Self {
+        Value::Array(v)
+    }
+}
+
+impl From<&[Value]> for Value {
+    fn from(v: &[Value]) -> Self {
+        Value::Array(v.to_vec())
     }
 }
 

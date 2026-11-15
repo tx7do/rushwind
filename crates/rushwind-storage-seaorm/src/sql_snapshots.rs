@@ -82,7 +82,7 @@ fn filter_placeholders_per_dialect() {
     let select = list_select(
         &schema(),
         &["id".into(), "name".into()],
-        Some(&translate(filter.node()).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::Sqlite).expect("translates")),
         &ListQuery::page(2, 10),
         DbBackend::Sqlite,
     )
@@ -117,7 +117,7 @@ fn ilike_lowers_the_column() {
     let select = list_select(
         &schema(),
         &["id".into()],
-        Some(&translate(filter.node()).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::Sqlite).expect("translates")),
         &ListQuery::default(),
         DbBackend::Sqlite,
     )
@@ -171,7 +171,7 @@ fn in_and_between_bind_every_operand() {
     let select = list_select(
         &schema(),
         &["id".into()],
-        Some(&translate(filter.node()).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::Sqlite).expect("translates")),
         &ListQuery::default(),
         DbBackend::Sqlite,
     )
@@ -266,7 +266,7 @@ fn iexact_lowers_the_column() {
     let select = list_select(
         &schema(),
         &["id".into()],
-        Some(&translate(filter.node()).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::Sqlite).expect("translates")),
         &ListQuery::default(),
         DbBackend::Sqlite,
     )

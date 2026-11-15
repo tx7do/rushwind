@@ -42,6 +42,8 @@ fn field(row: &Record, name: &str) -> String {
         Some(Value::Int(i)) => i.to_string(),
         Some(Value::Real(f)) => f.to_string(),
         Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Array(items)) => rushwind_storage::json::encode(&Value::Array(items.clone())),
+        Some(Value::Json(text)) => text.clone(),
         Some(Value::Null) | None => "NULL".into(),
     }
 }

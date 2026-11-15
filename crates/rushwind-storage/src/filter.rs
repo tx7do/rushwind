@@ -59,6 +59,14 @@ pub enum Op {
     StartsWith,
     /// Suffix match (one operand).
     EndsWith,
+    /// The column's JSON contains the operand JSON — MySQL's
+    /// `JSON_CONTAINS` semantics (one operand, kind [`Value::Json`]):
+    /// equality, or every operand key present with a contained value
+    /// (objects), or some element containing it (arrays).
+    JsonContains,
+    /// The column's array contains the operand as an element (one
+    /// operand, a scalar).
+    ArrayContains,
 }
 
 /// The operand-count requirement of an [`Op`].
@@ -91,7 +99,9 @@ impl Op {
             | Op::Iexact
             | Op::Contains
             | Op::StartsWith
-            | Op::EndsWith => Arity::One,
+            | Op::EndsWith
+            | Op::JsonContains
+            | Op::ArrayContains => Arity::One,
             Op::Between | Op::NotBetween => Arity::Two,
             Op::In | Op::NotIn => Arity::Many,
         }
@@ -260,6 +270,18 @@ impl FilterExpr {
             Op::Contains => like(&value, &text_arg(|s| format!("%{s}%")), false),
             Op::StartsWith => like(&value, &text_arg(|s| format!("{s}%")), false),
             Op::EndsWith => like(&value, &text_arg(|s| format!("%{s}")), false),
+            Op::JsonContains => json_contains(&value, &first()),
+            Op::ArrayContains => {
+                let Some(items) = value.as_array() else {
+                    return false;
+                };
+                let Some(operand) = condition.values.first() else {
+                    return false;
+                };
+                items
+                    .iter()
+                    .any(|item| item.compare(operand) == Ordering::Equal)
+            }
         }
     }
 
@@ -295,12 +317,39 @@ impl FilterExpr {
                             cond.op, cond.field
                         )));
                     }
+                    if matches!(cond.op, Op::JsonContains | Op::ArrayContains)
+                        && column.kind != ColumnKind::Json
+                    {
+                        return Err(StorageError::InvalidQuery(format!(
+                            "operator {:#?} applies only to json columns, but {:?} is not",
+                            cond.op, cond.field
+                        )));
+                    }
                     for value in &cond.values {
                         if !column.kind.accepts(value.type_name()) {
                             return Err(StorageError::InvalidQuery(format!(
                                 "column {:?} of kind {:#?} does not accept a {} operand",
                                 cond.field,
                                 column.kind,
+                                value.type_name()
+                            )));
+                        }
+                        // The JSON containment pair pin their operand
+                        // kinds: JSON_CONTAINS takes a JSON document,
+                        // ARRAY_CONTAINS a scalar element.
+                        if cond.op == Op::JsonContains && value.type_name() != "json" {
+                            return Err(StorageError::InvalidQuery(format!(
+                                "operator JSON_CONTAINS on {:?} takes a json operand, got {}",
+                                cond.field,
+                                value.type_name()
+                            )));
+                        }
+                        if cond.op == Op::ArrayContains
+                            && matches!(value.type_name(), "null" | "json" | "array")
+                        {
+                            return Err(StorageError::InvalidQuery(format!(
+                                "operator ARRAY_CONTAINS on {:?} takes a scalar operand, got {}",
+                                cond.field,
                                 value.type_name()
                             )));
                         }
@@ -377,6 +426,55 @@ mod tests {
 
 /// SQL `LIKE` semantics: `%` any sequence, `_` one character, no escapes;
 /// `fold` switches to case-insensitive matching.
+/// The contract's JSON containment reference semantics — MySQL's
+/// `JSON_CONTAINS`: the operand is contained when it equals the
+/// column's JSON, or every operand key is present with a contained
+/// value (objects), or some element contains it (arrays). The column
+/// carries a [`Value::Json`] document (parsed by the contract's own
+/// dependency-free reader) or a [`Value::Array`]; the operand is a
+/// [`Value::Json`].
+fn json_contains(column: &Value, operand: &Value) -> bool {
+    let Some(needle_text) = operand.as_json() else {
+        return false;
+    };
+    let Some(needle) = crate::json::parse(needle_text) else {
+        return false;
+    };
+    let hay = match column {
+        Value::Json(text) => crate::json::parse(text),
+        Value::Array(items) => items
+            .iter()
+            .map(json_of_value)
+            .collect::<Option<Vec<crate::json::Json>>>()
+            .map(crate::json::Json::Arr),
+        _ => None,
+    };
+    let Some(hay) = hay else {
+        return false;
+    };
+    crate::json::contains(&hay, &needle)
+}
+
+/// Converts a contract value into the JSON reader's model. `Value::Json`
+/// documents embed by parse; scalars map naturally (numbers onto f64 —
+/// the containment number model).
+fn json_of_value(value: &Value) -> Option<crate::json::Json> {
+    match value {
+        Value::Null => Some(crate::json::Json::Null),
+        Value::Bool(b) => Some(crate::json::Json::Bool(*b)),
+        Value::Int(i) => Some(crate::json::Json::Num(*i as f64)),
+        Value::Real(f) => Some(crate::json::Json::Num(*f)),
+        Value::Text(s) => Some(crate::json::Json::Str(s.clone())),
+        Value::Array(items) => Some(crate::json::Json::Arr(
+            items
+                .iter()
+                .map(json_of_value)
+                .collect::<Option<Vec<crate::json::Json>>>()?,
+        )),
+        Value::Json(text) => crate::json::parse(text),
+    }
+}
+
 fn like(value: &Value, pattern: &Value, fold: bool) -> bool {
     let (Some(text), Some(pattern)) = (value.as_str(), pattern.as_str()) else {
         return false;

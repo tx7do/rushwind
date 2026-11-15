@@ -7962,6 +7962,7 @@ dependencies = [
  "rushwind-storage-tree",
  "rushwind-testkit",
  "sea-orm",
+ "serde_json",
  "tokio",
 ]
 

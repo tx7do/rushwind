@@ -134,6 +134,8 @@ impl CassandraRepo {
                 rushwind_storage::ColumnKind::Int => "bigint",
                 rushwind_storage::ColumnKind::Real => "double",
                 rushwind_storage::ColumnKind::Text => "text",
+                // JSON columns store their canonical text.
+                rushwind_storage::ColumnKind::Json => "text",
             };
             if column.name == self.schema.primary_key {
                 continue; // clustering column, declared with the PK
@@ -235,6 +237,9 @@ impl CassandraRepo {
                 },
                 Some(serde_json::Value::String(text)) => match column.kind {
                     rushwind_storage::ColumnKind::Text => Value::Text(text.clone()),
+                    // JSON columns store their canonical text — parse
+                    // it back into the contract's kinds.
+                    rushwind_storage::ColumnKind::Json => json_text_to_value(text),
                     _ => Value::Bool(text != "false"),
                 },
                 Some(_) => {
@@ -867,5 +872,34 @@ fn lwt_rows_applied(rows: scylla::response::query_result::QueryRowsResult) -> bo
             .unwrap_or(true)
         }),
         Err(_) => true,
+    }
+}
+
+/// Parses one stored JSON document back into the contract's kinds —
+/// the read face of a JSON column's canonical text. Malformed stored
+/// text degrades to a JSON text value, never a panic.
+fn json_text_to_value(text: &str) -> Value {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(_)) => Value::Json(text.to_owned()),
+        Ok(serde_json::Value::Array(items)) => {
+            Value::Array(items.iter().map(json_element).collect())
+        }
+        Ok(other) => json_element(&other),
+        Err(_) => Value::Json(text.to_owned()),
+    }
+}
+
+/// One JSON element inside a stored document.
+fn json_element(value: &serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Real(n.as_f64().unwrap_or_default()),
+        },
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+        serde_json::Value::Array(items) => Value::Array(items.iter().map(json_element).collect()),
+        serde_json::Value::Object(_) => Value::Json(value.to_string()),
     }
 }

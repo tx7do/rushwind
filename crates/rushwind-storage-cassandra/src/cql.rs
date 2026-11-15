@@ -28,6 +28,17 @@ pub fn literal(value: Option<&Value>) -> String {
             }
         }
         Some(Value::Text(s)) => format!("'{}'", escape_string(s)),
+        // JSON kinds store as their canonical text (a JSON column's
+        // CQL face is a text column holding the document).
+        Some(Value::Array(items)) => {
+            format!(
+                "'{}'",
+                escape_string(&rushwind_storage::json::encode(&Value::Array(
+                    items.clone()
+                )))
+            )
+        }
+        Some(Value::Json(text)) => format!("'{}'", escape_string(text)),
     }
 }
 

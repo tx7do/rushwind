@@ -65,6 +65,17 @@ async fn full_request_document_drives_the_engine() {
     assert_eq!(page.items[0].len(), 2);
 }
 
+fn leaf_of(expr: &rushwind_storage::FilterExpr) -> &rushwind_storage::Condition {
+    match expr.node() {
+        rushwind_storage::FilterNode::All(children) => match children.first() {
+            Some(rushwind_storage::FilterNode::Cond(condition)) => condition,
+            _ => panic!("expected a leaf"),
+        },
+        rushwind_storage::FilterNode::Cond(condition) => condition,
+        _ => panic!("expected a leaf"),
+    }
+}
+
 #[test]
 fn snake_case_and_operators_map_identically() {
     let camel = list_query_from_json(
@@ -152,14 +163,7 @@ fn nested_groups_translate_recursively() {
 
 #[test]
 fn unsupported_taxonomy_is_named_at_the_boundary() {
-    for op in [
-        "REGEXP",
-        "IREGEXP",
-        "JSON_CONTAINS",
-        "ARRAY_CONTAINS",
-        "EXISTS",
-        "SEARCH",
-    ] {
+    for op in ["REGEXP", "IREGEXP", "EXISTS", "SEARCH"] {
         let err = filter_expr_from_json(&format!(
             r#"{{"conditions": [{{"field": "name", "op": "{op}", "value": "x"}}]}}"#
         ))
@@ -169,6 +173,28 @@ fn unsupported_taxonomy_is_named_at_the_boundary() {
             "op {op} must be a named Unsupported, got: {err}"
         );
     }
+    // The JSON containment pair now ride the contract's json kinds:
+    // JSON_CONTAINS with an object operand (canonical text), and
+    // ARRAY_CONTAINS with a list operand (typed elements).
+    let expr = filter_expr_from_json(
+        r#"{"conditions": [{"field": "meta", "op": "JSON_CONTAINS", "value": {"k": 1}}]}"#,
+    )
+    .expect("JSON_CONTAINS maps");
+    let condition = leaf_of(&expr);
+    assert_eq!(condition.op, Op::JsonContains);
+    assert_eq!(
+        condition.values,
+        vec![Value::Json(r#"{"k":1}"#.to_string())],
+        "the object operand rides canonical text"
+    );
+    let expr = filter_expr_from_json(
+        r#"{"conditions": [{"field": "tags", "op": "ARRAY_CONTAINS", "value": "red"}]}"#,
+    )
+    .expect("ARRAY_CONTAINS maps");
+    let condition = leaf_of(&expr);
+    assert_eq!(condition.op, Op::ArrayContains);
+    assert_eq!(condition.values, vec![Value::Text("red".to_string())]);
+
     // The date_part/json_path extensions likewise.
     let err = filter_expr_from_json(
         r#"{"conditions": [{"field": "created_at", "op": "GTE", "value": 1, "datePart": "DAY"}]}"#,

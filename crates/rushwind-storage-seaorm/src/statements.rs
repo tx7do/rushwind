@@ -45,6 +45,16 @@ pub(crate) fn create_table_statement(schema: &Schema, backend: DbBackend) -> Tab
             ColumnKind::Text => {
                 def.text();
             }
+            // JSON columns: MySQL's JSON, PostgreSQL's JSONB, SQLite's
+            // TEXT-stored documents (the canonical text round trips).
+            ColumnKind::Json => match backend {
+                DbBackend::Postgres => {
+                    def.json_binary();
+                }
+                _ => {
+                    def.json();
+                }
+            },
         }
         if column.name == schema.primary_key {
             def.primary_key();

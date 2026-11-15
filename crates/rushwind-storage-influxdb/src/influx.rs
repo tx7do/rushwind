@@ -56,6 +56,10 @@ fn display_id(value: &Value) -> String {
         Value::Text(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Null => String::new(),
+        // JSON-kind ids degrade to their canonical text (the pk is an
+        // integer by contract; this face never fires for them).
+        Value::Array(items) => rushwind_storage::json::encode(&Value::Array(items.clone())),
+        Value::Json(text) => text.clone(),
     }
 }
 
@@ -80,6 +84,21 @@ pub fn line(measurement: &str, row: &Record) -> String {
                 "{}=\"{}\"",
                 escape_line_token(column),
                 escape_field_string(s)
+            ),
+            // JSON kinds ride their canonical text as a string field
+            // (InfluxDB's line protocol has no JSON field type; the
+            // read face parses it back by the schema's kind).
+            Value::Array(items) => format!(
+                "{}=\"{}\"",
+                escape_line_token(column),
+                escape_field_string(&rushwind_storage::json::encode(&Value::Array(
+                    items.clone()
+                )))
+            ),
+            Value::Json(text) => format!(
+                "{}=\"{}\"",
+                escape_line_token(column),
+                escape_field_string(text)
             ),
         };
         fields.push(field);

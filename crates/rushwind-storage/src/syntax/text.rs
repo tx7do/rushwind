@@ -368,6 +368,11 @@ fn negate(node: &FilterNode) -> Result<FilterExpr, StorageError> {
                         "negated pattern operators".into(),
                     ))
                 }
+                Op::JsonContains | Op::ArrayContains => {
+                    return Err(StorageError::Unsupported(
+                        "negated json containment operators".into(),
+                    ))
+                }
             };
             FilterExpr::from(FilterNode::Cond(Condition {
                 field: condition.field.clone(),

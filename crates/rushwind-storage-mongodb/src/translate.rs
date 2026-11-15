@@ -20,8 +20,9 @@ use mongodb::bson::{doc, Bson, Document, Regex};
 
 use rushwind_storage::{Condition, FilterNode, Op, Schema, Sort, SortDir, StorageError, Value};
 
-/// Converts a contract scalar into BSON. Lists and objects do not exist in
-/// the contract's scalar model, so there is nothing else to map.
+/// Converts a contract value into BSON. Arrays encode element-wise;
+/// JSON documents ride their canonical text through the extended-JSON
+/// reader (the wire shape MongoDB stores natively).
 pub(crate) fn value_to_bson(value: &Value) -> Bson {
     match value {
         Value::Null => Bson::Null,
@@ -29,6 +30,10 @@ pub(crate) fn value_to_bson(value: &Value) -> Bson {
         Value::Int(i) => Bson::Int64(*i),
         Value::Real(f) => Bson::Double(*f),
         Value::Text(s) => Bson::String(s.clone()),
+        Value::Array(items) => Bson::Array(items.iter().map(value_to_bson).collect()),
+        Value::Json(text) => Bson::Document(
+            Document::from_reader(text.as_bytes()).unwrap_or_else(|_| Document::new()),
+        ),
     }
 }
 
@@ -76,6 +81,9 @@ pub(crate) fn bson_to_value(
         rushwind_storage::ColumnKind::Real => {
             Value::Real(bson.as_f64().ok_or_else(|| mismatches("a number"))?)
         }
+        // A JSON column reads back typed: arrays typed element-wise,
+        // objects as canonical documents, scalars native.
+        rushwind_storage::ColumnKind::Json => bson_to_json_value(bson),
         rushwind_storage::ColumnKind::Text => Value::Text(
             bson.as_str()
                 .ok_or_else(|| mismatches("a string"))?
@@ -210,7 +218,34 @@ pub(crate) fn condition_to_doc(condition: &Condition) -> Result<Document, Storag
                 options: "i".into(),
             }) } }
         }
+        // MongoDB's equality face IS the containment face for arrays:
+        // `{field: element}` matches arrays holding the element.
+        // JSON_CONTAINS rides the same shape — the operand document
+        // matches exact equality or array membership. The object
+        // key-subset containment MySQL's JSON_CONTAINS carries has no
+        // MongoDB query face (aggregation-only) — the crate docs
+        // declare the delta.
+        Op::ArrayContains => doc! { field: value_to_bson(&first()) },
+        Op::JsonContains => doc! { field: value_to_bson(&first()) },
     })
+}
+
+/// One stored BSON value back into the contract's kinds — arrays
+/// typed element-wise, documents as canonical JSON text.
+pub(crate) fn bson_to_json_value(bson: &Bson) -> Value {
+    match bson {
+        Bson::Null => Value::Null,
+        Bson::Boolean(b) => Value::Bool(*b),
+        Bson::Int32(i) => Value::Int(*i as i64),
+        Bson::Int64(i) => Value::Int(*i),
+        Bson::Double(f) => Value::Real(*f),
+        Bson::String(s) => Value::Text(s.clone()),
+        Bson::Array(items) => Value::Array(items.iter().map(bson_to_json_value).collect()),
+        Bson::Document(document) => Value::Json(document.to_string()),
+        // Other BSON shapes (DateTime, ObjectId, …) ride their
+        // extended-JSON text form.
+        other => Value::Json(other.clone().into_relaxed_extjson().to_string()),
+    }
 }
 
 /// Translates a filter-tree node; `All`/`Any` become `$and`/`$or`, and an

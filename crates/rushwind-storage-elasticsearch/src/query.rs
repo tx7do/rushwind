@@ -63,6 +63,13 @@ pub(crate) fn condition_json(
         Value::Int(i) => json!(i),
         Value::Real(f) => json!(f),
         Value::Text(s) => json!(s),
+        // JSON kinds ride the wire shape: arrays as JSON arrays (a
+        // term query matches any element — Elasticsearch's native
+        // containment face), documents as parsed objects.
+        Value::Array(items) => {
+            json!(items.iter().map(json_value).collect::<Vec<Json>>())
+        }
+        Value::Json(text) => serde_json::from_str(text).unwrap_or(Json::String(text.clone())),
     };
     let term = || json!({ "term": { field_borrow: scalar(&first()) } });
     // (lower, inclusive), (upper, inclusive): one-sided ops pass None.
@@ -128,7 +135,30 @@ pub(crate) fn condition_json(
             let text = pattern_operand(condition)?;
             wildcard_clause(field_borrow.to_owned(), &format!("%{text}"), false)
         }
+        // Elasticsearch's term face IS the array containment face: a
+        // term matches any element of an array field. ARRAY_CONTAINS
+        // rides it directly; JSON_CONTAINS rides equality — the term
+        // on the scalar/document/element. The object key-subset
+        // containment has no Elasticsearch query face without nested
+        // mappings — the crate docs declare the delta.
+        Op::ArrayContains => json!({ "term": { field_borrow: scalar(&first()) } }),
+        Op::JsonContains => term(),
     })
+}
+
+/// One contract value out to its JSON wire shape — the array face of
+/// [`scalar`] generalized (nested arrays recurse; documents parse
+/// their canonical text).
+pub(crate) fn json_value(value: &Value) -> Json {
+    match value {
+        Value::Null => Json::Null,
+        Value::Bool(b) => json!(b),
+        Value::Int(i) => json!(i),
+        Value::Real(f) => json!(f),
+        Value::Text(s) => json!(s),
+        Value::Array(items) => Json::Array(items.iter().map(json_value).collect()),
+        Value::Json(text) => serde_json::from_str(text).unwrap_or(Json::String(text.clone())),
+    }
 }
 
 /// The query JSON for a filter-tree node (`AND`/`OR` nest as bool

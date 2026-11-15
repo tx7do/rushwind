@@ -127,6 +127,11 @@ impl ElasticRepo {
                 ColumnKind::Bool => json!({ "type": "boolean" }),
                 ColumnKind::Int => json!({ "type": "long" }),
                 ColumnKind::Real => json!({ "type": "double" }),
+                // JSON columns stay dynamically mapped: term queries
+                // against their arrays/scalars work off the inferred
+                // types, and a static object mapping would fight the
+                // document shapes the column legally holds.
+                ColumnKind::Json => json!({ "type": "object", "enabled": true }),
                 ColumnKind::Text => json!({
                     "type": "text",
                     "fields": { "keyword": { "type": "keyword" } }
@@ -227,6 +232,12 @@ impl ElasticRepo {
                     None => Json::Null,
                 },
                 Some(Value::Text(s)) => json!(s),
+                Some(Value::Array(items)) => {
+                    Json::Array(items.iter().map(crate::query::json_value).collect())
+                }
+                Some(Value::Json(text)) => {
+                    serde_json::from_str(text).unwrap_or(Json::String(text.clone()))
+                }
             };
             map.insert(column.name.clone(), json);
         }
@@ -251,6 +262,12 @@ impl ElasticRepo {
                             Value::Null => Json::Null,
                             Value::Bool(b) => json!(b),
                             Value::Int(i) => json!(i),
+                            Value::Array(items) => {
+                                Json::Array(items.iter().map(crate::query::json_value).collect())
+                            }
+                            Value::Json(text) => {
+                                serde_json::from_str(text).unwrap_or(Json::String(text.clone()))
+                            }
                             Value::Real(f) => match serde_json::Number::from_f64(*f) {
                                 Some(number) => Json::Number(number),
                                 None => Json::Null,

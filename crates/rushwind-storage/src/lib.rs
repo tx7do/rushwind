@@ -52,6 +52,7 @@ pub mod context;
 pub mod error;
 pub mod field_mask;
 pub mod filter;
+pub mod json;
 pub mod paging;
 pub mod record;
 pub mod repository;

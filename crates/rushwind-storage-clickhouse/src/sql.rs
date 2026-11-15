@@ -42,6 +42,15 @@ pub(crate) fn literal(value: &Value) -> String {
             }
         }
         Value::Text(s) => format!("'{}'", escape_string(s)),
+        // JSON kinds store as their canonical text (a JSON column's
+        // ClickHouse face is a String column holding the document).
+        Value::Array(items) => format!(
+            "'{}'",
+            escape_string(&rushwind_storage::json::encode(&Value::Array(
+                items.clone()
+            )))
+        ),
+        Value::Json(text) => format!("'{}'", escape_string(text)),
     }
 }
 
@@ -59,6 +68,8 @@ fn column_type(kind: ColumnKind) -> &'static str {
         ColumnKind::Int => "Nullable(Int64)",
         ColumnKind::Real => "Nullable(Float64)",
         ColumnKind::Text => "Nullable(String)",
+        // JSON columns store their canonical text.
+        ColumnKind::Json => "Nullable(String)",
     }
 }
 
@@ -74,7 +85,7 @@ pub(crate) fn create_table_sql(schema: &Schema) -> String {
                 ColumnKind::Bool => "UInt8",
                 ColumnKind::Int => "Int64",
                 ColumnKind::Real => "Float64",
-                ColumnKind::Text => "String",
+                ColumnKind::Text | ColumnKind::Json => "String",
             }
         } else {
             column_type(column.kind)
@@ -228,6 +239,15 @@ pub(crate) fn condition_sql(condition: &Condition) -> Result<String, StorageErro
         Op::Like => format!("{} LIKE '{}'", column, pattern(|s| s.to_owned())?),
         Op::NotLike => format!("{} NOT LIKE '{}'", column, pattern(|s| s.to_owned())?),
         Op::Ilike => format!("{} ILIKE '{}'", column, pattern(|s| s.to_lowercase())?),
+        // The JSON containment pair have no pushed-down face yet —
+        // they refuse rather than silently narrowing (the fetch-and-
+        // evaluate fallback is the repository layer's move, not the
+        // translator's).
+        Op::JsonContains | Op::ArrayContains => {
+            return Err(StorageError::Unsupported(
+                "JSON_CONTAINS/ARRAY_CONTAINS have no ClickHouse face yet".into(),
+            ))
+        }
         // lowerUTF8 is ClickHouse's Unicode-aware LOWER; the operand
         // folds on the Rust side, as every SQL engine here does.
         Op::Iexact => format!(

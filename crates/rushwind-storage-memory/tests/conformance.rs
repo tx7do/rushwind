@@ -22,3 +22,7 @@ async fn fresh_tenant_repo() -> Arc<dyn Repository> {
 }
 
 rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant: crate::fresh_tenant_repo);
+
+// The JSON/Array kinds' operator faces (array membership, JSON
+// equality, NULL) — the engines with the face pin them here.
+rushwind_testkit::rushwind_storage_json_suite!(crate::fresh_repo);

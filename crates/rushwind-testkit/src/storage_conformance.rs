@@ -50,7 +50,7 @@
 
 use std::sync::Mutex;
 
-use crate::rushwind_storage::{AuditEntry, Auditor, ColumnKind, Record, Schema};
+use crate::rushwind_storage::{AuditEntry, Auditor, ColumnKind, Record, Schema, Value};
 
 /// The standard schema every conformant engine is tested against.
 ///
@@ -66,6 +66,7 @@ pub fn suite_schema() -> Schema {
         .column("score", ColumnKind::Real)
         .column("owner_id", ColumnKind::Int)
         .column("unit_id", ColumnKind::Int)
+        .column("meta", ColumnKind::Json)
         .build()
         .expect("suite schema is valid")
 }
@@ -141,14 +142,24 @@ pub fn tenant_standard_rows() -> Vec<Record> {
     ]
 }
 
-/// The five standard rows the filter and scope tests seed.
+/// The five standard rows the filter and scope tests seed. The `meta`
+/// JSON column carries one shape per row — a two-element array, an
+/// empty array, an object with nested scalars, NULL, and an object
+/// holding an array — so the JSON suite pins every shape's face.
 pub fn standard_rows() -> Vec<Record> {
     vec![
-        widget("alpha", 5, Some(1.5), 1, 10),
-        widget("Bravo", 10, None, 1, 20),
-        widget("charlie", 15, Some(2.5), 2, 10),
-        widget("delta", 20, None, 2, 20),
-        widget("Echo", 25, Some(3.5), 3, 30),
+        widget("alpha", 5, Some(1.5), 1, 10).set(
+            "meta",
+            Value::Array(vec![Value::Text("red".into()), Value::Text("blue".into())]),
+        ),
+        widget("Bravo", 10, None, 1, 20).set("meta", Value::Array(vec![])),
+        widget("charlie", 15, Some(2.5), 2, 10)
+            .set("meta", Value::Json(r#"{"k":1,"kind":"two"}"#.to_string())),
+        widget("delta", 20, None, 2, 20).set("meta", Value::Null),
+        widget("Echo", 25, Some(3.5), 3, 30).set(
+            "meta",
+            Value::Json(r#"{"tags":["red","green"]}"#.to_string()),
+        ),
     ]
 }
 
@@ -1323,6 +1334,158 @@ macro_rules! rushwind_storage_conformance_suite {
             /// Reads the integer id out of a stored row.
             fn id_of_value(v: Option<&Value>) -> i64 {
                 v.and_then(Value::as_i64).expect("int id")
+            }
+        }
+    };
+}
+
+/// The JSON suite: the JSON/Array kinds' operator faces every engine
+/// adopting the face pins against — array element membership, JSON
+/// equality (canonical text), NULL, and the wire's typed operands.
+/// Deeper containment shapes (MySQL key-subset, deep value search)
+/// carry engine-specific faces and stay crate-local pins; this suite
+/// pins only what every adopting engine honors identically.
+///
+/// ```ignore
+/// rushwind_testkit::rushwind_storage_json_suite!(crate::fresh_repo);
+/// ```
+#[macro_export]
+macro_rules! rushwind_storage_json_suite {
+    ($factory:expr) => {
+        mod rushwind_storage_json_conformance {
+            use std::sync::Arc;
+
+            use $crate::rushwind_storage::{
+                FilterExpr, ListQuery, Op, QueryCtx, Repository, Value,
+            };
+            use $crate::storage_conformance::standard_rows;
+
+            /// A fresh, empty table for every suite test.
+            async fn fresh_repo() -> Arc<dyn Repository> {
+                $factory().await
+            }
+
+            async fn seed(repo: &Arc<dyn Repository>) {
+                for row in standard_rows() {
+                    repo.create(QueryCtx::all_access(), row)
+                        .await
+                        .expect("seed row");
+                }
+            }
+
+            async fn ids_of(repo: &Arc<dyn Repository>, q: &ListQuery) -> Vec<i64> {
+                let page = repo
+                    .list(QueryCtx::all_access(), q)
+                    .await
+                    .expect("list succeeds");
+                page.items
+                    .iter()
+                    .map(|r| r.get("id").and_then(Value::as_i64).expect("int id"))
+                    .collect()
+            }
+
+            #[tokio::test]
+            async fn array_contains_matches_top_level_elements() {
+                let repo = fresh_repo().await;
+                seed(&repo).await;
+                let hit = ListQuery::default().filtered(FilterExpr::cond(
+                    "meta",
+                    Op::ArrayContains,
+                    [Value::Text("red".into())],
+                ));
+                assert_eq!(
+                    ids_of(&repo, &hit).await,
+                    vec![1i64],
+                    "alpha's array holds red"
+                );
+                let miss = ListQuery::default().filtered(FilterExpr::cond(
+                    "meta",
+                    Op::ArrayContains,
+                    [Value::Text("green".into())],
+                ));
+                assert_eq!(
+                    ids_of(&repo, &miss).await,
+                    Vec::<i64>::new(),
+                    "green rides only inside Echo's object — not a top-level element"
+                );
+                let miss_int = ListQuery::default().filtered(FilterExpr::cond(
+                    "meta",
+                    Op::ArrayContains,
+                    [Value::Int(5)],
+                ));
+                assert_eq!(ids_of(&repo, &miss_int).await, Vec::<i64>::new());
+            }
+
+            #[tokio::test]
+            async fn json_contains_pins_equality() {
+                let repo = fresh_repo().await;
+                seed(&repo).await;
+                let hit = ListQuery::default().filtered(FilterExpr::cond(
+                    "meta",
+                    Op::JsonContains,
+                    [Value::Json(r#"["red","blue"]"#.to_string())],
+                ));
+                assert_eq!(ids_of(&repo, &hit).await, vec![1i64], "the array equality");
+                let hit_obj = ListQuery::default().filtered(FilterExpr::cond(
+                    "meta",
+                    Op::JsonContains,
+                    [Value::Json(r#"{"k":1,"kind":"two"}"#.to_string())],
+                ));
+                assert_eq!(
+                    ids_of(&repo, &hit_obj).await,
+                    vec![3i64],
+                    "the object equality"
+                );
+            }
+
+            #[tokio::test]
+            async fn json_columns_round_trip_and_eq_exactly() {
+                let repo = fresh_repo().await;
+                seed(&repo).await;
+                // The stored array reads back typed; EQ on the same
+                // shape matches exactly.
+                let eq = ListQuery::default().filtered(FilterExpr::cond(
+                    "meta",
+                    Op::Eq,
+                    [Value::Array(vec![
+                        Value::Text("red".into()),
+                        Value::Text("blue".into()),
+                    ])],
+                ));
+                assert_eq!(ids_of(&repo, &eq).await, vec![1i64], "the array EQ");
+                let eq_obj = ListQuery::default().filtered(FilterExpr::cond(
+                    "meta",
+                    Op::Eq,
+                    [Value::Json(r#"{"tags":["red","green"]}"#.to_string())],
+                ));
+                assert_eq!(ids_of(&repo, &eq_obj).await, vec![5i64], "the object EQ");
+                // Empty arrays survive the round trip.
+                let eq_empty = ListQuery::default().filtered(FilterExpr::cond(
+                    "meta",
+                    Op::Eq,
+                    [Value::Array(vec![])],
+                ));
+                assert_eq!(
+                    ids_of(&repo, &eq_empty).await,
+                    vec![2i64],
+                    "the empty array EQ"
+                );
+            }
+
+            #[tokio::test]
+            async fn json_null_and_shape_misses() {
+                let repo = fresh_repo().await;
+                seed(&repo).await;
+                let nulls = ListQuery::default().filtered(FilterExpr::cond("meta", Op::IsNull, []));
+                assert_eq!(ids_of(&repo, &nulls).await, vec![4i64]);
+                // An object is not an array: ArrayContains never hits
+                // Echo's object, whatever it holds.
+                let miss = ListQuery::default().filtered(FilterExpr::cond(
+                    "meta",
+                    Op::ArrayContains,
+                    [Value::Text("x".into())],
+                ));
+                assert_eq!(ids_of(&repo, &miss).await, Vec::<i64>::new());
             }
         }
     };

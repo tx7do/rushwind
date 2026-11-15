@@ -47,6 +47,27 @@ pub fn record_from_json(
                 serde_json::Value::Null => Value::Null,
                 other => return Err(kind_error(key, "a string", other)),
             },
+            // A JSON column takes any JSON value: objects ride as their
+            // canonical text, arrays as typed element arrays.
+            rushwind_storage::ColumnKind::Json => match raw {
+                serde_json::Value::Object(_) => Value::Json(
+                    serde_json::to_string(raw)
+                        .map_err(|e| StorageError::InvalidQuery(format!("column {key:?}: {e}")))?,
+                ),
+                serde_json::Value::Array(items) => Value::Array(
+                    items
+                        .iter()
+                        .map(json_element)
+                        .collect::<Result<Vec<_>, StorageError>>()?,
+                ),
+                serde_json::Value::Null => Value::Null,
+                serde_json::Value::Bool(b) => Value::Bool(*b),
+                serde_json::Value::Number(n) if n.as_i64().is_some() => {
+                    Value::Int(n.as_i64().expect("checked"))
+                }
+                serde_json::Value::Number(n) => Value::Real(n.as_f64().unwrap_or_default()),
+                serde_json::Value::String(s) => Value::Text(s.clone()),
+            },
         };
         record.insert(key.as_str(), converted);
     }
@@ -65,10 +86,58 @@ pub fn record_to_json(record: &Record) -> serde_json::Value {
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null),
             Value::Text(s) => serde_json::Value::String(s.clone()),
+            Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(value_to_json).collect())
+            }
+            Value::Json(text) => {
+                serde_json::from_str(text).unwrap_or(serde_json::Value::String(text.clone()))
+            }
         };
         map.insert(field.to_owned(), json);
     }
     serde_json::Value::Object(map)
+}
+
+/// One JSON array element inside a Json column's write payload:
+/// nested objects ride as canonical text, arrays recurse, scalars map.
+fn json_element(raw: &serde_json::Value) -> Result<Value, StorageError> {
+    Ok(match raw {
+        serde_json::Value::Object(_) => Value::Json(
+            serde_json::to_string(raw)
+                .map_err(|e| StorageError::InvalidQuery(format!("nested json: {e}")))?,
+        ),
+        serde_json::Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(json_element)
+                .collect::<Result<Vec<_>, StorageError>>()?,
+        ),
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) if n.as_i64().is_some() => {
+            Value::Int(n.as_i64().expect("checked"))
+        }
+        serde_json::Value::Number(n) => Value::Real(n.as_f64().unwrap_or_default()),
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+    })
+}
+
+/// One contract value back out to JSON — the read face of a Json
+/// column's elements.
+fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int(i) => serde_json::Value::Number((*i).into()),
+        Value::Real(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Text(s) => serde_json::Value::String(s.clone()),
+        Value::Array(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::Json(text) => {
+            serde_json::from_str(text).unwrap_or(serde_json::Value::String(text.clone()))
+        }
+    }
 }
 
 fn kind_error(column: &str, expected: &str, got: &serde_json::Value) -> StorageError {

@@ -191,7 +191,9 @@ impl SeaRepo {
             match ctx.viewer.scope(Viewer::OWNER_COLUMN, Viewer::UNIT_COLUMN) {
                 Scope::Deny => ScopeSql::Deny,
                 Scope::Unrestricted => ScopeSql::Pass(None),
-                Scope::Scoped(filter) => ScopeSql::Pass(Some(translate(filter.node())?)),
+                Scope::Scoped(filter) => {
+                    ScopeSql::Pass(Some(translate(filter.node(), self.backend())?))
+                }
             },
         )
     }
@@ -234,6 +236,20 @@ impl SeaRepo {
                     row.try_get_by::<Option<String>, _>(name.as_str())
                         .map_err(|e| self.map_err(e))?,
                 ),
+                // A JSON column stores its canonical text; the read
+                // face parses it back into the contract's kinds —
+                // arrays typed, objects as canonical documents,
+                // scalars native.
+                ColumnKind::Json => {
+                    let text = row
+                        .try_get_by::<Option<String>, _>(name.as_str())
+                        .map_err(|e| self.map_err(e))?;
+                    match text.map(|text| json_to_value(&text)) {
+                        None => Value::Null,
+                        Some(Value::Null) => Value::Null,
+                        Some(value) => value,
+                    }
+                }
             };
             record.insert(name.as_str(), value);
         }
@@ -285,7 +301,7 @@ impl SeaRepo {
             any = true;
         }
         if let Some(filter) = &query.filter {
-            combined = combined.add(translate(filter.node())?);
+            combined = combined.add(translate(filter.node(), self.backend())?);
             any = true;
         }
         Ok(if any { Some(combined) } else { None })
@@ -864,3 +880,38 @@ mod tree;
 
 use condition::{bind, expect_id, translate, ScopeSql, TenantSql};
 use statements::{create_table_statement, list_select};
+
+/// Parses one stored JSON document back into the contract's kinds:
+/// arrays typed element-wise, objects as canonical `Value::Json`
+/// text, scalars native (numbers integral when whole). Malformed
+/// stored text degrades to a JSON text value — never a panic.
+fn json_to_value(text: &str) -> Value {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(text).ok();
+    match parsed {
+        None => Value::Json(text.to_owned()),
+        Some(serde_json::Value::Object(_)) => Value::Json(text.to_owned()),
+        Some(serde_json::Value::Array(items)) => {
+            Value::Array(items.iter().map(json_element_to_value).collect())
+        }
+        Some(other) => json_element_to_value(&other),
+    }
+}
+
+/// One JSON element inside a stored document.
+fn json_element_to_value(value: &serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Real(n.as_f64().unwrap_or_default()),
+        },
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+        serde_json::Value::Array(items) => {
+            Value::Array(items.iter().map(json_element_to_value).collect())
+        }
+        serde_json::Value::Object(_) => {
+            Value::Json(serde_json::to_string(value).unwrap_or_default())
+        }
+    }
+}

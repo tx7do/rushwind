@@ -191,6 +191,9 @@ impl ClickHouseRepo {
                         StorageError::Backend(format!("column {:?} is not a float", column.name))
                     })?),
                     ColumnKind::Bool => Value::Bool(text != "0"),
+                    // JSON columns store their canonical text — parse
+                    // it back into the contract's kinds.
+                    ColumnKind::Json => json_text_to_value(text),
                 },
                 Some(_) => {
                     return Err(StorageError::Backend(format!(
@@ -739,6 +742,33 @@ impl Repository for ClickHouseRepo {
 
     fn delete(&self, ctx: QueryCtx, id: Value) -> RepoFuture<'_, ()> {
         Box::pin(async move { self.delete_async(&ctx, id).await })
+    }
+}
+
+/// Parses one stored JSON document back into the contract's kinds —
+/// the read face of a JSON column's canonical text. Malformed stored
+/// text degrades to a JSON text value, never a panic.
+fn json_text_to_value(text: &str) -> Value {
+    match serde_json::from_str::<Json>(text) {
+        Ok(Json::Object(_)) => Value::Json(text.to_owned()),
+        Ok(Json::Array(items)) => Value::Array(items.iter().map(json_element).collect()),
+        Ok(other) => json_element(&other),
+        Err(_) => Value::Json(text.to_owned()),
+    }
+}
+
+/// One JSON element inside a stored document.
+fn json_element(value: &Json) -> Value {
+    match value {
+        Json::Null => Value::Null,
+        Json::Bool(b) => Value::Bool(*b),
+        Json::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Real(n.as_f64().unwrap_or_default()),
+        },
+        Json::String(s) => Value::Text(s.clone()),
+        Json::Array(items) => Value::Array(items.iter().map(json_element).collect()),
+        Json::Object(_) => Value::Json(value.to_string()),
     }
 }
 

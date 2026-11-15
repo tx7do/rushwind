@@ -17,6 +17,9 @@ pub enum ColumnKind {
     Real,
     /// UTF-8 text.
     Text,
+    /// JSON — objects (`Value::Json`) and arrays (`Value::Array`),
+    /// plus any scalar a JSON document can hold.
+    Json,
 }
 
 impl ColumnKind {
@@ -27,6 +30,9 @@ impl ColumnKind {
             ColumnKind::Int => kind == "int" || kind == "null",
             ColumnKind::Real => kind == "real" || kind == "int" || kind == "null",
             ColumnKind::Text => kind == "text" || kind == "null",
+            // A JSON column holds any JSON value: objects, arrays, and
+            // the scalars a JSON document carries.
+            ColumnKind::Json => true,
         }
     }
 }

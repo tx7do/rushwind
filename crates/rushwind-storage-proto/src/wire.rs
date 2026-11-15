@@ -186,12 +186,13 @@ fn condition_to_filter(condition: &FilterCondition) -> Result<ContractFilterExpr
         // SQL engines render LOWER(col) = LOWER(?), MongoDB an anchored
         // case-folded regex.
         Operator::Iexact => cond(Op::Iexact, values),
-        Operator::Regexp
-        | Operator::Iregexp
-        | Operator::JsonContains
-        | Operator::ArrayContains
-        | Operator::Exists
-        | Operator::Search => return Err(unsupported(op_name(op))),
+        // The JSON containment pair: typed JSON/Array operands ride
+        // the contract's json kinds.
+        Operator::JsonContains => cond(Op::JsonContains, values),
+        Operator::ArrayContains => cond(Op::ArrayContains, values),
+        Operator::Regexp | Operator::Iregexp | Operator::Exists | Operator::Search => {
+            return Err(unsupported(op_name(op)))
+        }
     })
 }
 
@@ -220,10 +221,49 @@ fn value_to_contract(value: &pbjson_types::Value) -> Result<Value, StorageError>
         }
         Some(Kind::StringValue(s)) => Ok(Value::Text(s.clone())),
         Some(Kind::NullValue(_)) | None => Ok(Value::Null),
-        Some(Kind::ListValue(_)) | Some(Kind::StructValue(_)) => {
-            Err(unsupported("composite (list/object) wire values"))
+        // The JSON/Array kinds: lists encode element-wise (arrays of
+        // scalars and documents), objects ride their canonical text
+        // (the Value::Json document shape).
+        Some(Kind::ListValue(list)) => {
+            let mut items = Vec::with_capacity(list.values.len());
+            for item in &list.values {
+                items.push(value_to_contract(item)?);
+            }
+            Ok(Value::Array(items))
         }
+        Some(Kind::StructValue(_)) => Ok(Value::Json(
+            serde_json::to_string(&pbjson_value_to_serde(value)?)
+                .map_err(|e| StorageError::InvalidQuery(format!("json operand: {e}")))?,
+        )),
     }
+}
+
+/// One pbjson value out to its serde_json model (for the JSON kinds'
+/// canonical encoding).
+fn pbjson_value_to_serde(value: &pbjson_types::Value) -> Result<serde_json::Value, StorageError> {
+    use pbjson_types::value::Kind;
+    Ok(match &value.kind {
+        Some(Kind::BoolValue(b)) => serde_json::json!(b),
+        // Whole-number doubles ride as integers — the canonical JSON
+        // number shape (1, never 1.0; the contract's number model).
+        Some(Kind::NumberValue(n)) if n.fract() == 0.0 => serde_json::json!(*n as i64),
+        Some(Kind::NumberValue(n)) => serde_json::json!(n),
+        Some(Kind::StringValue(s)) => serde_json::json!(s),
+        Some(Kind::NullValue(_)) | None => serde_json::Value::Null,
+        Some(Kind::ListValue(list)) => serde_json::Value::Array(
+            list.values
+                .iter()
+                .map(pbjson_value_to_serde)
+                .collect::<Result<Vec<_>, StorageError>>()?,
+        ),
+        Some(Kind::StructValue(structure)) => serde_json::Value::Object(
+            structure
+                .fields
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), pbjson_value_to_serde(value)?)))
+                .collect::<Result<serde_json::Map<String, serde_json::Value>, StorageError>>()?,
+        ),
+    })
 }
 
 fn op_name(op: Operator) -> &'static str {

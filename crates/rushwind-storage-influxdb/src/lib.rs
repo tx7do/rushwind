@@ -181,41 +181,57 @@ impl InfluxRepo {
                 if column == "time" {
                     continue; // engine bookkeeping, not a contract column
                 }
-                let value =
-                    match row.get(position) {
-                        None | Some(Json::Null) => Value::Null,
-                        Some(Json::Bool(b)) => Value::Bool(*b),
-                        Some(Json::Number(n)) => match self.schema.column(column).map(|c| c.kind) {
+                let value = match row.get(position) {
+                    None | Some(Json::Null) => Value::Null,
+                    Some(Json::Bool(b)) => Value::Bool(*b),
+                    Some(Json::Number(n)) => {
+                        match self.schema.column(column).map(|c| c.kind) {
                             Some(rushwind_storage::ColumnKind::Real) => {
                                 Value::Real(n.as_f64().unwrap_or_default())
                             }
                             _ => Value::Int(n.as_i64().ok_or_else(|| {
                                 StorageError::Backend("int64 out of range".into())
                             })?),
-                        },
-                        Some(Json::String(text)) => {
-                            // Tags ride the wire as strings — the primary key
-                            // (a series tag) and integer columns convert back
-                            // to the contract kinds.
-                            let is_pk = column.as_str() == self.schema.primary_key;
-                            let is_int_tag = self.schema.column(column).map(|c| c.kind)
-                                == Some(rushwind_storage::ColumnKind::Int);
-                            if is_pk || is_int_tag {
-                                Value::Int(text.parse().map_err(|_| {
-                                    StorageError::Backend(format!(
-                                        "column {column:?} is not an integer"
-                                    ))
-                                })?)
-                            } else {
-                                Value::Text(text.clone())
+                        }
+                    }
+                    Some(Json::String(text)) => {
+                        // Tags ride the wire as strings — the primary key
+                        // (a series tag) and integer columns convert back
+                        // to the contract kinds.
+                        let is_pk = column.as_str() == self.schema.primary_key;
+                        let is_int_tag = self.schema.column(column).map(|c| c.kind)
+                            == Some(rushwind_storage::ColumnKind::Int);
+                        if is_pk || is_int_tag {
+                            Value::Int(text.parse().map_err(|_| {
+                                StorageError::Backend(format!(
+                                    "column {column:?} is not an integer"
+                                ))
+                            })?)
+                        // JSON columns store their canonical text
+                        // as a string field — parse it back into
+                        // the contract's kinds.
+                        } else if self.schema.column(column).map(|c| c.kind)
+                            == Some(rushwind_storage::ColumnKind::Json)
+                        {
+                            let parsed: Result<serde_json::Value, _> = serde_json::from_str(text);
+                            match parsed {
+                                Ok(serde_json::Value::Object(_)) => Value::Json(text.clone()),
+                                Ok(serde_json::Value::Array(items)) => {
+                                    Value::Array(items.iter().map(json_element_to_value).collect())
+                                }
+                                Ok(other) => json_element_to_value(&other),
+                                Err(_) => Value::Json(text.clone()),
                             }
+                        } else {
+                            Value::Text(text.clone())
                         }
-                        Some(_) => {
-                            return Err(StorageError::Backend(format!(
-                                "column {column:?} arrived as a composite JSON value"
-                            )))
-                        }
-                    };
+                    }
+                    Some(_) => {
+                        return Err(StorageError::Backend(format!(
+                            "column {column:?} arrived as a composite JSON value"
+                        )))
+                    }
+                };
                 record.insert(column.clone().as_str(), value);
             }
             // Columns this measurement has never carried are absent from
@@ -738,5 +754,23 @@ impl Repository for InfluxRepo {
 
     fn delete(&self, ctx: QueryCtx, id: Value) -> RepoFuture<'_, ()> {
         Box::pin(async move { self.delete_async(&ctx, id).await })
+    }
+}
+
+/// One JSON element inside a stored document — the read face of a
+/// JSON column's string field.
+fn json_element_to_value(value: &serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Real(n.as_f64().unwrap_or_default()),
+        },
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+        serde_json::Value::Array(items) => {
+            Value::Array(items.iter().map(json_element_to_value).collect())
+        }
+        serde_json::Value::Object(_) => Value::Json(value.to_string()),
     }
 }
