@@ -19,6 +19,7 @@ fn schema() -> Schema {
         .column("score", ColumnKind::Real)
         .column("owner_id", ColumnKind::Int)
         .column("unit_id", ColumnKind::Int)
+        .column("meta", ColumnKind::Json)
         .build()
         .expect("schema is valid")
 }
@@ -182,6 +183,77 @@ async fn list_accepts_the_protojson_document() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["name"], "Bravo");
     assert_eq!(items[1]["name"], "charlie");
+}
+
+#[tokio::test]
+async fn json_and_regex_faces_ride_the_http_stack() {
+    let app = app();
+    // The write payloads carry JSON kinds: an array, a document, NULL.
+    for (name, meta) in [
+        ("alpha", json!(["red", "blue"])),
+        ("bravo", json!({"k": 1})),
+        ("charlie", json!(null)),
+    ] {
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/",
+            json!({"name": name, "age": 1, "score": null, "owner_id": 1, "unit_id": 1, "meta": meta}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let encoded = |document: &str| {
+        document
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-=._~".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect::<String>()
+    };
+
+    // ARRAY_CONTAINS over the wire's typed operand.
+    let q = encoded(
+        r#"{"filterExpr":{"conditions":[{"field":"meta","op":"ARRAY_CONTAINS","value":"red"}]}}"#,
+    );
+    let (status, page) = send(&app, "GET", &format!("/?q={q}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["items"][0]["name"], "alpha");
+
+    // JSON_CONTAINS: the object operand rides canonical text.
+    let q = encoded(
+        r#"{"filterExpr":{"conditions":[{"field":"meta","op":"JSON_CONTAINS","value":{"k":1}}]}}"#,
+    );
+    let (status, page) = send(&app, "GET", &format!("/?q={q}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["items"][0]["name"], "bravo");
+
+    // json_path: the dotted path extracts, the operator rides the
+    // extracted scalar.
+    let q = encoded(
+        r#"{"filterExpr":{"conditions":[{"field":"meta","op":"EQ","value":1,"jsonPath":"k"}]}}"#,
+    );
+    let (status, page) = send(&app, "GET", &format!("/?q={q}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["items"][0]["name"], "bravo");
+
+    // REGEXP rides the contract's own engine.
+    let q = encoded(
+        r#"{"filterExpr":{"conditions":[{"field":"name","op":"REGEXP","value":"^a[a-z]+$"}]}}"#,
+    );
+    let (status, page) = send(&app, "GET", &format!("/?q={q}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["items"][0]["name"], "alpha");
+
+    // The read face renders the JSON kinds back: the array round trips.
+    let (status, row) = send(&app, "GET", "/1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row["meta"], json!(["red", "blue"]));
 }
 
 #[tokio::test]

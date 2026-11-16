@@ -341,6 +341,11 @@ async fn unsubscribe_stops_the_pump() {
     .await;
 
     sub.unsubscribe().await.expect("unsubscribe");
+    // The quiesce: any receive already in flight when the stop landed
+    // completes against the pre-stop queue (empty here), and the
+    // pump's next loop-top check observes the stop — the post-publish
+    // message cannot reach a stopped subscription.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     engine
         .publish("orders", Message::from_payload(b"second".to_vec()))
         .await
