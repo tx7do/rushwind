@@ -137,12 +137,14 @@ let router = CrudApi::new(repo.clone())
 - **软删除需要表里先有墓碑列**。给存储叠软删除装饰器前，schema 里要有整型的 `deleted_at` 列（见[第 08 章](08-cache.md)）。
 - **`list` 的 `total` 与 `items` 是分开的**：`total` 是过滤后的全量计数，`items` 才是本页内容——做分页 UI 时别拿 `items.len()` 当总数。
 - **迁移**：`rushwind-storage-seaorm-migration` 提供由实体派生的 schema 迁移；原型期用 `SeaRepo` 的 `migrate_create()` 直接建表即可。
+- **JSON 列的 kind 是 `ColumnKind::Json`**：载荷是 `Value::Json`（规范文本）或 `Value::Array`（类型化元素），标量也合法——`accepts` 对 JSON 列全放行。过滤走 `JSON_CONTAINS`/`ARRAY_CONTAINS`（JSON 列专属）与 `json_path` 点路径（缺失读 NULL）；各引擎的方言面与诚实拒绝见[第 04 章](04-query-syntax.md)，可跑示例在 `examples/storage-json-filter`（SQLite 的 REGEXP 拒绝是教义不是缺陷）。
 
 ## 动手练习
 
 1. 把 `storage-basics` 的 `scenario` 对着第三个引擎跑一遍（比如 MongoDB），确认零改动。
 2. 用 `Viewer::own` 写一个"每个租户只能列出自己行"的集成测试。
 3. 用游标分页写一个导出函数，把全表按主键序流式写出。
+4. 给 `meta` JSON 列写一个 `ARRAY_CONTAINS` 命中与一个 `json_path` EQ 精确的查询，对着内存与 SQLite 双引擎跑 `examples/storage-json-filter`，确认结果一致。
 
 ---
 [系列目录](README.md) | 上一章：[02 · 装配器与配置](02-bootstrap-and-config.md) | 下一章：[04 · 查询语法](04-query-syntax.md)

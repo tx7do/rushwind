@@ -25,3 +25,9 @@ async fn fresh_tenant_repo() -> Arc<dyn Repository> {
 }
 
 rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant: crate::fresh_tenant_repo);
+
+// Decorator transparency: the JSON/Array and regex faces ride the
+// decorator unchanged — the same suite the inner memory engine
+// pins, re-pinned through the wrapper.
+rushwind_testkit::rushwind_storage_json_suite!(crate::fresh_repo);
+rushwind_testkit::rushwind_storage_regex_suite!(crate::fresh_repo);
