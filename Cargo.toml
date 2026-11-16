@@ -227,6 +227,7 @@ sea-orm = { version = "2.0", default-features = false, features = [
     "sqlx-postgres",
     "sqlx-mysql",
     "macros",
+    "with-json",
 ] }
 
 # The apalis task-queue storage traits: the Postgres backend implements

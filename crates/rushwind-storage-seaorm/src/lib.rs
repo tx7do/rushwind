@@ -21,7 +21,7 @@
 
 use sea_orm::sea_query::{
     Alias, Condition, DeleteStatement, Expr, ExprTrait, InsertStatement, MysqlQueryBuilder,
-    PostgresQueryBuilder, Query, SelectStatement, SqliteQueryBuilder, TableCreateStatement,
+    PostgresQueryBuilder, Query, SelectStatement, SqliteQueryBuilder, Table, TableCreateStatement,
     UpdateStatement, Values,
 };
 use sea_orm::{
@@ -144,6 +144,21 @@ impl SeaRepo {
         Ok(())
     }
 
+    /// Drops the schema's table — the live-suite harness's drop-then-
+    /// create face, which makes the suite idempotent against a reused
+    /// local database (CI's fresh containers never need it).
+    pub async fn drop_table(&self) -> Result<(), StorageError> {
+        let drop = Table::drop()
+            .table(Alias::new(self.schema.table.as_str()))
+            .if_exists()
+            .to_owned();
+        self.db
+            .execute_raw(self.statement(&drop))
+            .await
+            .map_err(|e| self.map_err(e))?;
+        Ok(())
+    }
+
     // ---- shared plumbing ---------------------------------------------------
 
     fn backend(&self) -> DbBackend {
@@ -191,9 +206,11 @@ impl SeaRepo {
             match ctx.viewer.scope(Viewer::OWNER_COLUMN, Viewer::UNIT_COLUMN) {
                 Scope::Deny => ScopeSql::Deny,
                 Scope::Unrestricted => ScopeSql::Pass(None),
-                Scope::Scoped(filter) => {
-                    ScopeSql::Pass(Some(translate(filter.node(), self.backend())?))
-                }
+                Scope::Scoped(filter) => ScopeSql::Pass(Some(translate(
+                    filter.node(),
+                    self.backend(),
+                    &self.schema,
+                )?)),
             },
         )
     }
@@ -236,18 +253,24 @@ impl SeaRepo {
                     row.try_get_by::<Option<String>, _>(name.as_str())
                         .map_err(|e| self.map_err(e))?,
                 ),
-                // A JSON column stores its canonical text; the read
-                // face parses it back into the contract's kinds —
-                // arrays typed, objects as canonical documents,
-                // scalars native.
+                // A JSON column reads via the driver's JSON decode —
+                // PostgreSQL jsonb, MySQL JSON, and SQLite text all
+                // surface as serde_json values — then parses back
+                // into the contract's kinds (arrays typed, objects as
+                // canonical documents, scalars native).
                 ColumnKind::Json => {
-                    let text = row
-                        .try_get_by::<Option<String>, _>(name.as_str())
+                    let decoded = row
+                        .try_get_by::<Option<serde_json::Value>, _>(name.as_str())
                         .map_err(|e| self.map_err(e))?;
-                    match text.map(|text| json_to_value(&text)) {
-                        None => Value::Null,
-                        Some(Value::Null) => Value::Null,
-                        Some(value) => value,
+                    match decoded {
+                        None | Some(serde_json::Value::Null) => Value::Null,
+                        Some(serde_json::Value::Object(_)) => Value::Json(
+                            serde_json::to_string(&decoded.expect("matched")).unwrap_or_default(),
+                        ),
+                        Some(serde_json::Value::Array(items)) => {
+                            Value::Array(items.iter().map(json_element_to_value).collect())
+                        }
+                        Some(other) => json_element_to_value(&other),
                     }
                 }
             };
@@ -301,7 +324,7 @@ impl SeaRepo {
             any = true;
         }
         if let Some(filter) = &query.filter {
-            combined = combined.add(translate(filter.node(), self.backend())?);
+            combined = combined.add(translate(filter.node(), self.backend(), &self.schema)?);
             any = true;
         }
         Ok(if any { Some(combined) } else { None })
@@ -547,7 +570,7 @@ impl SeaRepo {
                 row.get(&column.name).cloned().unwrap_or(Value::Null)
             };
             columns.push(Alias::new(&column.name));
-            values.push(bind(&value));
+            values.push(bind_for_column(&value, column.kind));
         }
         let mut insert = Query::insert();
         insert
@@ -560,6 +583,26 @@ impl SeaRepo {
             conn.execute_raw(self.statement(&insert))
                 .await
                 .map_err(|e| self.map_err(e))?;
+            // PostgreSQL's IDENTITY sequence never observes explicit-id
+            // inserts — a later engine-generated insert starts at the
+            // sequence's untouched 1 and collides with the seeded ids
+            // (SQLite's rowid takes max+1 and MySQL's AUTO_INCREMENT
+            // re-arms itself; only PostgreSQL needs the nudge). Advance
+            // the sequence past the explicit id.
+            if self.backend() == DbBackend::Postgres {
+                let advance = format!(
+                    "SELECT setval(pg_get_serial_sequence('{table}', '{pk}'), GREATEST((SELECT COALESCE(MAX({pk}), 0) FROM {table}), {explicit_id}))",
+                    table = self.schema.table,
+                    pk = pk,
+                    explicit_id = explicit_id,
+                );
+                conn.execute_raw(sea_orm::Statement::from_string(
+                    self.db.get_database_backend(),
+                    advance,
+                ))
+                .await
+                .map_err(|e| self.map_err(e))?;
+            }
             return Ok(explicit_id);
         }
         let backend = self.backend();
@@ -682,7 +725,10 @@ impl SeaRepo {
                 } else {
                     value.clone()
                 };
-                update.value(Alias::new(&column.name), bind(&bound));
+                update.value(
+                    Alias::new(&column.name),
+                    bind_for_column(&bound, column.kind),
+                );
                 touched += 1;
             }
         }
@@ -752,7 +798,10 @@ impl SeaRepo {
                         continue; // the primary key addresses the row, never moves
                     }
                     if let Some(value) = row.get(&column.name) {
-                        update.value(Alias::new(&column.name), bind(value));
+                        update.value(
+                            Alias::new(&column.name),
+                            bind_for_column(value, column.kind),
+                        );
                         touched += 1;
                     }
                 }
@@ -878,24 +927,8 @@ mod sql_snapshots;
 mod statements;
 mod tree;
 
-use condition::{bind, expect_id, translate, ScopeSql, TenantSql};
+use condition::{bind_for_column, expect_id, translate, ScopeSql, TenantSql};
 use statements::{create_table_statement, list_select};
-
-/// Parses one stored JSON document back into the contract's kinds:
-/// arrays typed element-wise, objects as canonical `Value::Json`
-/// text, scalars native (numbers integral when whole). Malformed
-/// stored text degrades to a JSON text value — never a panic.
-fn json_to_value(text: &str) -> Value {
-    let parsed: Option<serde_json::Value> = serde_json::from_str(text).ok();
-    match parsed {
-        None => Value::Json(text.to_owned()),
-        Some(serde_json::Value::Object(_)) => Value::Json(text.to_owned()),
-        Some(serde_json::Value::Array(items)) => {
-            Value::Array(items.iter().map(json_element_to_value).collect())
-        }
-        Some(other) => json_element_to_value(&other),
-    }
-}
 
 /// One JSON element inside a stored document.
 fn json_element_to_value(value: &serde_json::Value) -> Value {

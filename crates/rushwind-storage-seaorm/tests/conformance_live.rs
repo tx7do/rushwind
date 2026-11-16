@@ -22,6 +22,11 @@ async fn fresh_repo() -> Arc<dyn Repository> {
     let repo = SeaRepo::connect(url, schema)
         .await
         .expect("connects to the live database");
+    // Drop-then-create: the suite assumes an empty table (CI spins a
+    // fresh container), and a reused local database carries the
+    // previous run's rows under the same SEQ-derived names — the
+    // drop makes the suite idempotent across runs.
+    repo.drop_table().await.expect("drops any stale table");
     repo.migrate_create()
         .await
         .expect("creates the suite table");
@@ -39,6 +44,8 @@ async fn fresh_tenant_repo() -> Arc<dyn Repository> {
     let repo = SeaRepo::connect(url, schema)
         .await
         .expect("connects to the live database");
+    // The drop-then-create idempotence, for the tenant twin.
+    repo.drop_table().await.expect("drops any stale table");
     repo.migrate_create()
         .await
         .expect("creates the tenant suite table");
@@ -46,3 +53,10 @@ async fn fresh_tenant_repo() -> Arc<dyn Repository> {
 }
 
 rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant: crate::fresh_tenant_repo);
+
+// The JSON/Array and regex faces against the real dialects — the SQL
+// the snapshot pins and the live servers render are the same strings,
+// but the servers' JSON machinery (jsonb containment, json_each,
+// REGEXP_LIKE) is what actually evaluates them.
+rushwind_testkit::rushwind_storage_json_suite!(crate::fresh_repo);
+rushwind_testkit::rushwind_storage_regex_suite!(crate::fresh_repo);

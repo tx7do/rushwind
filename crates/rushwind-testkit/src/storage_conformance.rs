@@ -1613,7 +1613,7 @@ macro_rules! rushwind_storage_regex_suite {
                     Op::Regexp,
                     [Value::Text("^z".into())],
                 ));
-                assert_eq!(ids_of(&repo, &miss).await, vec![]);
+                assert_eq!(ids_of(&repo, &miss).await, Vec::<i64>::new());
             }
 
             #[tokio::test]

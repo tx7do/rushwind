@@ -6,7 +6,7 @@ use sea_orm::sea_query::{Alias, Condition, Expr, ExprTrait, Func};
 use sea_orm::DbBackend;
 
 use rushwind_storage::{
-    FilterNode, Op, QueryCtx, Record, StorageError, TenancyDecision, Value, Viewer,
+    ColumnKind, FilterNode, Op, QueryCtx, Record, StorageError, TenancyDecision, Value, Viewer,
 };
 
 use crate::Schema;
@@ -95,30 +95,55 @@ pub(crate) fn bind(value: &Value) -> Expr {
         Value::Int(i) => Expr::val(*i),
         Value::Real(f) => Expr::val(*f),
         Value::Text(s) => Expr::val(s.clone()),
-        Value::Array(items) => {
-            Expr::val(rushwind_storage::json::encode(&Value::Array(items.clone())))
-        }
-        Value::Json(text) => Expr::val(text.clone()),
+        // The JSON kinds bind as sea_query's typed JSON parameter —
+        // the driver binds it per dialect (PostgreSQL jsonb, MySQL
+        // JSON, SQLite text). A text bind on PostgreSQL's JSONB
+        // column is a type error the live suite caught.
+        Value::Array(items) => Expr::val(sea_json(&Value::Array(items.clone()))),
+        Value::Json(text) => Expr::val(sea_json(&Value::Json(text.clone()))),
     }
+}
+
+/// Binds a value for one column: a NULL rides the column's declared
+/// kind (PostgreSQL types its NULLs — an untyped bigint NULL into a
+/// jsonb column is a type error the live suite caught).
+pub(crate) fn bind_for_column(value: &Value, kind: ColumnKind) -> Expr {
+    match (value, kind) {
+        (Value::Null, ColumnKind::Json) => Expr::val(sea_orm::sea_query::Value::Json(None)),
+        _ => bind(value),
+    }
+}
+
+/// One contract JSON-carrying value out to sea_query's typed JSON
+/// parameter.
+fn sea_json(value: &Value) -> sea_orm::sea_query::Value {
+    let encoded = rushwind_storage::json::encode(value);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&encoded).unwrap_or(serde_json::Value::String(encoded));
+    sea_orm::sea_query::Value::Json(Some(Box::new(parsed)))
 }
 
 /// Translates a filter node into a SQL condition — the counterpart of the
 /// in-memory engine's evaluator; the conformance suite pins them together.
 /// The backend shapes the JSON operators (each dialect speaks its own
 /// JSON face; the rest of the tree renders identically everywhere).
-pub(crate) fn translate(node: &FilterNode, backend: DbBackend) -> Result<Condition, StorageError> {
+pub(crate) fn translate(
+    node: &FilterNode,
+    backend: DbBackend,
+    schema: &Schema,
+) -> Result<Condition, StorageError> {
     match node {
         FilterNode::All(children) => {
             let mut cond = Condition::all();
             for child in children {
-                cond = cond.add(translate(child, backend)?);
+                cond = cond.add(translate(child, backend, schema)?);
             }
             Ok(cond)
         }
         FilterNode::Any(children) => {
             let mut cond = Condition::any();
             for child in children {
-                cond = cond.add(translate(child, backend)?);
+                cond = cond.add(translate(child, backend, schema)?);
             }
             Ok(cond)
         }
@@ -135,6 +160,7 @@ pub(crate) fn translate(node: &FilterNode, backend: DbBackend) -> Result<Conditi
             if let Some(path) = &cond.json_path {
                 return Ok(json_path_condition(cond, path, backend));
             }
+            let _ = schema;
             let col = Expr::col(Alias::new(&cond.field));
             let first = || cond.values.first().cloned().unwrap_or(Value::Null);
             let pattern = |fmt: fn(&str) -> String| match first().as_str() {
@@ -142,6 +168,35 @@ pub(crate) fn translate(node: &FilterNode, backend: DbBackend) -> Result<Conditi
                 None => String::new(),
             };
             let expr: Expr = match cond.op {
+                // MySQL compares a JSON column with a string parameter
+                // as STRINGS — and its serialization carries spaces the
+                // canonical text does not, so equality would never
+                // match. The CAST forces JSON-vs-JSON deep comparison.
+                Op::Eq
+                    if backend == DbBackend::MySql
+                        && is_json_column(schema, &cond.field)
+                        && matches!(first(), Value::Array(_) | Value::Json(_)) =>
+                {
+                    Expr::cust_with_values(
+                        format!("`{}` = CAST(? AS JSON)", cond.field),
+                        [sea_value(&first())],
+                    )
+                    .into()
+                }
+                Op::NotEq
+                    if backend == DbBackend::MySql
+                        && is_json_column(schema, &cond.field)
+                        && matches!(first(), Value::Array(_) | Value::Json(_)) =>
+                {
+                    Expr::cust_with_values(
+                        format!(
+                            "(`{}` <> CAST(? AS JSON) OR `{}` IS NULL)",
+                            cond.field, cond.field
+                        ),
+                        [sea_value(&first())],
+                    )
+                    .into()
+                }
                 Op::Eq => col.eq(bind(&first())),
                 Op::NotEq => col.ne(bind(&first())),
                 Op::Gt => col.gt(bind(&first())),
@@ -418,7 +473,7 @@ fn sea_value(value: &Value) -> sea_orm::sea_query::Value {
         Value::Int(i) => (*i).into(),
         Value::Real(f) => (*f).into(),
         Value::Text(s) => s.clone().into(),
-        Value::Array(_) | Value::Json(_) => unreachable!("scalar bind"),
+        Value::Array(_) | Value::Json(_) => sea_json(value),
     }
 }
 
@@ -487,11 +542,11 @@ fn json_path_condition(
             };
             match cond.op {
                 Op::Eq => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) = CAST($1 AS jsonb)"),
+                    format!("({chain}) = to_jsonb($1)"),
                     [sea_value(&operand())],
                 )),
                 Op::NotEq => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) <> CAST($1 AS jsonb) OR ({chain}) IS NULL"),
+                    format!("({chain}) <> to_jsonb($1) OR ({chain}) IS NULL"),
                     [sea_value(&operand())],
                 )),
                 Op::In => Condition::all().add(Expr::cust_with_values(
@@ -509,28 +564,26 @@ fn json_path_condition(
                     cond.values.iter().map(sea_value).collect::<Vec<_>>(),
                 )),
                 Op::Gt => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) > CAST($1 AS jsonb)"),
+                    format!("({chain}) > to_jsonb($1)"),
                     [sea_value(&operand())],
                 )),
                 Op::Gte => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) >= CAST($1 AS jsonb)"),
+                    format!("({chain}) >= to_jsonb($1)"),
                     [sea_value(&operand())],
                 )),
                 Op::Lt => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) < CAST($1 AS jsonb)"),
+                    format!("({chain}) < to_jsonb($1)"),
                     [sea_value(&operand())],
                 )),
                 Op::Lte => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) <= CAST($1 AS jsonb)"),
+                    format!("({chain}) <= to_jsonb($1)"),
                     [sea_value(&operand())],
                 )),
                 Op::Between => {
                     let lo = cond.values.first().cloned().unwrap_or(Value::Null);
                     let hi = cond.values.get(1).cloned().unwrap_or(Value::Null);
                     Condition::all().add(Expr::cust_with_values(
-                        format!(
-                            "({chain}) >= CAST($1 AS jsonb) AND ({chain}) <= CAST($2 AS jsonb)"
-                        ),
+                        format!("({chain}) >= to_jsonb($1) AND ({chain}) <= to_jsonb($2)"),
                         [sea_value(&lo), sea_value(&hi)],
                     ))
                 }
@@ -538,7 +591,7 @@ fn json_path_condition(
                     let lo = cond.values.first().cloned().unwrap_or(Value::Null);
                     let hi = cond.values.get(1).cloned().unwrap_or(Value::Null);
                     Condition::all().add(Expr::cust_with_values(
-                        format!("({chain}) < CAST($1 AS jsonb) OR ({chain}) > CAST($2 AS jsonb)"),
+                        format!("({chain}) < to_jsonb($1) OR ({chain}) > to_jsonb($2)"),
                         [sea_value(&lo), sea_value(&hi)],
                     ))
                 }
@@ -580,7 +633,11 @@ fn json_path_condition(
         }
         DbBackend::MySql => {
             let path_literal = sqlite_path(path);
-            let expression = format!("JSON_UNQUOTE(JSON_EXTRACT(\"{column}\", '{path_literal}'))");
+            // Backticks: MySQL's default mode reads "meta" as a string
+            // literal, and json_extract's document argument would be
+            // the six characters m-e-t-a — the Invalid JSON the live
+            // suite caught.
+            let expression = format!("JSON_UNQUOTE(JSON_EXTRACT(`{column}`, '{path_literal}'))");
             let col = Expr::cust(expression.clone());
             let first = || cond.values.first().cloned().unwrap_or(Value::Null);
             let pattern = |fmt: fn(&str) -> String| match cond.values.first() {
@@ -665,6 +722,13 @@ fn json_path_condition(
             .into()
         }
     }
+}
+
+/// Whether the field names a JSON column (the MySQL equality cast's
+/// gate; unknown fields keep the plain bind — validate rejects them
+/// before translate runs).
+fn is_json_column(schema: &Schema, field: &str) -> bool {
+    schema.column(field).map(|c| c.kind) == Some(ColumnKind::Json)
 }
 
 /// PostgreSQL's numbered placeholders (`$1`…`$n`) — the cust SQL

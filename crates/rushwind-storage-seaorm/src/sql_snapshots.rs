@@ -82,7 +82,7 @@ fn filter_placeholders_per_dialect() {
     let select = list_select(
         &schema(),
         &["id".into(), "name".into()],
-        Some(&translate(filter.node(), DbBackend::Sqlite).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::Sqlite, &schema()).expect("translates")),
         &ListQuery::page(2, 10),
         DbBackend::Sqlite,
     )
@@ -117,7 +117,7 @@ fn ilike_lowers_the_column() {
     let select = list_select(
         &schema(),
         &["id".into()],
-        Some(&translate(filter.node(), DbBackend::Sqlite).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::Sqlite, &schema()).expect("translates")),
         &ListQuery::default(),
         DbBackend::Sqlite,
     )
@@ -171,7 +171,7 @@ fn in_and_between_bind_every_operand() {
     let select = list_select(
         &schema(),
         &["id".into()],
-        Some(&translate(filter.node(), DbBackend::Sqlite).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::Sqlite, &schema()).expect("translates")),
         &ListQuery::default(),
         DbBackend::Sqlite,
     )
@@ -266,7 +266,7 @@ fn regexp_renders_per_dialect() {
     let select = list_select(
         &schema(),
         &["id".into()],
-        Some(&translate(filter.node(), DbBackend::MySql).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::MySql, &schema()).expect("translates")),
         &ListQuery::default(),
         DbBackend::MySql,
     )
@@ -277,7 +277,7 @@ fn regexp_renders_per_dialect() {
     let select = list_select(
         &schema(),
         &["id".into()],
-        Some(&translate(filter.node(), DbBackend::Postgres).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::Postgres, &schema()).expect("translates")),
         &ListQuery::default(),
         DbBackend::Postgres,
     )
@@ -286,7 +286,7 @@ fn regexp_renders_per_dialect() {
     assert!(postgres.contains("\"name\" ~ $1"), "{postgres}");
 
     // SQLite ships no regexp function — the face refuses.
-    let refused = translate(filter.node(), DbBackend::Sqlite);
+    let refused = translate(filter.node(), DbBackend::Sqlite, &schema());
     assert!(
         matches!(refused, Err(StorageError::Unsupported(_))),
         "the SQLite face refuses: {refused:?}"
@@ -299,7 +299,7 @@ fn iregexp_renders_the_folding_dialects() {
     let select = list_select(
         &schema(),
         &["id".into()],
-        Some(&translate(filter.node(), DbBackend::MySql).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::MySql, &schema()).expect("translates")),
         &ListQuery::default(),
         DbBackend::MySql,
     )
@@ -309,7 +309,7 @@ fn iregexp_renders_the_folding_dialects() {
     let select = list_select(
         &schema(),
         &["id".into()],
-        Some(&translate(filter.node(), DbBackend::Postgres).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::Postgres, &schema()).expect("translates")),
         &ListQuery::default(),
         DbBackend::Postgres,
     )
@@ -324,7 +324,7 @@ fn iexact_lowers_the_column() {
     let select = list_select(
         &schema(),
         &["id".into()],
-        Some(&translate(filter.node(), DbBackend::Sqlite).expect("translates")),
+        Some(&translate(filter.node(), DbBackend::Sqlite, &schema()).expect("translates")),
         &ListQuery::default(),
         DbBackend::Sqlite,
     )
