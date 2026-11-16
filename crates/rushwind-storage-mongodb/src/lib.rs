@@ -266,6 +266,15 @@ impl MongoRepo {
                     value.type_name()
                 )));
             }
+            // A Json column's document must parse — the write face
+            // would otherwise store a silently-empty BSON document,
+            // which every equality query on `{field: {}}` would then
+            // match.
+            if column.kind == rushwind_storage::ColumnKind::Json {
+                if let Value::Json(text) = value {
+                    translate::bson_of_json(text)?;
+                }
+            }
         }
         Ok(())
     }

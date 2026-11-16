@@ -21,8 +21,9 @@ use mongodb::bson::{doc, Bson, Document, Regex};
 use rushwind_storage::{Condition, FilterNode, Op, Schema, Sort, SortDir, StorageError, Value};
 
 /// Converts a contract value into BSON. Arrays encode element-wise;
-/// JSON documents ride their canonical text through the extended-JSON
-/// reader (the wire shape MongoDB stores natively).
+/// JSON documents parse strictly (see [`bson_of_json`]) — the write
+/// face: validate_row has already refused unparseable documents, so
+/// the fallback never fires for honest payloads.
 pub(crate) fn value_to_bson(value: &Value) -> Bson {
     match value {
         Value::Null => Bson::Null,
@@ -31,9 +32,46 @@ pub(crate) fn value_to_bson(value: &Value) -> Bson {
         Value::Real(f) => Bson::Double(*f),
         Value::Text(s) => Bson::String(s.clone()),
         Value::Array(items) => Bson::Array(items.iter().map(value_to_bson).collect()),
-        Value::Json(text) => Bson::Document(
-            Document::from_reader(text.as_bytes()).unwrap_or_else(|_| Document::new()),
-        ),
+        Value::Json(text) => bson_of_json(text).unwrap_or(Bson::Null),
+    }
+}
+
+/// Parses a JSON document strictly and converts it to BSON — the
+/// query operands' face, where a failed parse must refuse (MongoDB
+/// reads an empty document as "matches every embedded document", the
+/// silent narrowing the live suite caught). Top-level arrays and
+/// scalars ride their own BSON kinds.
+pub(crate) fn bson_of_json(text: &str) -> Result<Bson, StorageError> {
+    let parsed = rushwind_storage::json::parse(text).ok_or_else(|| {
+        StorageError::InvalidQuery(format!("the JSON document is not valid JSON: {text:?}"))
+    })?;
+    Ok(json_model_to_bson(&parsed))
+}
+
+/// One parsed JSON model value out to BSON (objects keep their field
+/// order; whole-number reals ride as Int64 — the contract's number
+/// model).
+fn json_model_to_bson(model: &rushwind_storage::json::Json) -> Bson {
+    use rushwind_storage::json::Json;
+    match model {
+        Json::Null => Bson::Null,
+        Json::Bool(b) => Bson::Boolean(*b),
+        Json::Num(n) => {
+            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                Bson::Int64(*n as i64)
+            } else {
+                Bson::Double(*n)
+            }
+        }
+        Json::Str(s) => Bson::String(s.clone()),
+        Json::Arr(items) => Bson::Array(items.iter().map(json_model_to_bson).collect()),
+        Json::Obj(entries) => {
+            let mut document = Document::new();
+            for (key, value) in entries {
+                document.insert(key.clone(), json_model_to_bson(value));
+            }
+            Bson::Document(document)
+        }
     }
 }
 
@@ -182,7 +220,26 @@ pub(crate) fn condition_to_doc(condition: &Condition) -> Result<Document, Storag
                 field: { "$nin": condition.values.iter().map(value_to_bson).collect::<Vec<_>>() }
             }
         }
+        // The point-path face's null is "the path does not resolve" —
+        // MongoDB's `{path: null}` skips rows whose path traverses an
+        // array (the element-wise semantics never see the missing
+        // key), so the face spells the two disjuncts: absent path, or
+        // a present-but-null value (the live suite caught it).
+        Op::IsNull if condition.json_path.is_some() => doc! {
+            "$or": [
+                { field: { "$exists": false } },
+                { field: Bson::Null },
+            ]
+        },
         Op::IsNull => doc! { field: Bson::Null },
+        // The point-path face's $ne null needs $exists alongside it:
+        // MongoDB's null matching is element-wise over arrays — a
+        // `meta.tags ≠ null` alone matches rows whose meta is an
+        // array of scalars (the live suite caught it); exists pins
+        // the path's presence, ne-null pins the non-null value.
+        Op::IsNotNull if condition.json_path.is_some() => doc! {
+            field: { "$exists": true, "$ne": Bson::Null }
+        },
         Op::IsNotNull => doc! { field: { "$ne": Bson::Null } },
         Op::Between => doc! { field: {
             "$gte": value_to_bson(&first()),
@@ -230,9 +287,16 @@ pub(crate) fn condition_to_doc(condition: &Condition) -> Result<Document, Storag
         // matches exact equality or array membership. The object
         // key-subset containment MySQL's JSON_CONTAINS carries has no
         // MongoDB query face (aggregation-only) — the crate docs
-        // declare the delta.
-        Op::ArrayContains => doc! { field: value_to_bson(&first()) },
-        Op::JsonContains => doc! { field: value_to_bson(&first()) },
+        // declare the delta. The JSON operands parse strictly — a
+        // failed parse refuses (an empty document would match every
+        // embedded document, the silent narrowing the live suite
+        // caught).
+        Op::ArrayContains => doc! {
+            field: bson_of_json(&rushwind_storage::json::encode(&first()))?
+        },
+        Op::JsonContains => doc! {
+            field: bson_of_json(&rushwind_storage::json::encode(&first()))?
+        },
         // The regex family rides PCRE verbatim — the contract's
         // documented subset renders identically there (the anchors
         // and classes included); IREGEXP flips mongo's own
