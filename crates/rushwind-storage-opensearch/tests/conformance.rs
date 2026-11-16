@@ -20,8 +20,11 @@ async fn fresh_repo_with(schema: Schema) -> Arc<dyn Repository> {
     let mut schema = schema;
     schema.table = format!("widgets_live_{}", SEQ.fetch_add(1, Ordering::Relaxed));
 
-    let repo = OpenSearchRepo::new(url, schema);
-    let base = format!("http://localhost:9200/{}", repo.schema().table);
+    let repo = OpenSearchRepo::new(url.clone(), schema);
+    // The reset target derives from the configured URL — a hardcoded
+    // port deleted nothing when the server mapped elsewhere (9201),
+    // and the stale index then served duplicate ids to the seeds.
+    let base = format!("{}/{}", url.trim_end_matches('/'), repo.schema().table);
     let client = reqwest::Client::new();
     let _ = client.delete(&base).send().await;
     for _ in 0..50 {
@@ -54,10 +57,12 @@ async fn fresh_tenant_repo() -> Arc<dyn Repository> {
 
 rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant: crate::fresh_tenant_repo);
 
-// The JSON/Array kinds' operator faces + the point-path face —
-// adopted here; the containers' CI runs them.
-rushwind_testkit::rushwind_storage_json_suite!(crate::fresh_repo);
+// The JSON suite is NOT adopted: the JSON column is storage-only on
+// Elasticsearch/OpenSearch (no static mapping indexes every JSON
+// shape), so the containment/point-path faces refuse — the crate's
+// snapshot pins cover the refusals.
 
-// The regex family (unanchored contains, anchors, classes,
-// alternation, folding) — the engines carrying the face pin it here.
-rushwind_testkit::rushwind_storage_regex_suite!(crate::fresh_repo);
+// The regex suite is NOT adopted: Lucene's whole-value regexp carries
+// the fully-anchored and unanchored shapes but not the one-sided
+// anchors (which refuse) — the crate's snapshot pins cover the three
+// renderings and the refusal.

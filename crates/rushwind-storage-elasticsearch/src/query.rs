@@ -54,22 +54,15 @@ pub(crate) fn condition_json(
     condition: &Condition,
     mapped: FieldMapper,
 ) -> Result<Json, rushwind_storage::StorageError> {
-    // The point-path face: key steps join the field's dotted path
-    // (Elasticsearch walks objects natively); numeric steps have no
-    // face — arrays are implicit in ES, there is no positional
-    // indexing to translate — so they refuse rather than silently
-    // matching every element.
-    let field = match &condition.json_path {
-        Some(path) => {
-            if path.split('.').any(|step| step.parse::<usize>().is_ok()) {
-                return Err(rushwind_storage::StorageError::Unsupported(
-                    "json_path array indexes have no Elasticsearch face".into(),
-                ));
-            }
-            mapped(&format!("{}.{}", condition.field, path))
-        }
-        None => mapped(&condition.field),
-    };
+    // The point-path face refuses wholesale: the JSON column is
+    // storage-only (no index for any shape), and every extracted
+    // query would silently match nothing.
+    if condition.json_path.is_some() {
+        return Err(rushwind_storage::StorageError::Unsupported(
+            "json_path has no Elasticsearch face — the JSON column is storage-only".into(),
+        ));
+    }
+    let field = mapped(&condition.field);
     let field_borrow = field.as_str();
     let first = || condition.values.first().cloned().unwrap_or(Value::Null);
     let scalar = |value: &Value| match value {
@@ -78,9 +71,10 @@ pub(crate) fn condition_json(
         Value::Int(i) => json!(i),
         Value::Real(f) => json!(f),
         Value::Text(s) => json!(s),
-        // JSON kinds ride the wire shape: arrays as JSON arrays (a
-        // term query matches any element — Elasticsearch's native
-        // containment face), documents as parsed objects.
+        // JSON-carrying operands render their wire shape: the tree
+        // gate in the engine refuses the query before it rides (the
+        // JSON column is storage-only, so an index query would
+        // silently match nothing).
         Value::Array(items) => {
             json!(items.iter().map(json_value).collect::<Vec<Json>>())
         }
@@ -150,14 +144,16 @@ pub(crate) fn condition_json(
             let text = pattern_operand(condition)?;
             wildcard_clause(field_borrow.to_owned(), &format!("%{text}"), false)
         }
-        // Elasticsearch's term face IS the array containment face: a
-        // term matches any element of an array field. ARRAY_CONTAINS
-        // rides it directly; JSON_CONTAINS rides equality — the term
-        // on the scalar/document/element. The object key-subset
-        // containment has no Elasticsearch query face without nested
-        // mappings — the crate docs declare the delta.
-        Op::ArrayContains => json!({ "term": { field_borrow: scalar(&first()) } }),
-        Op::JsonContains => term(),
+        // The JSON containment pair refuse: a JSON column legally
+        // holds every JSON shape, Elasticsearch has no static mapping
+        // that indexes all of them, and the storage-only mapping the
+        // engine declares leaves no index for the term face to ride —
+        // a pushed-down query would silently match nothing.
+        Op::ArrayContains | Op::JsonContains => {
+            return Err(rushwind_storage::StorageError::Unsupported(
+                "JSON_CONTAINS/ARRAY_CONTAINS have no Elasticsearch face — the JSON column is storage-only".into(),
+            ))
+        }
         // The regex family: Lucene's regexp matches the WHOLE term, so
         // the contract's unanchored semantics render as a per-top-
         // level-alternative `.*alt.*` wrapper. The anchors have no
@@ -176,17 +172,17 @@ pub(crate) fn condition_json(
                     error.position, error.message
                 ))
             })?;
-            if has_anchor(&ast) {
-                return Err(rushwind_storage::StorageError::Unsupported(
-                    "the ^ and $ anchors have no Elasticsearch regexp face".into(),
-                ));
-            }
-            let wrapped: Vec<String> = ast
+            // Lucene's whole-value match IS the contract's fully-
+            // anchored semantics: a `^…$` branch rides verbatim with
+            // the anchors stripped, an unanchored branch wraps in
+            // `.*….*`, and a one-sided or mid-pattern anchor (position
+            // semantics Lucene cannot carry) refuses by name.
+            let branches = ast
                 .top_level_alternatives()
-                .iter()
-                .map(|alternative| format!(".*{}.*", render_verbatim(alternative)))
-                .collect();
-            let lucene = wrapped.join("|");
+                .into_iter()
+                .map(render_alternative)
+                .collect::<Result<Vec<_>, rushwind_storage::StorageError>>()?;
+            let lucene = branches.join("|");
             json!({
                 "regexp": { field_borrow: {
                     "value": lucene,
@@ -195,6 +191,39 @@ pub(crate) fn condition_json(
             })
         }
     })
+}
+
+/// Renders one top-level alternative into its Lucene fragment: a
+/// fully-anchored branch (`^…$`) rides verbatim — the whole-value
+/// match carries both anchors — an unanchored branch wraps in `.*….*`,
+/// and anything else (one-sided anchors, mid-pattern anchors) refuses:
+/// Lucene's whole-value match cannot carry partial position semantics.
+fn render_alternative(
+    ast: &rushwind_storage::regex::Ast,
+) -> Result<String, rushwind_storage::StorageError> {
+    use rushwind_storage::regex::Ast;
+    if let Ast::Concat(nodes) = ast {
+        let (Some(first), Some(last)) = (nodes.first(), nodes.last()) else {
+            return Ok(String::new());
+        };
+        if matches!(first, Ast::Start) && matches!(last, Ast::End) && nodes.len() >= 2 {
+            // The interior must be anchor-free (an anchor past the
+            // ends has no Lucene face).
+            let interior = Ast::Concat(nodes[1..nodes.len() - 1].to_vec());
+            if has_anchor(&interior) {
+                return Err(rushwind_storage::StorageError::Unsupported(
+                    "mid-pattern ^/$ anchors have no Elasticsearch regexp face".into(),
+                ));
+            }
+            return Ok(render_verbatim(&interior));
+        }
+    }
+    if has_anchor(ast) {
+        return Err(rushwind_storage::StorageError::Unsupported(
+            "one-sided ^/$ anchors have no Elasticsearch regexp face — spell both anchors".into(),
+        ));
+    }
+    Ok(format!(".*{}.*", render_verbatim(ast)))
 }
 
 /// Whether any node in the tree is an anchor.
@@ -464,6 +493,54 @@ mod tests {
                 "size": 10,
                 "_source": ["id", "name"],
             })
+        );
+    }
+
+    #[test]
+    fn regexp_renders_the_three_lucene_shapes() {
+        let mapped = |column: &str| column.to_string();
+        // Fully anchored: the anchors strip, the whole-value match
+        // carries them.
+        let condition = rushwind_storage::Condition::new(
+            "name",
+            Op::Regexp,
+            [Value::Text("^(alpha|delta)$".into())],
+        );
+        let rendered = serde_json::to_value(condition_json(&condition, &mapped).expect("renders"))
+            .expect("json");
+        assert_eq!(
+            rendered["regexp"]["name"]["value"],
+            json!("alpha|delta"),
+            "{rendered:?}"
+        );
+        assert_eq!(rendered["regexp"]["name"]["case_insensitive"], json!(false));
+
+        // Unanchored: the .* wrapper carries the contains semantics.
+        let condition =
+            rushwind_storage::Condition::new("name", Op::Regexp, [Value::Text("ta".into())]);
+        let rendered = serde_json::to_value(condition_json(&condition, &mapped).expect("renders"))
+            .expect("json");
+        assert_eq!(rendered["regexp"]["name"]["value"], json!(".*ta.*"));
+
+        // The folding face rides the case_insensitive flag.
+        let condition = rushwind_storage::Condition::new(
+            "name",
+            Op::Iregexp,
+            [Value::Text("^[a-c]ard$".into())],
+        );
+        let rendered = serde_json::to_value(condition_json(&condition, &mapped).expect("renders"))
+            .expect("json");
+        assert_eq!(rendered["regexp"]["name"]["value"], json!("[a-c]ard"));
+        assert_eq!(rendered["regexp"]["name"]["case_insensitive"], json!(true));
+
+        // One-sided anchors refuse: Lucene's whole-value match cannot
+        // carry partial position semantics.
+        let condition =
+            rushwind_storage::Condition::new("name", Op::Regexp, [Value::Text("^[a-c]".into())]);
+        let err = condition_json(&condition, &mapped).expect_err("refuses");
+        assert!(
+            matches!(err, rushwind_storage::StorageError::Unsupported(ref m) if m.contains("one-sided")),
+            "{err:?}"
         );
     }
 }

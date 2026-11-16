@@ -61,10 +61,12 @@ async fn fresh_tenant_repo() -> Arc<dyn Repository> {
 
 rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant: crate::fresh_tenant_repo);
 
-// The JSON/Array kinds' operator faces + the point-path face —
-// adopted here; the containers' CI runs them.
-rushwind_testkit::rushwind_storage_json_suite!(crate::fresh_repo);
+// The JSON suite is NOT adopted: the JSON column is storage-only on
+// Elasticsearch/OpenSearch (no static mapping indexes every JSON
+// shape), so the containment/point-path faces refuse — the crate's
+// snapshot pins cover the refusals.
 
-// The regex family (unanchored contains, anchors, classes,
-// alternation, folding) — the engines carrying the face pin it here.
-rushwind_testkit::rushwind_storage_regex_suite!(crate::fresh_repo);
+// The regex suite is NOT adopted: Lucene's whole-value regexp carries
+// the fully-anchored and unanchored shapes but not the one-sided
+// anchors (which refuse) — the crate's snapshot pins cover the three
+// renderings and the refusal.

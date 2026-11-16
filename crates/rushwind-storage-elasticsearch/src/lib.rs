@@ -28,7 +28,23 @@
 //!   reports per-item outcomes, and the adapter fails the batch if any
 //!   item errored. The bulk items already use the `create` op, so a
 //!   duplicate id lands as an item error, not a silent overwrite.
-
+//!
+//! # The JSON column's storage-only face
+//!
+//! A JSON column legally holds every JSON shape — arrays, documents,
+//! scalars, NULL — and Elasticsearch has no static mapping that
+//! indexes all of them (object mappings reject scalar arrays; dynamic
+//! inference fights the mixed shapes). The declared mapping is
+//! storage-only (`object`, `enabled: false`): reads and writes
+//! round-trip through `_source` untouched, while the JSON query faces
+//! (JSON_CONTAINS, ARRAY_CONTAINS, json_path, JSON-carrying operands)
+//! refuse as `Unsupported` rather than silently matching nothing —
+//! the live OpenSearch suite verified the round trip and the
+//! refusals. The regex family rides Lucene's whole-value regexp
+//! semantics: fully-anchored branches strip their anchors (the
+//! whole-value match carries both), unanchored branches wrap in
+//! `.*….*`, one-sided and mid-pattern anchors refuse.
+//!
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -37,8 +53,9 @@ pub mod query;
 use serde_json::{json, Value as Json};
 
 use rushwind_storage::{
-    AuditAction, AuditEntry, ColumnKind, FieldMask, FilterExpr, ListQuery, Page, Paging, QueryCtx,
-    Record, RepoFuture, Repository, Schema, Scope, StorageError, TenancyDecision, Value, Viewer,
+    AuditAction, AuditEntry, ColumnKind, FieldMask, FilterExpr, FilterNode, ListQuery, Page,
+    Paging, QueryCtx, Record, RepoFuture, Repository, Schema, Scope, StorageError, TenancyDecision,
+    Value, Viewer,
 };
 
 /// A [`Repository`] backed by an Elasticsearch (or OpenSearch) REST
@@ -127,11 +144,15 @@ impl ElasticRepo {
                 ColumnKind::Bool => json!({ "type": "boolean" }),
                 ColumnKind::Int => json!({ "type": "long" }),
                 ColumnKind::Real => json!({ "type": "double" }),
-                // JSON columns stay dynamically mapped: term queries
-                // against their arrays/scalars work off the inferred
-                // types, and a static object mapping would fight the
-                // document shapes the column legally holds.
-                ColumnKind::Json => json!({ "type": "object", "enabled": true }),
+                // A JSON column legally holds every JSON shape —
+                // arrays, documents, scalars, NULL — and Elasticsearch
+                // has no static mapping that indexes all of them
+                // (object mappings reject scalar arrays; dynamic
+                // inference fights the mixed shapes). The mapping is
+                // storage-only: reads and writes round-trip through
+                // _source untouched, and the JSON query faces refuse
+                // rather than pretend an index exists.
+                ColumnKind::Json => json!({ "type": "object", "enabled": false }),
                 ColumnKind::Text => json!({
                     "type": "text",
                     "fields": { "keyword": { "type": "keyword" } }
@@ -203,8 +224,27 @@ impl ElasticRepo {
                         },
                         Some(Json::String(text)) => match column.kind {
                             ColumnKind::Text => Value::Text(text.clone()),
+                            // A Json column's scalars read back native.
+                            ColumnKind::Json => Value::Text(text.clone()),
                             _ => Value::Bool(text != "false"),
                         },
+                        // A Json column's composites read back typed —
+                        // arrays typed element-wise, objects as their
+                        // canonical text (the storage-only mapping keeps
+                        // _source verbatim, so the round trip holds).
+                        Some(composite @ Json::Array(_)) if column.kind == ColumnKind::Json => {
+                            Value::Array(
+                                composite
+                                    .as_array()
+                                    .expect("matched")
+                                    .iter()
+                                    .map(json_element_to_value)
+                                    .collect(),
+                            )
+                        }
+                        Some(composite @ Json::Object(_)) if column.kind == ColumnKind::Json => {
+                            Value::Json(composite.to_string())
+                        }
                         Some(_) => {
                             return Err(StorageError::Backend(format!(
                                 "column {:?} arrived as a composite JSON value",
@@ -334,6 +374,15 @@ impl ElasticRepo {
         };
         let filter_json = match filter {
             Some(filter) => {
+                // The tree gate: JSON-carrying operands have no index
+                // face (the JSON column is storage-only) — a pushed-down
+                // query would silently match nothing, so the refusal
+                // names the operator instead.
+                if carries_json_operand(filter.node()) {
+                    return Err(StorageError::Unsupported(
+                        "queries over JSON-carrying operands have no Elasticsearch face — the JSON column is storage-only".into(),
+                    ));
+                }
                 let mapper = |column: &str| self.field_of(column);
                 query::node_json(filter.node(), &mapper)?
             }
@@ -599,7 +648,14 @@ impl ElasticRepo {
         let pk = self.schema.primary_key.clone();
         let id = match row.get(pk.as_str()) {
             Some(Value::Int(existing)) if *existing > 0 => *existing,
-            _ => self.next_id().await?,
+            _ => {
+                let id = self.next_id().await?;
+                // The assigned id rides the stored document too — an
+                // _id alone is invisible to term queries over the pk
+                // column, and every existence probe rides one.
+                row = row.set(pk.as_str(), Value::Int(id));
+                id
+            }
         };
         let source = self.source_json(&row);
         // `_create` (op_type=create), never a plain indexed put: an
@@ -713,6 +769,10 @@ impl ElasticRepo {
                 _ => {
                     let id = next_id;
                     next_id += 1;
+                    // Same backfill as the single create: the assigned
+                    // id must ride the stored document, not just the
+                    // _id metadata.
+                    stamped = stamped.set(pk.as_str(), Value::Int(id));
                     id
                 }
             };
@@ -1004,3 +1064,34 @@ impl Repository for ElasticRepo {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether any leaf of the tree carries a JSON-carrying operand (the
+/// JSON column is storage-only on Elasticsearch — such queries refuse
+/// instead of silently matching nothing).
+fn carries_json_operand(node: &FilterNode) -> bool {
+    match node {
+        FilterNode::All(children) | FilterNode::Any(children) => {
+            children.iter().any(carries_json_operand)
+        }
+        FilterNode::Cond(condition) => condition
+            .values
+            .iter()
+            .any(|v| matches!(v, Value::Array(_) | Value::Json(_))),
+    }
+}
+
+/// One JSON element inside a stored document — the read face of a
+/// JSON column's typed array.
+fn json_element_to_value(value: &Json) -> Value {
+    match value {
+        Json::Null => Value::Null,
+        Json::Bool(b) => Value::Bool(*b),
+        Json::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Real(n.as_f64().unwrap_or_default()),
+        },
+        Json::String(s) => Value::Text(s.clone()),
+        Json::Array(items) => Value::Array(items.iter().map(json_element_to_value).collect()),
+        Json::Object(_) => Value::Json(value.to_string()),
+    }
+}
