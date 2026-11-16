@@ -276,7 +276,6 @@ jobs:
             | grep -h "panicked at\|register must\|etcd\|consul\|zookeeper\|nacos\|eureka\|servicecomb\|polaris" \
             | grep -v "^     Running\|Doc-tests\|Compiling\|warning" | head -20 | cut -c1-900 | sed 's/^/::error::/'
 
-  broker-integration:
   broker-nsq-integration:
     name: broker conformance (live nsqd)
     runs-on: ubuntu-latest
@@ -322,6 +321,7 @@ jobs:
           SQS_ENDPOINT: http://localhost:4566
           SQS_QUEUE: rushwind-live
 
+  broker-integration:
     name: broker conformance (live mqtt)
     runs-on: ubuntu-latest
     timeout-minutes: 15
