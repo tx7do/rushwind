@@ -62,11 +62,15 @@
 //! the HEARTBEAT face's consumer-data schema before any PULL
 //! resolves (an unregistered group NPEs broker-side). With the group
 //! registered (HEARTBEAT's `consumerGroupDataSet`) and the pull
-//! header completed (`subVersion` plus the full field set), the PULL
-//! face answers with its own semantic codes — `PULL_NOT_FOUND` — the
-//! request pipeline fully processed server-side; why a stored message
-//! reads as not-found (the FOUND branch's queue/visibility details)
-//! is the investigation's remaining work.
+//! header's three fields in place — `requestSource` (0 = CLIENT; its
+//! absence NPEs the 5.x processor's request-source switch),
+//! `sysFlag: 7` (the commit-offset/suspend/subscription bits
+//! together), and `subVersion` — the PULL against stored messages
+//! answers FOUND (code 0) with the broker's own
+//! `nextBeginOffset`/`maxOffset` and the message bytes in the body.
+//! The port's remaining work is decoding that body — the messages
+//! ride the broker's REMOTING-serialized MessageExt list, a format
+//! this engine has not yet implemented.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
