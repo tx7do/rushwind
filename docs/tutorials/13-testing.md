@@ -26,7 +26,7 @@ fn axum_server() -> Arc<dyn Server> {
 rushwind_testkit::rushwind_conformance_suite!(crate::axum_server);
 ```
 
-这一行宏展开后是完整的生命周期一致性用例：端点可读、`start` 恰好一次、停机信号被体面处理、`Cancelled` 与真故障的区分……你新写一个 `Server` 实现，接上宏就继承了全部既有结论。存储引擎同理——`examples/storage-basics` 里"两个引擎跑同一 scenario"演示的正是这套思路的应用层形态：**同一场景跨引擎输出一致**。
+这一行宏展开后是完整的生命周期一致性用例：端点可读、`start` 恰好一次、停机信号被体面处理、`Cancelled` 与真故障的区分……你新写一个 `Server` 实现，接上宏就继承了全部既有结论。存储引擎同理——`examples/storage-basics` 里"两个引擎跑同一 scenario"演示的正是这套思路的应用层形态：**同一场景跨引擎输出一致**。存储域的套件是一个家族：主套件（`rushwind_storage_conformance_suite!`，全部引擎必接）之外，JSON/Array 算子与点路径（`rushwind_storage_json_suite!`）、regex 族（`rushwind_storage_regex_suite!`）是**采用制**——引擎带着方言面就采纳钉住，没有面（如 SQLite 无 regexp 函数）就如实拒绝、不采纳套件而用 crate 内快照钉自己的 SQL 与拒绝面；装饰器（cache/observe/soft-delete/tree）也采纳，钉的是**透明性**——装饰不能改变语义。
 
 ## 两层测试：纯单元与 live
 
