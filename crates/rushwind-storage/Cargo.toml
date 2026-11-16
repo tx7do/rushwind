@@ -10,6 +10,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[[bench]]
+name = "regex"
+harness = false
+
+[dev-dependencies]
+criterion = { workspace = true }
+
 [dependencies]
 # Intentionally empty: the contract layer must stay dependency-free so that
 # every engine adapter can adopt it without locking users into a driver.

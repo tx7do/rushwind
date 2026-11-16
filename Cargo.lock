@@ -7813,6 +7813,9 @@ dependencies = [
 [[package]]
 name = "rushwind-storage"
 version = "0.0.1"
+dependencies = [
+ "criterion",
+]
 
 [[package]]
 name = "rushwind-storage-axum"
