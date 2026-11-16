@@ -50,13 +50,18 @@
 //! made the broker read zero-length headers and NPE on every
 //! message; the live experiment against broker 5.3 established the
 //! shape and the fixed engine's PULL answers with the broker's own
-//! semantic errors, e.g. `topic not exist, apply first`). What
-//! remains unverified is the send path: SEND_MESSAGE on a
-//! mqadmin-registered topic answers `SERVICE_NOT_AVAILABLE` on the
-//! experiment host (a 91%-full disk — the store's disk checks and
-//! their tmpfs workaround did not clear it) — the send path needs a
-//! server-side investigation on a roomy host before the wire is
-//! called broker-compatible.
+//! semantic errors, e.g. `topic not exist, apply first`). The send
+//! path is verified too: on a host with disk headroom (the workspace
+//! build cache cleaned 59.5 GiB, dropping the disk from 91% to 65%)
+//! the SEND_MESSAGE answers code 0 with the broker's own
+//! msgId/queueOffset/transactionId — the earlier
+//! `SERVICE_NOT_AVAILABLE` was the experiment host's 91%-full disk
+//! tripping the store's disk checks, no engine fault. What remains
+//! unverified is the pull face's consumer-registration chain: the
+//! real broker requires the consumer group to be registered through
+//! the HEARTBEAT face's consumer-data schema before any PULL
+//! resolves (an unregistered group NPEs broker-side) — the
+//! heartbeat-data schema archaeology is the port's remaining work.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
