@@ -60,8 +60,13 @@
 //! unverified is the pull face's consumer-registration chain: the
 //! real broker requires the consumer group to be registered through
 //! the HEARTBEAT face's consumer-data schema before any PULL
-//! resolves (an unregistered group NPEs broker-side) — the
-//! heartbeat-data schema archaeology is the port's remaining work.
+//! resolves (an unregistered group NPEs broker-side). With the group
+//! registered (HEARTBEAT's `consumerGroupDataSet`) and the pull
+//! header completed (`subVersion` plus the full field set), the PULL
+//! face answers with its own semantic codes — `PULL_NOT_FOUND` — the
+//! request pipeline fully processed server-side; why a stored message
+//! reads as not-found (the FOUND branch's queue/visibility details)
+//! is the investigation's remaining work.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
