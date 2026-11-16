@@ -45,10 +45,20 @@
 //! **Compatibility note**: the protocol faces below are pinned by the
 //! in-process mock (the frames are byte-self-consistent between the
 //! engine and the mock), but have **not** been verified against a real
-//! RocketMQ broker — the live attempt against broker 5.x surfaced
-//! remoting-frame encoding differences (the serialize-type int's
-//! layout, the V1/V2 header field sets) whose honest port needs its
-//! own project. Treat the wire as mock-compatible, not
+//! RocketMQ broker. The live experiment against broker 5.3 advanced
+//! the diagnosis two layers and froze the port's starting point: the
+//! remoting frame's second int must be `(serializeType << 24) |
+//! headerLength` (the engine writes a bare 0 — the broker's JSON
+//! decoder never sees the fields and every message NPEs
+//! server-side); with the frame fixed the full request pipeline
+//! round-trips (SEND_MESSAGE to a registered topic answers with
+//! extFields), and the remaining gap is server-side topic registration
+//! — broker 5.3 no longer pre-registers the TBW102 default template
+//! (so msgCheck NPEs on auto-create) and the admin create-topic face
+//! NPEs on its own request-header set. The port is: fix the frame
+//! int, encode extFields with correct JSON types (timestamps as
+//! numbers), pre-register the topic through the admin face, then pin
+//! the live suite. Treat the wire as mock-compatible, not
 //! broker-compatible, until that lands.
 
 #![forbid(unsafe_code)]
