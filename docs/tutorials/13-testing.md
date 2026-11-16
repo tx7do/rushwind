@@ -91,6 +91,7 @@ curl -X POST http://127.0.0.1:<port>/widgets -d '{"name":"demo"}'   # CRUD 面
 ## 踩坑清单
 
 - **live 测试默认对准本机端口**：容器映射到非标准端口时**必须**设环境变量，否则测试会打到本机真服务上（或干脆超时）。
+- **live 验证方法论全文见 [live-verification.md](../live-verification.md)**：七容器/九服务器的验证矩阵、14 类离线看不见的真方言 bug 的完整类别学（类型系统差异/字面拼写/服务器状态机/harness 漂移），以及「mock 与引擎同错是离线套件的结构性盲区」的核心教义。
 - **并行 live 测试共享外部资源**：MQTT 的 client_id 冲突会互踢连接、Kafka 的消费组互抢分区——并行前确认测试间资源隔离（各 crate 的 live 套件已按此设计，自己新加的用例要遵守）。
 - **存储域的 live 矩阵是七容器**：PostgreSQL/MySQL（seaorm 三方言 + JSON/regex 面）、MongoDB（$eq 包含 + 点路径 + 严格 parse）、OpenSearch（存储-only JSON 列 + regex 渲染）、ClickHouse（JSON 函数分解 + coalesce 守卫）、Cassandra/InfluxDB（canonical text 往返 + 契约求值器）——CI 的 storage-integration 作业每次全新容器跑全量；本地重跑安全（harness 均已幂等：ES 轮询 404、influx 轮询 SHOW MEASUREMENTS、seaorm/cassandra drop-then-create）。**方言面的改动必须跑一次对应 live 验证**——JSONB 类型化绑定、PG IDENTITY 推进、cust 占位符方言 mark、mongo 空文档毒载荷等都是 SQLite 离线套件结构性抓不到的。
 - **apalis worker 构造后不 start 就不就绪**：直接用 `Worker::new` 会停在不可 Claim 的状态——生产经 ReadinessLayer 翻就绪位，测试里构造后立刻 `worker.start()`。
