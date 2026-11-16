@@ -41,6 +41,15 @@
 //! scope. One queue (`queueId: 0`) per engine. Heartbeats are not
 //! sent: this engine is pull-only and never rebalances, so RocketMQ's
 //! heartbeat/rebalance machinery has nothing to track.
+//!
+//! **Compatibility note**: the protocol faces below are pinned by the
+//! in-process mock (the frames are byte-self-consistent between the
+//! engine and the mock), but have **not** been verified against a real
+//! RocketMQ broker — the live attempt against broker 5.x surfaced
+//! remoting-frame encoding differences (the serialize-type int's
+//! layout, the V1/V2 header field sets) whose honest port needs its
+//! own project. Treat the wire as mock-compatible, not
+//! broker-compatible, until that lands.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
