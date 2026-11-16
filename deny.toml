@@ -21,6 +21,12 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste via cel-interpreter 0.10.0 / starlark 0.14.2, both the newest releases; no fixed version exists" },
     # samsa 0.1.8 (latest, itself dormant) -> rustls-pemfile
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile via samsa 0.1.8, the newest release; samsa itself is dormant, no fixed version exists" },
+    # samsa 0.1.8 (latest, itself dormant) -> ruzstd; fix >=0.9.1 needs samsa to ship
+    { id = "RUSTSEC-2026-0344", reason = "ruzstd decompression bomb via samsa 0.1.8 (broker-kafka), the newest release; samsa pins ruzstd ^0.8 and is dormant, so 0.9.x is unreachable until it releases" },
+    # sqlx 0.9.0 (latest) -> sqlx-sqlite -> libsqlite3-sys; fix >=0.39.0 lands with sqlx's next release
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.37 via sqlx-sqlite 0.9.0 under sea-orm 2.0.4; sqlx 0.9.0 is the newest release and caps the requirement at ^0.37, so 0.39.x is unreachable until sqlx ships it" },
+    # serde_yaml 0.9 (deprecated) -> unsafe-libyaml, its parser backend
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained with no fixed release; it rides in through serde_yaml 0.9, itself deprecated upstream — re-evaluate on a serde_yaml successor" },
 ]
 
 [licenses]
