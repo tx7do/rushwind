@@ -277,6 +277,29 @@ jobs:
             | grep -v "^     Running\|Doc-tests\|Compiling\|warning" | head -20 | cut -c1-900 | sed 's/^/::error::/'
 
   broker-integration:
+  broker-sqs-integration:
+    name: broker conformance (live localstack sqs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start LocalStack (SQS)
+        run: |
+          docker run -d --name localstack-sqs -p 4566:4566 -e SERVICES=sqs localstack/localstack:3.4
+          for i in $(seq 1 60); do curl -fsS http://localhost:4566/_localstack/health >/dev/null 2>&1 && break; sleep 2; done
+
+      - name: SQS suite
+        run: cargo test -p rushwind-broker-sqs --features live --test live
+        env:
+          SQS_ENDPOINT: http://localhost:4566
+          SQS_QUEUE: rushwind-live
+
     name: broker conformance (live mqtt)
     runs-on: ubuntu-latest
     timeout-minutes: 15

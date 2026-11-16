@@ -181,7 +181,6 @@ pub(crate) fn translate(
                         format!("`{}` = CAST(? AS JSON)", cond.field),
                         [sea_value(&first())],
                     )
-                    .into()
                 }
                 Op::NotEq
                     if backend == DbBackend::MySql
@@ -195,7 +194,6 @@ pub(crate) fn translate(
                         ),
                         [sea_value(&first())],
                     )
-                    .into()
                 }
                 Op::Eq => col.eq(bind(&first())),
                 Op::NotEq => col.ne(bind(&first())),

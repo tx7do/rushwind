@@ -126,10 +126,12 @@ impl SqsMock {
                         "<Message><ReceiptHandle>{receipt}</ReceiptHandle><Body>{}</Body>",
                         message.body
                     );
-                    for (index, (name, value)) in message.attributes.iter().enumerate() {
+                    // The real response shape: repeated unnumbered
+                    // <MessageAttribute> elements with the value nested
+                    // inside <Value>.
+                    for (name, value) in message.attributes.iter() {
                         xml.push_str(&format!(
-                            "<MessageAttribute.{0}><Name>{name}</Name><Value><StringValue>{value}</StringValue></Value></MessageAttribute.{0}>",
-                            index + 1
+                            "<MessageAttribute><Name>{name}</Name><Value><StringValue>{value}</StringValue></Value></MessageAttribute>"
                         ));
                     }
                     xml.push_str("</Message>");

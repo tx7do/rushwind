@@ -679,19 +679,24 @@ fn xml_tag(block: &str, tag: &str) -> Option<String> {
 
 /// The `MessageAttribute.N` entries of a receive block, as key-values.
 fn extract_attributes(block: &str) -> Vec<(String, String)> {
+    // The ReceiveMessage response nests each attribute as a repeated
+    // `<MessageAttribute>` element (no numbered suffix — that shape
+    // belongs to the *request* parameters), with the value inside a
+    // nested `<Value>`: `<Name>hop</Name><Value><StringValue>one`.
     let mut attributes = Vec::new();
-    let mut index = 1;
-    while let Some(name) = xml_tag(block, &format!("MessageAttribute.{index}.Name")) {
-        let entry_start = block
-            .find(&format!("<MessageAttribute.{index}>"))
-            .unwrap_or(block.len());
-        let entry_end = block
-            .find(&format!("</MessageAttribute.{index}>"))
-            .unwrap_or(block.len());
-        let entry = &block[entry_start..entry_end];
-        let value = xml_tag(entry, "Value.StringValue").unwrap_or_default();
+    let mut rest = block;
+    while let Some(start) = rest.find("<MessageAttribute>") {
+        let after = &rest[start + "<MessageAttribute>".len()..];
+        let Some(end) = after.find("</MessageAttribute>") else {
+            break;
+        };
+        let entry = &after[..end];
+        rest = &after[end + "</MessageAttribute>".len()..];
+        let Some(name) = xml_tag(entry, "Name") else {
+            continue;
+        };
+        let value = xml_tag(entry, "StringValue").unwrap_or_default();
         attributes.push((name, value));
-        index += 1;
     }
     attributes
 }

@@ -58,7 +58,7 @@ broker.subscribe("orders", handler).await?;   // json_handler 返回的就是 Ha
 | `broker-mqtt` | `MqttBroker::new(options)` + `connect` | `+`/`#` | ✗ | ✗ | QoS 1；重连后全量重订阅 |
 | `broker-redis` | `RedisBroker::connect(url)`（同步、惰性） | ✗ | ✗ | ✗ | pub/sub，至多一次，无持久化 |
 | `broker-stomp` | `StompBroker::new(addr)` + `connect` | ✗ | ✗ | ✗ | 手写 STOMP 1.2 客户端，指数退避重连并重放订阅 |
-| `broker-sqs` | `SqsBroker::new(options)`（queue_url 进 options） | ✗ | MessageAttributes | ✗ | Query API + 手写 SigV4；nack(Requeue) = 可见性归零、nack(Drop) = 删除 |
+| `broker-sqs` | `SqsBroker::new(options)`（queue_url 进 options） | ✗ | MessageAttributes | ✗ | Query API + 手写 SigV4；nack(Requeue) = 可见性归零、nack(Drop) = 删除；LocalStack live 套件两钉（CI 作业） |
 | `broker-gcpubsub` | `GcpPubSubBroker::new(options)`（endpoint 进 options） | ✗ | attributes map | ✗ | v1 REST + 调用方供给 token；nack = ack deadline 归零即立即可重投 |
 | `broker-nsq` | `NsqBroker::new(options)`（nsqd addr 进 options） | ✗ | JSON 信封（payload base64） | ✗ | nsqd v2 二进制协议手写 tokio；nack(Requeue) = REQ 0 原生立即重投 |
 | `broker-rocketmq` | `RocketmqBroker::new(options)`（broker_addr 进 options） | ✗ | `\u0001`/`\u0002` properties 串 | ✗ | 4.x remoting JSON 模式手写 tokio，pull-only 单队列；结算面 = 队列位移，Manual 单批窗口 |
