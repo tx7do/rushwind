@@ -255,10 +255,12 @@ async fn manual_mode_nack_requeue_redelivers() {
 
     // The abandon releases the lock and re-enters the queue — the
     // message redelivers with DeliveryCount incremented, then the ack
-    // completes it.
+    // completes it. The 30s budget is the live-suite standard: the
+    // cycle is microseconds against the in-process mock, and the pin
+    // measures the semantics, not a loaded runner's scheduler.
     wait_until(
         "the abandon-and-redeliver cycle",
-        Duration::from_secs(5),
+        Duration::from_secs(30),
         || {
             let seen = seen.lock().expect("seen");
             seen.iter().any(|(p, _)| p == "poison:requeued")

@@ -46,10 +46,13 @@ async fn ensure_topic(engine: &NsqBroker, topic: &str) {
 }
 
 async fn wait_for<F: Fn() -> bool>(what: &str, check: F) {
+    // 30s — the shared CI-runner standard. The pins complete in a
+    // fraction of a second locally; the budget absorbs a slow runner,
+    // not the semantics.
     let start = tokio::time::Instant::now();
     while !check() {
         assert!(
-            start + Duration::from_secs(15) > tokio::time::Instant::now(),
+            start + Duration::from_secs(30) > tokio::time::Instant::now(),
             "timed out waiting: {what}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
