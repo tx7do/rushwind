@@ -31,7 +31,7 @@
 
 框架核心只做一件事：**可靠的多服务器生命周期编排**——并发启动、级联停机、分阶段限时、结果观察。契约先行：每个能力域都是一份契约 crate，每个具体引擎、每个协议栈都是独立的适配器 crate，由使用者按需拼装。
 
-一切按 Rust 的所有权、取消与错误模型原生设计；契约语义与预算、停机行为的规范细节见 [docs/architecture.md](./docs/architecture.md)。数据访问层是同一哲学的延伸：`rushwind-storage` 用一套 Repository 契约驾驭多种存储引擎——每引擎一个适配器 crate，按需引入。
+一切按 Rust 的所有权、取消与错误模型原生设计；契约语义与预算、停机行为的规范细节见 [docs/architecture.md](./docs/architecture.md)，live 服务器验证的方法论与九服务器矩阵见 [docs/live-verification.md](./docs/live-verification.md)。数据访问层是同一哲学的延伸：`rushwind-storage` 用一套 Repository 契约驾驭多种存储引擎——每引擎一个适配器 crate，按需引入。
 
 ## 快速开始
 
