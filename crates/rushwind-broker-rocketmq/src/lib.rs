@@ -44,22 +44,19 @@
 //!
 //! **Compatibility note**: the protocol faces below are pinned by the
 //! in-process mock (the frames are byte-self-consistent between the
-//! engine and the mock), but have **not** been verified against a real
-//! RocketMQ broker. The live experiment against broker 5.3 advanced
-//! the diagnosis two layers and froze the port's starting point: the
-//! remoting frame's second int must be `(serializeType << 24) |
-//! headerLength` (the engine writes a bare 0 — the broker's JSON
-//! decoder never sees the fields and every message NPEs
-//! server-side); with the frame fixed the full request pipeline
-//! round-trips (SEND_MESSAGE to a registered topic answers with
-//! extFields), and the remaining gap is server-side topic registration
-//! — broker 5.3 no longer pre-registers the TBW102 default template
-//! (so msgCheck NPEs on auto-create) and the admin create-topic face
-//! NPEs on its own request-header set. The port is: fix the frame
-//! int, encode extFields with correct JSON types (timestamps as
-//! numbers), pre-register the topic through the admin face, then pin
-//! the live suite. Treat the wire as mock-compatible, not
-//! broker-compatible, until that lands.
+//! engine and the mock), and the remoting frame encoding is now
+//! **verified against a real broker** — the second int is
+//! `(serializeType << 24) | headerLength` (the earlier bare-0 shape
+//! made the broker read zero-length headers and NPE on every
+//! message; the live experiment against broker 5.3 established the
+//! shape and the fixed engine's PULL answers with the broker's own
+//! semantic errors, e.g. `topic not exist, apply first`). What
+//! remains unverified is the send path: SEND_MESSAGE on a
+//! mqadmin-registered topic answers `SERVICE_NOT_AVAILABLE` on the
+//! experiment host (a 91%-full disk — the store's disk checks and
+//! their tmpfs workaround did not clear it) — the send path needs a
+//! server-side investigation on a roomy host before the wire is
+//! called broker-compatible.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -545,12 +542,14 @@ fn remoting_frame(code: i32, opaque: i64, ext_fields: &Value, body: Option<&[u8]
     .into_bytes();
     let header_len = header.len() as u32;
     let body_len = body.map(|b| b.len() as u32).unwrap_or(0);
-    // The total covers everything after the total field itself: the
-    // serialize-type field, the header-length field, the header, the
-    // body.
-    let total = 8 + header_len + body_len;
+    // The wire (per the real broker's decoder): [total][(serializeType
+    // << 24) | headerLength][header JSON][body]. Serialize type 0 is
+    // the REMOTING codec this engine rides, so the second int reads as
+    // the bare header length — the earlier extra serialize-type
+    // segment made the broker read zero-length headers and every
+    // message NPEd server-side (the live experiment caught it).
+    let total = 4 + header_len + body_len;
     let mut frame = total.to_be_bytes().to_vec();
-    frame.extend_from_slice(&0u32.to_be_bytes()); // JSON serialization
     frame.extend_from_slice(&header_len.to_be_bytes());
     frame.extend_from_slice(&header);
     if let Some(body) = body {
@@ -584,7 +583,7 @@ async fn call(
             .await
             .map_err(|e| BrokerError::Failed(format!("rocketmq {context}: {e}")))?;
         let total = u32::from_be_bytes(total_buf) as usize;
-        if total < 8 {
+        if total < 4 {
             return Err(BrokerError::Failed("rocketmq frame too short".to_string()));
         }
         let mut payload = vec![0u8; total];
@@ -592,15 +591,13 @@ async fn call(
             .read_exact(&mut payload)
             .await
             .map_err(|e| BrokerError::Failed(format!("rocketmq {context}: {e}")))?;
-        let serialize_type = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        if serialize_type != 0 {
-            return Err(BrokerError::Failed(
-                "rocketmq: only JSON serialization is supported".to_string(),
-            ));
-        }
-        let header_len =
-            u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
-        let header_start = 8;
+        // The second int is (serializeType << 24) | headerLength; the
+        // engine rides serialize type 0 (the REMOTING codec whose
+        // headers are JSON), so the low 24 bits are the header length.
+        let header_len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+            as usize
+            & 0x00FF_FFFF;
+        let header_start = 4;
         let header_end = header_start + header_len;
         if payload.len() < header_end {
             return Err(BrokerError::Failed("rocketmq header truncated".to_string()));

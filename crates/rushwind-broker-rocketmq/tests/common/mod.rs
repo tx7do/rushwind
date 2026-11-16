@@ -118,16 +118,17 @@ async fn serve(mock: Arc<RocketmqMock>, mut socket: TcpStream) {
             Err(_) => return, // connection closed
         }
         let total = u32::from_be_bytes(total_buf) as usize;
-        if total < 8 {
+        if total < 4 {
             return;
         }
         let mut payload = vec![0u8; total];
         if socket.read_exact(&mut payload).await.is_err() {
             return;
         }
-        let header_len =
-            u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
-        let header_start = 8;
+        let header_len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+            as usize
+            & 0x00FF_FFFF;
+        let header_start = 4;
         let header_end = header_start + header_len;
         if payload.len() < header_end {
             return;
@@ -281,10 +282,10 @@ fn response_frame(code: i64, opaque: i64, ext_fields: &Value, remark: Option<&st
     .into_bytes();
     let header_len = header.len() as u32;
     // The total covers everything after the total field itself: the
-    // serialize-type field, the header-length field, the header.
-    let total = 8 + header_len;
+    // header-length field (serialize type 0 in its high byte) and the
+    // header.
+    let total = 4 + header_len;
     let mut frame = total.to_be_bytes().to_vec();
-    frame.extend_from_slice(&0u32.to_be_bytes());
     frame.extend_from_slice(&header_len.to_be_bytes());
     frame.extend_from_slice(&header);
     frame
