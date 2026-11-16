@@ -102,6 +102,11 @@ struct Inner {
 #[derive(Debug)]
 struct SubscriptionShared {
     done: Arc<Notify>,
+    /// The subscription's stop flag: the pump checks it each loop and
+    /// the delivery face guards the in-flight receive (a delivery
+    /// arriving after the stop drops — a stopped subscription's
+    /// handler sees nothing).
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 /// The Azure Service Bus broker.
@@ -366,6 +371,9 @@ impl Broker for AzureSbBroker {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let subscriptions = self.inner.subscriptions.lock().await;
             for shared in subscriptions.values() {
+                shared
+                    .stopped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 shared.done.notify_waiters();
             }
             Ok(())
@@ -432,7 +440,10 @@ impl Broker for AzureSbBroker {
                 return Err(BrokerError::NotConnected);
             }
             let done = Arc::new(Notify::new());
-            let shared = Arc::new(SubscriptionShared { done: done.clone() });
+            let shared = Arc::new(SubscriptionShared {
+                done: done.clone(),
+                stopped: std::sync::atomic::AtomicBool::new(false),
+            });
             {
                 let mut subscriptions = self.inner.subscriptions.lock().await;
                 subscriptions.insert(topic.to_string(), Arc::clone(&shared));
@@ -447,6 +458,7 @@ impl Broker for AzureSbBroker {
             let ack_mode = self.inner.options.ack_mode;
             let (settle_tx, mut settle_rx) =
                 mpsc::unbounded_channel::<(String, String, SettleAction)>();
+            let pump_shared = Arc::clone(&shared);
             tokio::spawn(async move {
                 loop {
                     if engine
@@ -467,6 +479,7 @@ impl Broker for AzureSbBroker {
                         received = engine.receive_dispatch(
                             &topic_for_task,
                             ack_mode,
+                            &pump_shared,
                             settle_tx.clone(),
                             handler.clone(),
                         ) => match received {
@@ -482,6 +495,7 @@ impl Broker for AzureSbBroker {
             Ok(Box::new(AzureSbSubscriber {
                 topic: topic.to_string(),
                 done,
+                shared: Arc::clone(&shared),
             }) as Box<dyn Subscriber>)
         })
     }
@@ -509,12 +523,20 @@ impl AzureSbBroker {
         &self,
         topic: &str,
         ack_mode: AckMode,
+        shared: &Arc<SubscriptionShared>,
         settle_tx: mpsc::UnboundedSender<(String, String, SettleAction)>,
         handler: Handler,
     ) -> Result<(), BrokerError> {
         match ack_mode {
             AckMode::Auto => {
                 if let Some(message) = self.receive_and_delete(topic).await? {
+                    // The destructive receive settled the message
+                    // server-side; if the subscription stopped while
+                    // the receive was in flight, the delivery drops —
+                    // a stopped subscription's handler sees nothing.
+                    if shared.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Ok(());
+                    }
                     let event = Event::new(topic.to_string(), message);
                     tokio::spawn(handler(event));
                 }
@@ -522,6 +544,12 @@ impl AzureSbBroker {
             }
             AckMode::Manual => {
                 if let Some(delivery) = self.receive_peek_lock(topic, settle_tx.clone()).await? {
+                    // Same guard: a peek-locked delivery arriving after
+                    // the stop lands drops instead of reaching the
+                    // handler (the lock self-expires server-side).
+                    if shared.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Ok(());
+                    }
                     let ack_tx = delivery.settle_tx.clone();
                     let ack_id = delivery.message_id.clone();
                     let ack_token = delivery.lock_token.clone();
@@ -575,6 +603,7 @@ impl AzureSbBroker {
 struct AzureSbSubscriber {
     topic: String,
     done: Arc<Notify>,
+    shared: Arc<SubscriptionShared>,
 }
 
 impl Subscriber for AzureSbSubscriber {
@@ -583,6 +612,9 @@ impl Subscriber for AzureSbSubscriber {
     }
 
     fn unsubscribe(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
+        self.shared
+            .stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.done.notify_waiters();
         Box::pin(async { Ok(()) })
     }
