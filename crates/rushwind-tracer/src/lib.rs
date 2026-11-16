@@ -287,18 +287,18 @@ fn headers_to_metadata(
 ) -> StdResult<tonic::metadata::MetadataMap, opentelemetry_otlp::ExporterBuildError> {
     let mut metadata = tonic::metadata::MetadataMap::new();
     for (key, value) in headers {
-        let parsed: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = value
-            .parse()
-            .map_err(|_| opentelemetry_otlp::ExporterBuildError::InvalidConfig {
-                name: "headers".to_string(),
-                reason: format!("header value {value:?} is not valid metadata ASCII"),
+        let parsed: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
+            value.parse().map_err(|_| {
+                opentelemetry_otlp::ExporterBuildError::InvalidConfiguration(format!(
+                    "headers: header value {value:?} is not valid metadata ASCII"
+                ))
             })?;
         let key: tonic::metadata::MetadataKey<tonic::metadata::Ascii> =
-            key.parse()
-                .map_err(|_| opentelemetry_otlp::ExporterBuildError::InvalidConfig {
-                    name: "headers".to_string(),
-                    reason: format!("header key {key:?} is not valid metadata ASCII"),
-                })?;
+            key.parse().map_err(|_| {
+                opentelemetry_otlp::ExporterBuildError::InvalidConfiguration(format!(
+                    "headers: header key {key:?} is not valid metadata ASCII"
+                ))
+            })?;
         metadata.insert(key, parsed);
     }
     Ok(metadata)
