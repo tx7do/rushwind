@@ -67,6 +67,14 @@ pub enum Op {
     /// The column's array contains the operand as an element (one
     /// operand, a scalar).
     ArrayContains,
+    /// The text matches the operand's regular expression —
+    /// unanchored contains semantics over the contract's own
+    /// documented subset (the dependency-free engine in `regex`;
+    /// one Text operand, case-sensitive).
+    Regexp,
+    /// The Unicode case-folded face of [`Op::Regexp`] (the same
+    /// folding `Iexact` uses).
+    Iregexp,
 }
 
 /// The operand-count requirement of an [`Op`].
@@ -101,7 +109,9 @@ impl Op {
             | Op::StartsWith
             | Op::EndsWith
             | Op::JsonContains
-            | Op::ArrayContains => Arity::One,
+            | Op::ArrayContains
+            | Op::Regexp
+            | Op::Iregexp => Arity::One,
             Op::Between | Op::NotBetween => Arity::Two,
             Op::In | Op::NotIn => Arity::Many,
         }
@@ -128,6 +138,8 @@ impl Op {
                 | Op::Contains
                 | Op::StartsWith
                 | Op::EndsWith
+                | Op::Regexp
+                | Op::Iregexp
         )
     }
 }
@@ -286,6 +298,18 @@ impl FilterExpr {
             Op::Contains => like(&value, &text_arg(|s| format!("%{s}%")), false),
             Op::StartsWith => like(&value, &text_arg(|s| format!("{s}%")), false),
             Op::EndsWith => like(&value, &text_arg(|s| format!("%{s}")), false),
+            Op::Regexp | Op::Iregexp => {
+                let owned = first();
+                let (Some(text), Some(pattern)) = (value.as_str(), owned.as_str()) else {
+                    return false;
+                };
+                // The pattern compiled at validate; the belt-and-braces
+                // face reads a failed parse as a miss, never a panic.
+                match crate::regex::parse(pattern) {
+                    Ok(ast) => crate::regex::is_match(&ast, text, condition.op == Op::Iregexp),
+                    Err(_) => false,
+                }
+            }
             Op::JsonContains => json_contains(&value, &first()),
             Op::ArrayContains => {
                 let Some(items) = value.as_array() else {
@@ -378,6 +402,23 @@ impl FilterExpr {
                                 column.kind,
                                 value.type_name()
                             )));
+                        }
+                        // The regex family compiles its pattern at the
+                        // edge — a malformed pattern refuses with its
+                        // parse position, never at row evaluation.
+                        if matches!(cond.op, Op::Regexp | Op::Iregexp) {
+                            let Some(pattern) = cond.values.first().and_then(Value::as_str) else {
+                                return Err(StorageError::InvalidQuery(format!(
+                                    "operator {:#?} on {:?} takes one text operand (the pattern)",
+                                    cond.op, cond.field
+                                )));
+                            };
+                            if let Err(error) = crate::regex::parse(pattern) {
+                                return Err(StorageError::InvalidQuery(format!(
+                                    "regexp pattern at byte {}: {}",
+                                    error.position, error.message
+                                )));
+                            }
                         }
                         // The JSON containment pair pin their operand
                         // kinds: JSON_CONTAINS takes a JSON document,

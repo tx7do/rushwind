@@ -233,6 +233,28 @@ pub(crate) fn condition_to_doc(condition: &Condition) -> Result<Document, Storag
         // declare the delta.
         Op::ArrayContains => doc! { field: value_to_bson(&first()) },
         Op::JsonContains => doc! { field: value_to_bson(&first()) },
+        // The regex family rides PCRE verbatim — the contract's
+        // documented subset renders identically there (the anchors
+        // and classes included); IREGEXP flips mongo's own
+        // case-insensitive option.
+        Op::Regexp => {
+            let owned = first();
+            let Some(pattern) = owned.as_str() else {
+                return Err(StorageError::InvalidQuery(
+                    "REGEXP needs one text pattern operand".into(),
+                ));
+            };
+            doc! { field: { "$regex": pattern } }
+        }
+        Op::Iregexp => {
+            let owned = first();
+            let Some(pattern) = owned.as_str() else {
+                return Err(StorageError::InvalidQuery(
+                    "IREGEXP needs one text pattern operand".into(),
+                ));
+            };
+            doc! { field: { "$regex": pattern, "$options": "i" } }
+        }
     })
 }
 

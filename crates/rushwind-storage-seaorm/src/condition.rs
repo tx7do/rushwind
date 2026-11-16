@@ -171,6 +171,41 @@ pub(crate) fn translate(node: &FilterNode, backend: DbBackend) -> Result<Conditi
                 Op::Contains => col.like(pattern(|s| format!("%{s}%"))),
                 Op::StartsWith => col.like(pattern(|s| format!("{s}%"))),
                 Op::EndsWith => col.like(pattern(|s| format!("%{s}"))),
+                // The regex family: MySQL's REGEXP_LIKE (case-sensitive
+                // by the 'c' match type — the default is insensitive)
+                // and PostgreSQL's `~`/`~*`; SQLite ships no regexp
+                // function, so the face refuses rather than silently
+                // narrowing.
+                Op::Regexp => match backend {
+                    DbBackend::MySql => Expr::cust_with_values(
+                        format!("REGEXP_LIKE(`{}`, ?, 'c')", cond.field),
+                        [sea_value(&first())],
+                    ),
+                    DbBackend::Postgres => Expr::cust_with_values(
+                        format!("\"{}\" ~ $1", cond.field),
+                        [sea_value(&first())],
+                    ),
+                    _ => {
+                        return Err(StorageError::Unsupported(
+                            "SQLite ships no regexp function — the face refuses".into(),
+                        ))
+                    }
+                },
+                Op::Iregexp => match backend {
+                    DbBackend::MySql => Expr::cust_with_values(
+                        format!("REGEXP_LIKE(`{}`, ?)", cond.field),
+                        [sea_value(&first())],
+                    ),
+                    DbBackend::Postgres => Expr::cust_with_values(
+                        format!("\"{}\" ~* $1", cond.field),
+                        [sea_value(&first())],
+                    ),
+                    _ => {
+                        return Err(StorageError::Unsupported(
+                            "SQLite ships no regexp function — the face refuses".into(),
+                        ))
+                    }
+                },
                 // The JSON containment pair returned above, per dialect.
                 Op::JsonContains | Op::ArrayContains => unreachable!("json faces handled above"),
             };
@@ -216,11 +251,11 @@ fn json_contains_sql(
     };
     match backend {
         DbBackend::MySql => Ok(Condition::all().add(Expr::cust_with_values(
-            format!("JSON_CONTAINS(\"{field}\", ?)"),
+            format!("JSON_CONTAINS(`{field}`, ?)"),
             [text],
         ))),
         DbBackend::Postgres => Ok(Condition::all().add(Expr::cust_with_values(
-            format!("\"{field}\" @> CAST(? AS jsonb)"),
+            format!("\"{field}\" @> CAST($1 AS jsonb)"),
             [text],
         ))),
         _ => sqlite_contains_sql(field, text),
@@ -237,11 +272,11 @@ fn array_contains_sql(
     let json_text = rushwind_storage::json::encode(element);
     match backend {
         DbBackend::MySql => Ok(Condition::all().add(Expr::cust_with_values(
-            format!("JSON_CONTAINS(\"{field}\", ?)"),
+            format!("JSON_CONTAINS(`{field}`, ?)"),
             [json_text],
         ))),
         DbBackend::Postgres => Ok(Condition::all().add(Expr::cust_with_values(
-            format!("\"{field}\" @> CAST(? AS jsonb)"),
+            format!("\"{field}\" @> CAST($1 AS jsonb)"),
             [json_text],
         ))),
         _ => sqlite_element_sql(field, element),
@@ -309,7 +344,7 @@ fn sqlite_contains_sql(field: &str, needle_text: &str) -> Result<Condition, Stor
     let needle = sqlite_needle(needle_text)?;
     // Whole-document equality always applies.
     let mut any = Condition::any().add(Expr::cust_with_values(
-        format!("json(\"{field}\") = json(?)"),
+        format!("json(`{field}`) = json(?)"),
         [needle_text.to_string()],
     ));
     // Top-level element membership: the element bind matches
@@ -327,7 +362,7 @@ fn sqlite_contains_sql(field: &str, needle_text: &str) -> Result<Condition, Stor
             // The needle array itself may sit as one element.
             any = any.add(Expr::cust_with_values(
                 format!(
-                    "EXISTS (SELECT 1 FROM json_each(\"{field}\") WHERE json_each.type = 'array' AND json_each.value = ?)"
+                    "EXISTS (SELECT 1 FROM json_each(`{field}`) WHERE json_each.type = 'array' AND json_each.value = ?)"
                 ),
                 [needle_text.to_string()],
             ));
@@ -338,14 +373,14 @@ fn sqlite_contains_sql(field: &str, needle_text: &str) -> Result<Condition, Stor
         let mut subset = Condition::all();
         for (key, value) in entries {
             subset = subset.add(Expr::cust_with_values(
-                format!("json_extract(\"{field}\", '$.{key}') = ?"),
+                format!("json_extract(`{field}`, '$.{key}') = ?"),
                 [sea_value(value)],
             ));
         }
         any = any.add(subset);
     }
     Ok(Condition::all()
-        .add(Expr::cust(format!("json_valid(\"{field}\")")))
+        .add(Expr::cust(format!("json_valid(`{field}`)")))
         .add(any))
 }
 
@@ -368,7 +403,7 @@ fn sqlite_each_membership(field: &str, element: &Value) -> Condition {
     };
     Condition::all().add(Expr::cust_with_values(
         format!(
-            "EXISTS (SELECT 1 FROM json_each(\"{field}\") WHERE json_each.type IN ({types}) AND json_each.value = ?)"
+            "EXISTS (SELECT 1 FROM json_each(`{field}`) WHERE json_each.type IN ({types}) AND json_each.value = ?)"
         ),
         [sea_value(element)],
     ))
@@ -406,7 +441,7 @@ fn sqlite_element_sql(field: &str, element: &Value) -> Result<Condition, Storage
 /// - MySQL: `JSON_UNQUOTE(JSON_EXTRACT(...))` — the unquote keeps
 ///   string comparisons textual (numbers compare natively).
 /// - PostgreSQL: the JSON chain — every step `->` (JSON), values
-///   bound as `CAST(? AS jsonb)` so jsonb's own equality/ordering
+///   bound as `CAST($n AS jsonb)` so jsonb's own equality/ordering
 ///   carries the operator; the pattern family extracts text
 ///   (`->>` final step) since patterns apply to text.
 fn json_path_condition(
@@ -452,56 +487,50 @@ fn json_path_condition(
             };
             match cond.op {
                 Op::Eq => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) = CAST(? AS jsonb)"),
+                    format!("({chain}) = CAST($1 AS jsonb)"),
                     [sea_value(&operand())],
                 )),
                 Op::NotEq => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) <> CAST(? AS jsonb) OR ({chain}) IS NULL"),
+                    format!("({chain}) <> CAST($1 AS jsonb) OR ({chain}) IS NULL"),
                     [sea_value(&operand())],
                 )),
                 Op::In => Condition::all().add(Expr::cust_with_values(
                     format!(
                         "({chain}) IN ({})",
-                        cond.values
-                            .iter()
-                            .map(|_| "?".to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        pg_placeholders(cond.values.len()).join(", ")
                     ),
                     cond.values.iter().map(sea_value).collect::<Vec<_>>(),
                 )),
                 Op::NotIn => Condition::all().add(Expr::cust_with_values(
                     format!(
                         "({chain}) NOT IN ({}) OR ({chain}) IS NULL",
-                        cond.values
-                            .iter()
-                            .map(|_| "?".to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        pg_placeholders(cond.values.len()).join(", ")
                     ),
                     cond.values.iter().map(sea_value).collect::<Vec<_>>(),
                 )),
                 Op::Gt => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) > CAST(? AS jsonb)"),
+                    format!("({chain}) > CAST($1 AS jsonb)"),
                     [sea_value(&operand())],
                 )),
                 Op::Gte => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) >= CAST(? AS jsonb)"),
+                    format!("({chain}) >= CAST($1 AS jsonb)"),
                     [sea_value(&operand())],
                 )),
                 Op::Lt => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) < CAST(? AS jsonb)"),
+                    format!("({chain}) < CAST($1 AS jsonb)"),
                     [sea_value(&operand())],
                 )),
                 Op::Lte => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) <= CAST(? AS jsonb)"),
+                    format!("({chain}) <= CAST($1 AS jsonb)"),
                     [sea_value(&operand())],
                 )),
                 Op::Between => {
                     let lo = cond.values.first().cloned().unwrap_or(Value::Null);
                     let hi = cond.values.get(1).cloned().unwrap_or(Value::Null);
                     Condition::all().add(Expr::cust_with_values(
-                        format!("({chain}) >= CAST(? AS jsonb) AND ({chain}) <= CAST(? AS jsonb)"),
+                        format!(
+                            "({chain}) >= CAST($1 AS jsonb) AND ({chain}) <= CAST($2 AS jsonb)"
+                        ),
                         [sea_value(&lo), sea_value(&hi)],
                     ))
                 }
@@ -509,39 +538,39 @@ fn json_path_condition(
                     let lo = cond.values.first().cloned().unwrap_or(Value::Null);
                     let hi = cond.values.get(1).cloned().unwrap_or(Value::Null);
                     Condition::all().add(Expr::cust_with_values(
-                        format!("({chain}) < CAST(? AS jsonb) OR ({chain}) > CAST(? AS jsonb)"),
+                        format!("({chain}) < CAST($1 AS jsonb) OR ({chain}) > CAST($2 AS jsonb)"),
                         [sea_value(&lo), sea_value(&hi)],
                     ))
                 }
                 Op::Like => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) LIKE ?"),
+                    format!("({chain}) LIKE $1"),
                     [pattern(|s| s.to_owned())],
                 )),
                 Op::NotLike => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) NOT LIKE ?"),
+                    format!("({chain}) NOT LIKE $1"),
                     [pattern(|s| s.to_owned())],
                 )),
                 Op::Ilike => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) ILIKE ?"),
+                    format!("({chain}) ILIKE $1"),
                     [pattern(|s| s.to_lowercase())],
                 )),
                 Op::Iexact => Condition::all().add(Expr::cust_with_values(
-                    format!("LOWER({chain}) = ?"),
+                    format!("LOWER({chain}) = $1"),
                     [match cond.values.first() {
                         Some(Value::Text(s)) => sea_orm::sea_query::Value::from(s.to_lowercase()),
                         _ => sea_orm::sea_query::Value::from(String::new()),
                     }],
                 )),
                 Op::Contains => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) LIKE ?"),
+                    format!("({chain}) LIKE $1"),
                     [pattern(|s| format!("%{s}%"))],
                 )),
                 Op::StartsWith => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) LIKE ?"),
+                    format!("({chain}) LIKE $1"),
                     [pattern(|s| format!("{s}%"))],
                 )),
                 Op::EndsWith => Condition::all().add(Expr::cust_with_values(
-                    format!("({chain}) LIKE ?"),
+                    format!("({chain}) LIKE $1"),
                     [pattern(|s| format!("%{s}"))],
                 )),
                 Op::IsNull => Condition::all().add(Expr::cust(format!("({chain}) IS NULL"))),
@@ -636,6 +665,13 @@ fn json_path_condition(
             .into()
         }
     }
+}
+
+/// PostgreSQL's numbered placeholders (`$1`…`$n`) — the cust SQL
+/// spells the dialect's own mark (sea-query's tokenizer matches the
+/// builder's mark, and PostgreSQL's is `$`).
+fn pg_placeholders(count: usize) -> Vec<String> {
+    (1..=count).map(|i| format!("${i}")).collect()
 }
 
 /// The SQLite/MySQL JSON path literal for a dotted contract path

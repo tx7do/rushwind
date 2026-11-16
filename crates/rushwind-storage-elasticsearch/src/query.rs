@@ -158,7 +158,107 @@ pub(crate) fn condition_json(
         // mappings — the crate docs declare the delta.
         Op::ArrayContains => json!({ "term": { field_borrow: scalar(&first()) } }),
         Op::JsonContains => term(),
+        // The regex family: Lucene's regexp matches the WHOLE term, so
+        // the contract's unanchored semantics render as a per-top-
+        // level-alternative `.*alt.*` wrapper. The anchors have no
+        // Lucene face — they refuse rather than silently changing
+        // position semantics.
+        Op::Regexp | Op::Iregexp => {
+            let owned = first();
+            let Some(pattern) = owned.as_str() else {
+                return Err(rushwind_storage::StorageError::InvalidQuery(
+                    "the regex operators need one text pattern operand".into(),
+                ));
+            };
+            let ast = rushwind_storage::regex::parse(pattern).map_err(|error| {
+                rushwind_storage::StorageError::InvalidQuery(format!(
+                    "regexp pattern at byte {}: {}",
+                    error.position, error.message
+                ))
+            })?;
+            if has_anchor(&ast) {
+                return Err(rushwind_storage::StorageError::Unsupported(
+                    "the ^ and $ anchors have no Elasticsearch regexp face".into(),
+                ));
+            }
+            let wrapped: Vec<String> = ast
+                .top_level_alternatives()
+                .iter()
+                .map(|alternative| format!(".*{}.*", render_verbatim(alternative)))
+                .collect();
+            let lucene = wrapped.join("|");
+            json!({
+                "regexp": { field_borrow: {
+                    "value": lucene,
+                    "case_insensitive": condition.op == Op::Iregexp,
+                } }
+            })
+        }
     })
+}
+
+/// Whether any node in the tree is an anchor.
+fn has_anchor(ast: &rushwind_storage::regex::Ast) -> bool {
+    use rushwind_storage::regex::Ast;
+    match ast {
+        Ast::Start | Ast::End => true,
+        Ast::Concat(nodes) | Ast::Alt(nodes) => nodes.iter().any(has_anchor),
+        Ast::Repeat { node, .. } => has_anchor(node),
+        _ => false,
+    }
+}
+
+/// Renders the AST verbatim — every construct the contract's subset
+/// parses rides Lucene's syntax unchanged (the parser refused the
+/// dialect-specific shorthands at the edge).
+fn render_verbatim(ast: &rushwind_storage::regex::Ast) -> String {
+    use rushwind_storage::regex::Ast;
+    match ast {
+        Ast::Empty => String::new(),
+        Ast::Char(c) => c.to_string(),
+        Ast::Any => ".".to_string(),
+        Ast::Class { ranges, negated } => {
+            let mut out = String::from("[");
+            if *negated {
+                out.push('^');
+            }
+            for (low, high) in ranges {
+                if low == high {
+                    out.push(*low);
+                } else {
+                    out.push(*low);
+                    out.push('-');
+                    out.push(*high);
+                }
+            }
+            out.push(']');
+            out
+        }
+        Ast::Concat(nodes) => nodes.iter().map(render_verbatim).collect(),
+        Ast::Alt(branches) => {
+            let rendered: Vec<String> = branches.iter().map(render_verbatim).collect();
+            rendered.join("|")
+        }
+        Ast::Repeat { node, min, max } => {
+            let inner = render_verbatim(node);
+            let quantifier = match (min, max) {
+                (0, None) => "*".to_string(),
+                (1, None) => "+".to_string(),
+                (0, Some(1)) => "?".to_string(),
+                (min, None) => format!("{{{min},}}"),
+                (min, Some(max)) if min == max => format!("{{{min}}}"),
+                (min, Some(max)) => format!("{{{min},{max}}}"),
+            };
+            // Multi-char nodes quote into a group so the quantifier
+            // binds the whole node.
+            if matches!(node.as_ref(), Ast::Char(_) | Ast::Any | Ast::Class { .. }) {
+                format!("{inner}{quantifier}")
+            } else {
+                format!("({inner}){quantifier}")
+            }
+        }
+        Ast::Start | Ast::End => String::new(),
+    }
 }
 
 /// One contract value out to its JSON wire shape — the array face of

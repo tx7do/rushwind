@@ -261,6 +261,64 @@ fn garbage_cursor_is_invalid_query() {
 }
 
 #[test]
+fn regexp_renders_per_dialect() {
+    let filter = FilterExpr::cond("name", Op::Regexp, [Value::Text("^a".into())]);
+    let select = list_select(
+        &schema(),
+        &["id".into()],
+        Some(&translate(filter.node(), DbBackend::MySql).expect("translates")),
+        &ListQuery::default(),
+        DbBackend::MySql,
+    )
+    .expect("builds");
+    let (mysql, binds) = render(&select, DbBackend::MySql);
+    assert!(mysql.contains("REGEXP_LIKE(`name`, ?, 'c')"), "{mysql}");
+    assert_eq!(binds, 3, "the pattern plus the bound limit and offset");
+    let select = list_select(
+        &schema(),
+        &["id".into()],
+        Some(&translate(filter.node(), DbBackend::Postgres).expect("translates")),
+        &ListQuery::default(),
+        DbBackend::Postgres,
+    )
+    .expect("builds");
+    let (postgres, _) = render(&select, DbBackend::Postgres);
+    assert!(postgres.contains("\"name\" ~ $1"), "{postgres}");
+
+    // SQLite ships no regexp function — the face refuses.
+    let refused = translate(filter.node(), DbBackend::Sqlite);
+    assert!(
+        matches!(refused, Err(StorageError::Unsupported(_))),
+        "the SQLite face refuses: {refused:?}"
+    );
+}
+
+#[test]
+fn iregexp_renders_the_folding_dialects() {
+    let filter = FilterExpr::cond("name", Op::Iregexp, [Value::Text("^a".into())]);
+    let select = list_select(
+        &schema(),
+        &["id".into()],
+        Some(&translate(filter.node(), DbBackend::MySql).expect("translates")),
+        &ListQuery::default(),
+        DbBackend::MySql,
+    )
+    .expect("builds");
+    let (mysql, _) = render(&select, DbBackend::MySql);
+    assert!(mysql.contains("REGEXP_LIKE(`name`, ?)"), "{mysql}");
+    let select = list_select(
+        &schema(),
+        &["id".into()],
+        Some(&translate(filter.node(), DbBackend::Postgres).expect("translates")),
+        &ListQuery::default(),
+        DbBackend::Postgres,
+    )
+    .expect("builds");
+    let (postgres, _) = render(&select, DbBackend::Postgres);
+    assert!(postgres.contains("\"name\" ~* $1"), "{postgres}");
+}
+
+#[test]
 fn iexact_lowers_the_column() {
     let filter = FilterExpr::cond("name", Op::Iexact, [Value::Text("CHARLIE".into())]);
     let select = list_select(

@@ -198,9 +198,11 @@ fn condition_to_filter(condition: &FilterCondition) -> Result<ContractFilterExpr
         // the contract's json kinds.
         Operator::JsonContains => cond(Op::JsonContains, values),
         Operator::ArrayContains => cond(Op::ArrayContains, values),
-        Operator::Regexp | Operator::Iregexp | Operator::Exists | Operator::Search => {
-            return Err(unsupported(op_name(op)))
-        }
+        // The regex family rides the contract's own engine (the
+        // pattern compiles at the edge, the subset documented).
+        Operator::Regexp => cond(Op::Regexp, values),
+        Operator::Iregexp => cond(Op::Iregexp, values),
+        Operator::Exists | Operator::Search => return Err(unsupported(op_name(op))),
     })
 }
 

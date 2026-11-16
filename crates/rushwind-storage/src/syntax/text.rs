@@ -373,6 +373,9 @@ fn negate(node: &FilterNode) -> Result<FilterExpr, StorageError> {
                         "negated json containment operators".into(),
                     ))
                 }
+                Op::Regexp | Op::Iregexp => {
+                    return Err(StorageError::Unsupported("negated regexp operators".into()))
+                }
             };
             FilterExpr::from(FilterNode::Cond(Condition {
                 field: condition.field.clone(),

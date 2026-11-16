@@ -163,7 +163,7 @@ fn nested_groups_translate_recursively() {
 
 #[test]
 fn unsupported_taxonomy_is_named_at_the_boundary() {
-    for op in ["REGEXP", "IREGEXP", "EXISTS", "SEARCH"] {
+    for op in ["EXISTS", "SEARCH"] {
         let err = filter_expr_from_json(&format!(
             r#"{{"conditions": [{{"field": "name", "op": "{op}", "value": "x"}}]}}"#
         ))
@@ -194,6 +194,15 @@ fn unsupported_taxonomy_is_named_at_the_boundary() {
     let condition = leaf_of(&expr);
     assert_eq!(condition.op, Op::ArrayContains);
     assert_eq!(condition.values, vec![Value::Text("red".to_string())]);
+
+    // The regex family rides the contract's own engine.
+    let expr = filter_expr_from_json(
+        r#"{"conditions": [{"field": "name", "op": "IREGEXP", "value": "^h.*o$"}]}"#,
+    )
+    .expect("IREGEXP maps");
+    let condition = leaf_of(&expr);
+    assert_eq!(condition.op, Op::Iregexp);
+    assert_eq!(condition.values, vec![Value::Text("^h.*o$".to_string())]);
 
     // The point-path face rides protojson's jsonPath.
     let expr = filter_expr_from_json(

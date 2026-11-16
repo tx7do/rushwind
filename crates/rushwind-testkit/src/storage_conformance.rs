@@ -1539,3 +1539,124 @@ macro_rules! rushwind_storage_json_suite {
         }
     };
 }
+
+/// The regex suite: the `Regexp`/`Iregexp` faces every engine carrying
+/// the family pins against — unanchored contains semantics, the
+/// anchors, character classes, alternation, and the Iexact folding —
+/// over the standard seed rows' `name` column (alpha/Bravo/charlie/
+/// delta/Echo). Engines without a dialect face (SQLite ships no regexp
+/// function) do not adopt it; their crate-local pins cover the SQL
+/// rendering and the refusal.
+///
+/// ```ignore
+/// rushwind_testkit::rushwind_storage_regex_suite!(crate::fresh_repo);
+/// ```
+#[macro_export]
+macro_rules! rushwind_storage_regex_suite {
+    ($factory:expr) => {
+        mod rushwind_storage_regex_conformance {
+            use std::sync::Arc;
+
+            use $crate::rushwind_storage::{
+                FilterExpr, ListQuery, Op, QueryCtx, Repository, Value,
+            };
+            use $crate::storage_conformance::standard_rows;
+
+            /// A fresh, empty table for every suite test.
+            async fn fresh_repo() -> Arc<dyn Repository> {
+                $factory().await
+            }
+
+            async fn seed(repo: &Arc<dyn Repository>) {
+                for row in standard_rows() {
+                    repo.create(QueryCtx::all_access(), row)
+                        .await
+                        .expect("seed row");
+                }
+            }
+
+            async fn ids_of(repo: &Arc<dyn Repository>, q: &ListQuery) -> Vec<i64> {
+                let page = repo
+                    .list(QueryCtx::all_access(), q)
+                    .await
+                    .expect("list succeeds");
+                page.items
+                    .iter()
+                    .map(|r| r.get("id").and_then(Value::as_i64).expect("int id"))
+                    .collect()
+            }
+
+            #[tokio::test]
+            async fn regexp_is_unanchored_and_case_sensitive() {
+                let repo = fresh_repo().await;
+                seed(&repo).await;
+                // Unanchored: the pattern matches anywhere.
+                let hit = ListQuery::default().filtered(FilterExpr::cond(
+                    "name",
+                    Op::Regexp,
+                    [Value::Text("ta".into())],
+                ));
+                assert_eq!(ids_of(&repo, &hit).await, vec![4i64], "delta's ta");
+                // Case-sensitive: charlie's lowercase c stays out.
+                let upper = ListQuery::default().filtered(FilterExpr::cond(
+                    "name",
+                    Op::Regexp,
+                    [Value::Text("^[A-C]".into())],
+                ));
+                assert_eq!(
+                    ids_of(&repo, &upper).await,
+                    vec![2i64],
+                    "case-sensitive: only Bravo's uppercase B is in [A-C]"
+                );
+                let miss = ListQuery::default().filtered(FilterExpr::cond(
+                    "name",
+                    Op::Regexp,
+                    [Value::Text("^z".into())],
+                ));
+                assert_eq!(ids_of(&repo, &miss).await, vec![]);
+            }
+
+            #[tokio::test]
+            async fn regexp_anchors_classes_and_alternation() {
+                let repo = fresh_repo().await;
+                seed(&repo).await;
+                let anchored = ListQuery::default().filtered(FilterExpr::cond(
+                    "name",
+                    Op::Regexp,
+                    [Value::Text("^(alpha|delta)$".into())],
+                ));
+                assert_eq!(
+                    ids_of(&repo, &anchored).await,
+                    vec![1i64, 4i64],
+                    "the anchors + alternation pin the whole string"
+                );
+                let class = ListQuery::default().filtered(FilterExpr::cond(
+                    "name",
+                    Op::Regexp,
+                    [Value::Text("^[a-z]+$".into())],
+                ));
+                assert_eq!(
+                    ids_of(&repo, &class).await,
+                    vec![1i64, 3i64, 4i64],
+                    "the all-lowercase names; Bravo and Echo carry uppercase"
+                );
+            }
+
+            #[tokio::test]
+            async fn iregexp_folds_the_pattern() {
+                let repo = fresh_repo().await;
+                seed(&repo).await;
+                let folded = ListQuery::default().filtered(FilterExpr::cond(
+                    "name",
+                    Op::Iregexp,
+                    [Value::Text("^[a-c]".into())],
+                ));
+                assert_eq!(
+                    ids_of(&repo, &folded).await,
+                    vec![1i64, 2i64, 3i64],
+                    "Bravo's B and charlie's c fold into [a-c]"
+                );
+            }
+        }
+    };
+}

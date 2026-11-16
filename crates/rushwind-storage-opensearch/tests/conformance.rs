@@ -57,3 +57,7 @@ rushwind_testkit::rushwind_storage_conformance_suite!(crate::fresh_repo, tenant:
 // The JSON/Array kinds' operator faces + the point-path face —
 // adopted here; the containers' CI runs them.
 rushwind_testkit::rushwind_storage_json_suite!(crate::fresh_repo);
+
+// The regex family (unanchored contains, anchors, classes,
+// alternation, folding) — the engines carrying the face pin it here.
+rushwind_testkit::rushwind_storage_regex_suite!(crate::fresh_repo);

@@ -212,6 +212,11 @@ pub(crate) fn condition_sql(condition: &Condition) -> Result<String, StorageErro
         Op::JsonContains | Op::ArrayContains => {
             unreachable!("json faces handled above")
         }
+        // The regex family rides RE2 verbatim (match() is an
+        // unanchored search — the contract's semantics); IREGEXP
+        // carries the inline (?i) flag.
+        Op::Regexp => format!("match({}, '{}')", column, pattern(|s| s.to_owned())?),
+        Op::Iregexp => format!("match({}, '(?i){}')", column, pattern(|s| s.to_owned())?),
         Op::Eq => format!("{} = {}", column, literal(&first())),
         Op::NotEq => format!("{} != {}", column, literal(&first())),
         Op::Gt => format!("{} > {}", column, literal(&first())),
@@ -533,6 +538,11 @@ fn json_path_sql(condition: &Condition) -> Result<String, StorageError> {
         Op::Contains => format!("{text} LIKE '{}'", pattern(|s| format!("%{s}%"))?),
         Op::StartsWith => format!("{text} LIKE '{}'", pattern(|s| format!("{s}%"))?),
         Op::EndsWith => format!("{text} LIKE '{}'", pattern(|s| format!("%{s}"))?),
+        // The regex family rides RE2 verbatim (match() is an
+        // unanchored search — the contract's semantics); IREGEXP
+        // carries the inline (?i) flag.
+        Op::Regexp => format!("match({}, '{}')", column, pattern(|s| s.to_owned())?,),
+        Op::Iregexp => format!("match({}, '(?i){}')", column, pattern(|s| s.to_owned())?,),
         Op::IsNull => format!("coalesce({has}, 0) = 0"),
         Op::IsNotNull => format!("coalesce({has}, 0) != 0"),
         // The containment pair never reach here (the contract refuses
@@ -642,6 +652,24 @@ mod tests {
             .column("meta", ColumnKind::Json)
             .build()
             .expect("valid schema")
+    }
+
+    #[test]
+    fn regexp_rides_re2_verbatim() {
+        let sql = condition_sql(&Condition::new(
+            "name",
+            Op::Regexp,
+            [Value::Text("^a[0-9]+$".into())],
+        ))
+        .expect("renders");
+        assert_eq!(sql, "match(`name`, '^a[0-9]+$')");
+        let sql = condition_sql(&Condition::new(
+            "name",
+            Op::Iregexp,
+            [Value::Text("^a[0-9]+$".into())],
+        ))
+        .expect("renders");
+        assert_eq!(sql, "match(`name`, '(?i)^a[0-9]+$')");
     }
 
     #[test]

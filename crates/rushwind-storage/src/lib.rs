@@ -55,6 +55,7 @@ pub mod filter;
 pub mod json;
 pub mod paging;
 pub mod record;
+pub mod regex;
 pub mod repository;
 pub mod schema;
 pub mod sorting;
