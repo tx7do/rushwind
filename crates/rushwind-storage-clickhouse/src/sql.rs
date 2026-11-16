@@ -426,11 +426,18 @@ fn json_path_sql(condition: &Condition) -> Result<String, StorageError> {
         .as_deref()
         .ok_or_else(|| StorageError::InvalidQuery("json_path missing".into()))?;
     let args = json_path_args(path);
+    // The JSON functions demand a non-Nullable argument (ClickHouse's
+    // type synthesis rejects Nullable-wrapped arrays), and the
+    // declared column is Nullable(String) — coalesce hands NULL and
+    // the functions a harmless empty string, which every predicate
+    // below reads as "the path is absent" (NULL rows stay invisible
+    // through the guards and the empty comparisons).
     let column = identifier(&condition.field);
-    let raw = format!("JSONExtractRaw({column}, {args})");
-    let has = format!("JSONHas({column}, {args})");
-    let text = format!("JSONExtractString({column}, {args})");
-    let float = format!("JSONExtractFloat({column}, {args})");
+    let doc = format!("coalesce({column}, '')");
+    let raw = format!("JSONExtractRaw({doc}, {args})");
+    let has = format!("JSONHas({doc}, {args})");
+    let text = format!("JSONExtractString({doc}, {args})");
+    let float = format!("JSONExtractFloat({doc}, {args})");
     let first = || condition.values.first().cloned().unwrap_or(Value::Null);
     let canonical = || {
         format!(
@@ -562,9 +569,9 @@ fn json_path_sql(condition: &Condition) -> Result<String, StorageError> {
 fn array_contains_sql(condition: &Condition) -> Result<String, StorageError> {
     let element = condition.values.first().cloned().unwrap_or(Value::Null);
     let canonical = rushwind_storage::json::encode(&element);
-    let column = identifier(&condition.field);
+    let doc = format!("coalesce({}, '')", identifier(&condition.field));
     Ok(format!(
-        "isValidJSON({column}) AND has(JSONExtractArrayRaw({column}), '{}')",
+        "isValidJSON({doc}) AND has(JSONExtractArrayRaw({doc}), '{}')",
         escape_string(&canonical)
     ))
 }
@@ -583,7 +590,11 @@ fn json_contains_sql(condition: &Condition) -> Result<String, StorageError> {
     let canonical = rushwind_storage::json::encode(&needle);
     let quoted = format!("'{}'", escape_string(&canonical));
     let column = identifier(&condition.field);
-    let mut arms = vec![format!("{column} = {quoted}")];
+    // The coalesce keeps the JSON functions off the Nullable type
+    // synthesis (the live suite caught the Array-inside-Nullable
+    // error); NULL rows fail isValidJSON and stay invisible.
+    let doc = format!("coalesce({}, '')", column);
+    let mut arms = vec![format!("{doc} = {quoted}")];
     // The flat key-subset for object needles — every key must extract
     // and compare (an AND group inside the OR of containment arms).
     if let Some(entries) = object_entries(&needle) {
@@ -591,7 +602,7 @@ fn json_contains_sql(condition: &Condition) -> Result<String, StorageError> {
             .iter()
             .map(|(key, value)| {
                 format!(
-                    "JSONExtractRaw({column}, '{}') = '{}'",
+                    "JSONExtractRaw({doc}, '{}') = '{}'",
                     escape_string(key),
                     escape_string(&rushwind_storage::json::encode(value))
                 )
@@ -603,8 +614,8 @@ fn json_contains_sql(condition: &Condition) -> Result<String, StorageError> {
     }
     // Top-level element membership — non-array columns read empty, so
     // the guard is structural.
-    arms.push(format!("has(JSONExtractArrayRaw({column}), {quoted})"));
-    Ok(format!("isValidJSON({column}) AND ({})", arms.join(" OR ")))
+    arms.push(format!("has(JSONExtractArrayRaw({doc}), {quoted})"));
+    Ok(format!("isValidJSON({doc}) AND ({})", arms.join(" OR ")))
 }
 
 /// The needle object's flat entries; non-objects read empty (the
@@ -682,7 +693,7 @@ mod tests {
         .expect("renders");
         assert_eq!(
             sql,
-            "isValidJSON(`meta`) AND has(JSONExtractArrayRaw(`meta`), '\"red\"')"
+            "isValidJSON(coalesce(`meta`, '')) AND has(JSONExtractArrayRaw(coalesce(`meta`, '')), '\"red\"')"
         );
     }
 
@@ -696,18 +707,24 @@ mod tests {
         .expect("renders");
         // Equality, the flat key-subset, and the array-membership arm
         // under the validity guard.
-        assert!(sql.starts_with("isValidJSON(`meta`) AND ("), "{sql}");
         assert!(
-            sql.contains("`meta` = '{\"k\":1,\"kind\":\"two\"}'"),
+            sql.starts_with("isValidJSON(coalesce(`meta`, '')) AND ("),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("coalesce(`meta`, '') = '{\"k\":1,\"kind\":\"two\"}'"),
             "{sql}"
         );
         assert!(
             sql.contains(
-                "JSONExtractRaw(`meta`, 'k') = '1' AND JSONExtractRaw(`meta`, 'kind') = '\"two\"'"
+                "JSONExtractRaw(coalesce(`meta`, ''), 'k') = '1' AND JSONExtractRaw(coalesce(`meta`, ''), 'kind') = '\"two\"'"
             ),
             "{sql}"
         );
-        assert!(sql.contains("has(JSONExtractArrayRaw(`meta`),"), "{sql}");
+        assert!(
+            sql.contains("has(JSONExtractArrayRaw(coalesce(`meta`, '')),"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -718,9 +735,9 @@ mod tests {
             [Value::Json("5".to_string())],
         ))
         .expect("renders");
-        assert!(sql.contains("`meta` = '5'"), "{sql}");
+        assert!(sql.contains("coalesce(`meta`, '') = '5'"), "{sql}");
         assert!(
-            sql.contains("has(JSONExtractArrayRaw(`meta`), '5')"),
+            sql.contains("has(JSONExtractArrayRaw(coalesce(`meta`, '')), '5')"),
             "{sql}"
         );
     }
@@ -730,23 +747,32 @@ mod tests {
         let sql =
             condition_sql(&Condition::new("meta", Op::Eq, [Value::Int(1)]).with_json_path("k"))
                 .expect("renders");
-        assert_eq!(sql, "JSONExtractRaw(`meta`, 'k') = '1'");
+        assert_eq!(sql, "JSONExtractRaw(coalesce(`meta`, ''), 'k') = '1'");
 
         let sql = condition_sql(
             &Condition::new("meta", Op::Eq, [Value::Text("x".into())]).with_json_path("a.0.b"),
         )
         .expect("renders");
-        assert_eq!(sql, "JSONExtractRaw(`meta`, 'a', 0, 'b') = '\"x\"'");
+        assert_eq!(
+            sql,
+            "JSONExtractRaw(coalesce(`meta`, ''), 'a', 0, 'b') = '\"x\"'"
+        );
     }
 
     #[test]
     fn json_path_null_rides_json_has_with_coalesce() {
         let sql = condition_sql(&Condition::new("meta", Op::IsNull, []).with_json_path("tags"))
             .expect("renders");
-        assert_eq!(sql, "coalesce(JSONHas(`meta`, 'tags'), 0) = 0");
+        assert_eq!(
+            sql,
+            "coalesce(JSONHas(coalesce(`meta`, ''), 'tags'), 0) = 0"
+        );
         let sql = condition_sql(&Condition::new("meta", Op::IsNotNull, []).with_json_path("tags"))
             .expect("renders");
-        assert_eq!(sql, "coalesce(JSONHas(`meta`, 'tags'), 0) != 0");
+        assert_eq!(
+            sql,
+            "coalesce(JSONHas(coalesce(`meta`, ''), 'tags'), 0) != 0"
+        );
     }
 
     #[test]
@@ -756,13 +782,16 @@ mod tests {
                 .with_json_path("kind"),
         )
         .expect("renders");
-        assert_eq!(sql, "JSONExtractString(`meta`, 'kind') LIKE '%wo%'");
+        assert_eq!(
+            sql,
+            "JSONExtractString(coalesce(`meta`, ''), 'kind') LIKE '%wo%'"
+        );
         let sql =
             condition_sql(&Condition::new("meta", Op::Gt, [Value::Int(5)]).with_json_path("k"))
                 .expect("renders");
         assert_eq!(
             sql,
-            "coalesce(JSONHas(`meta`, 'k'), 0) != 0 AND JSONExtractFloat(`meta`, 'k') > 5"
+            "coalesce(JSONHas(coalesce(`meta`, ''), 'k'), 0) != 0 AND JSONExtractFloat(coalesce(`meta`, ''), 'k') > 5"
         );
     }
 
