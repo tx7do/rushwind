@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use hmac::Mac;
+use hmac::{KeyInit, Mac};
 use rushwind_broker::{
     AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, NackAction, Subscriber,
 };

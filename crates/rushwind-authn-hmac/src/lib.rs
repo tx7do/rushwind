@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rushwind_authn::{AuthClaims, Authenticator, AuthnError, CLAIM_FIELD_SUBJECT, SCHEME_BEARER};
 use sha2::Sha256;
 

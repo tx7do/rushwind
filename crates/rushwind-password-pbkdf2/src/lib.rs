@@ -5,6 +5,9 @@
 //! salt per call, at the engine's cost policy — [OWASP's recommended
 //! rounds](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2)
 //! (600,000 with HMAC-SHA-256) unless overridden at construction.
+//! pbkdf2 0.13 floors minted rounds at its `Params::MIN_ROUNDS` (1000,
+//! NIST's floor): construction stays permissive, but `hash` refuses a
+//! sub-floor policy instead of minting it.
 //!
 //! Verification rebuilds the derivation from the **stored hash's
 //! embedded parameters** (`i` rounds, `l` length, and the PRF named in
@@ -22,7 +25,10 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use password_hash::{rand_core::OsRng, Output, PasswordHash, PasswordHasher as _, SaltString};
+use pbkdf2::password_hash::{
+    phc::{Output, PasswordHash, SaltString},
+    CustomizedPasswordHasher as _,
+};
 use pbkdf2::{pbkdf2_hmac, Pbkdf2};
 use rushwind_password::{PasswordError, PasswordHasher};
 use sha2::{Sha256, Sha512};
@@ -71,17 +77,18 @@ impl Default for Pbkdf2Hasher {
 
 impl PasswordHasher for Pbkdf2Hasher {
     fn hash(&self, password: &str) -> Result<String, PasswordError> {
-        let salt = SaltString::generate(&mut OsRng);
-        Pbkdf2
+        let salt = SaltString::generate();
+        // pbkdf2 0.13 floors rounds at its Params::MIN_ROUNDS (1000) —
+        // sub-floor policies are refused here rather than minted.
+        let params = pbkdf2::Params::new_with_output_len(self.rounds, 32)
+            .map_err(|e| PasswordError::InvalidParams(e.to_string()))?;
+        Pbkdf2::default()
             .hash_password_customized(
                 password.as_bytes(),
-                Some(pbkdf2::Algorithm::Pbkdf2Sha256.ident()),
+                salt.to_salt().as_ref(),
+                Some(pbkdf2::Algorithm::PBKDF2_SHA256_ID),
                 None,
-                pbkdf2::Params {
-                    rounds: self.rounds,
-                    output_length: 32,
-                },
-                &salt,
+                params,
             )
             .map(|h| h.to_string())
             .map_err(|e| PasswordError::Hash(e.to_string()))
@@ -95,18 +102,20 @@ impl PasswordHasher for Pbkdf2Hasher {
             .map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         let salt = parsed.salt.as_ref().expect("parse refuses saltless hashes");
         let digest = parsed.hash.as_ref().expect("parse refuses empty digests");
-        let mut salt_buf = [0u8; 64];
-        let salt_bytes = salt
-            .decode_b64(&mut salt_buf)
-            .map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         let mut out = vec![0u8; digest.len()];
         match parsed.algorithm.as_str() {
-            "pbkdf2-sha256" => {
-                pbkdf2_hmac::<Sha256>(password.as_bytes(), salt_bytes, params.rounds, &mut out)
-            }
-            "pbkdf2-sha512" => {
-                pbkdf2_hmac::<Sha512>(password.as_bytes(), salt_bytes, params.rounds, &mut out)
-            }
+            "pbkdf2-sha256" => pbkdf2_hmac::<Sha256>(
+                password.as_bytes(),
+                salt.as_ref(),
+                params.rounds(),
+                &mut out,
+            ),
+            "pbkdf2-sha512" => pbkdf2_hmac::<Sha512>(
+                password.as_bytes(),
+                salt.as_ref(),
+                params.rounds(),
+                &mut out,
+            ),
             other => {
                 return Err(PasswordError::InvalidHash(format!(
                     "unsupported PRF: {other}"
@@ -128,7 +137,7 @@ impl PasswordHasher for Pbkdf2Hasher {
         let Ok(params) = pbkdf2::Params::try_from(&parsed) else {
             return true;
         };
-        params.rounds < self.rounds
+        params.rounds() < self.rounds
     }
 
     fn algorithm(&self) -> &'static str {
@@ -140,7 +149,7 @@ impl Pbkdf2Hasher {
     /// Parses a stored PHC string, refusing anything outside the
     /// pbkdf2 family. SHA-512 hashes parse fine — they verify, and
     /// [`PasswordHasher::needs_rehash`] is what flags policy distance.
-    fn parse(hash: &str) -> Result<PasswordHash<'_>, PasswordError> {
+    fn parse(hash: &str) -> Result<PasswordHash, PasswordError> {
         let parsed =
             PasswordHash::new(hash).map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         if !matches!(parsed.algorithm.as_str(), "pbkdf2-sha256" | "pbkdf2-sha512") {
@@ -182,32 +191,26 @@ mod tests {
     #[test]
     fn cheaper_hash_verifies_and_needs_rehash() {
         let hasher = Pbkdf2Hasher::with_rounds(10_000).expect("policy");
-        let cheap = Pbkdf2
+        let cheap = Pbkdf2::default()
             .hash_password_customized(
                 "legacy".as_bytes(),
-                Some(pbkdf2::Algorithm::Pbkdf2Sha256.ident()),
+                SaltString::generate().to_salt().as_ref(),
+                Some(pbkdf2::Algorithm::PBKDF2_SHA256_ID),
                 None,
-                pbkdf2::Params {
-                    rounds: 1_000,
-                    output_length: 32,
-                },
-                &SaltString::generate(&mut OsRng),
+                pbkdf2::Params::new_with_output_len(1_000, 32).expect("params at the floor"),
             )
             .expect("cheap hash")
             .to_string();
         assert!(hasher.verify("legacy", &cheap).expect("verify"));
         assert!(hasher.needs_rehash(&cheap));
 
-        let sha512 = Pbkdf2
+        let sha512 = Pbkdf2::default()
             .hash_password_customized(
                 "stronger-prf".as_bytes(),
-                Some(pbkdf2::Algorithm::Pbkdf2Sha512.ident()),
+                SaltString::generate().to_salt().as_ref(),
+                Some(pbkdf2::Algorithm::PBKDF2_SHA512_ID),
                 None,
-                pbkdf2::Params {
-                    rounds: 10_000,
-                    output_length: 32,
-                },
-                &SaltString::generate(&mut OsRng),
+                pbkdf2::Params::new_with_output_len(10_000, 32).expect("fast params"),
             )
             .expect("sha512 hash")
             .to_string();

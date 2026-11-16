@@ -52,7 +52,7 @@ async fn ensure_queue(client: &reqwest::Client, name: &str) -> String {
 async fn purge_queue(client: &reqwest::Client, queue_url: &str) {
     let path = queue_url
         .split('/')
-        .last()
+        .next_back()
         .map(|name| format!("/{name}"))
         .unwrap_or_else(|| "/rushwind-live".to_string());
     let _ = client

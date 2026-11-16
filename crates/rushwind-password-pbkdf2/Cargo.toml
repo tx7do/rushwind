@@ -12,14 +12,13 @@ workspace = true
 
 [dependencies]
 rushwind-password = { workspace = true }
-# `simple` brings the password-hash bridge and the sha2 PRF set.
-pbkdf2 = { version = "0.12", features = ["simple"] }
+# 0.13 rebuilt on the digest-0.11 wave and split its surface: `phc` is the
+# PHC-string face (the old password-hash 0.5 types now live in the `phc`
+# crate, surfaced as pbkdf2::password_hash::phc) and carries the sha2 PRF
+# set with it; `getrandom` feeds SaltString::generate's OS randomness.
+pbkdf2 = { version = "0.13", features = ["phc", "getrandom"] }
 # The PRF dispatch imports sha2 directly.
 sha2 = { workspace = true }
-
-# The password-hash face (PHC types, salt generation, constant-time
-# Output equality) is used directly, not through the engine crate's re-export.
-password-hash = "0.5"
 
 [dev-dependencies]
 rushwind-testkit = { workspace = true, features = ["password"] }

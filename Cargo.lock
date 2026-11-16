@@ -308,7 +308,7 @@ dependencies = [
  "base64ct",
  "blake2",
  "cpufeatures 0.2.17",
- "password-hash",
+ "password-hash 0.5.0",
 ]
 
 [[package]]
@@ -5455,6 +5455,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "password-hash"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
+dependencies = [
+ "getrandom 0.4.3",
+ "phc",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5517,8 +5527,6 @@ checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest 0.10.7",
  "hmac 0.12.1",
- "password-hash",
- "sha2 0.10.9",
 ]
 
 [[package]]
@@ -5528,6 +5536,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
 dependencies = [
  "digest 0.11.3",
+ "hmac 0.13.0",
+ "password-hash 0.6.1",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -5635,6 +5646,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3673cba5b9a124916096a423b806a9f29620972c6c97b08db5f2053e9428b481"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "phc"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
+dependencies = [
+ "base64ct",
+ "ctutils",
+ "getrandom 0.4.3",
 ]
 
 [[package]]
@@ -6785,10 +6807,10 @@ dependencies = [
 name = "rushwind-authn-hmac"
 version = "0.0.1"
 dependencies = [
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "rushwind-authn",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -6925,14 +6947,14 @@ name = "rushwind-broker-azuresb"
 version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "percent-encoding",
  "reqwest 0.12.28",
  "rushwind-broker",
  "rushwind-transport",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tokio",
 ]
 
@@ -7070,13 +7092,13 @@ name = "rushwind-broker-sqs"
 version = "0.0.1"
 dependencies = [
  "form_urlencoded",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "reqwest 0.12.28",
  "rushwind-broker",
  "rushwind-transport",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tokio",
 ]
 
@@ -7526,7 +7548,7 @@ name = "rushwind-password-argon2"
 version = "0.0.1"
 dependencies = [
  "argon2",
- "password-hash",
+ "password-hash 0.5.0",
  "rushwind-password",
  "rushwind-testkit",
 ]
@@ -7544,18 +7566,17 @@ dependencies = [
 name = "rushwind-password-pbkdf2"
 version = "0.0.1"
 dependencies = [
- "password-hash",
- "pbkdf2 0.12.2",
+ "pbkdf2 0.13.0",
  "rushwind-password",
  "rushwind-testkit",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
 name = "rushwind-password-scrypt"
 version = "0.0.1"
 dependencies = [
- "password-hash",
+ "password-hash 0.5.0",
  "rushwind-password",
  "rushwind-testkit",
  "scrypt",
@@ -8673,7 +8694,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
 dependencies = [
- "password-hash",
+ "password-hash 0.5.0",
  "pbkdf2 0.12.2",
  "salsa20",
  "sha2 0.10.9",
