@@ -185,5 +185,9 @@ async fn the_handshake_disables_heartbeats() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(mock.last_heartbeat(), Some(-1), "heartbeats disabled");
+    assert_eq!(
+        mock.last_heartbeat(),
+        Some(0),
+        "heartbeats disabled — the legal zero spelling"
+    );
 }

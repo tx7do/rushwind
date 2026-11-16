@@ -182,6 +182,17 @@ fn handle(mock: &NsqMock, command: &str, body: Option<Vec<u8>>) -> CommandOutcom
             let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
             inner.last_identify_heartbeat =
                 parsed.get("heartbeat_interval").and_then(Value::as_i64);
+            // nsqd's real validation: a *negative* heartbeat interval
+            // is not a legal spelling — SUB would be refused with
+            // E_INVALID. Zero (disabled) passes. The mock reproduces
+            // it so the offline pins carry the same handshake
+            // contract.
+            let heartbeat = parsed.get("heartbeat_interval").and_then(Value::as_i64);
+            if heartbeat.map(|v| v < 0).unwrap_or(false) {
+                return CommandOutcome::Response(respond_error(
+                    "E_INVALID cannot SUB with heartbeats disabled",
+                ));
+            }
         }
         return CommandOutcome::Response(respond_ok());
     }
@@ -240,7 +251,7 @@ fn handle(mock: &NsqMock, command: &str, body: Option<Vec<u8>>) -> CommandOutcom
 }
 
 fn respond_ok() -> Vec<u8> {
-    let payload = b"+OK";
+    let payload = b"OK";
     let size = (4 + payload.len()) as u32;
     let mut frame = size.to_be_bytes().to_vec();
     frame.extend_from_slice(&0u32.to_be_bytes());
@@ -288,7 +299,7 @@ async fn serve(mock: Arc<NsqMock>, stream: tokio::net::TcpStream) {
 
     // Handshake on the plain halves: magic + IDENTIFY + SUB are driven
     // inline before the select loop (the engine's dial does the same
-    // sequence and waits on each +OK).
+    // sequence and waits on each OK).
     let mut magic = [0u8; 4];
     if reader.read_exact(&mut magic).await.is_err() {
         eprintln!("[nsq mock] magic read failed");

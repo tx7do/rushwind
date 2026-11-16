@@ -20,3 +20,6 @@ tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros", "
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }
+
+[features]
+live = []

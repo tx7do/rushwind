@@ -277,6 +277,28 @@ jobs:
             | grep -v "^     Running\|Doc-tests\|Compiling\|warning" | head -20 | cut -c1-900 | sed 's/^/::error::/'
 
   broker-integration:
+  broker-nsq-integration:
+    name: broker conformance (live nsqd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start nsqd
+        run: |
+          docker run -d --name nsqd -p 14150:4150 nsqio/nsq /nsqd
+          for i in $(seq 1 30); do timeout 2 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/14150" 2>/dev/null && break; sleep 2; done
+
+      - name: NSQ suite
+        run: cargo test -p rushwind-broker-nsq --features live --test live
+        env:
+          NSQ_ADDR: 127.0.0.1:14150
+
   broker-sqs-integration:
     name: broker conformance (live localstack sqs)
     runs-on: ubuntu-latest

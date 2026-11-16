@@ -291,14 +291,19 @@ impl NsqBroker {
         .await
         .map_err(|_| BrokerError::Failed(format!("nsq {context}: response timeout")))?
         .map_err(|e| BrokerError::Failed(format!("nsq {context}: {e}")))?;
-        if payload.first() == Some(&b'+') {
-            Ok(())
-        } else {
-            Err(BrokerError::Failed(format!(
-                "nsq {context}: {}",
-                String::from_utf8_lossy(&payload)
-            )))
+        // Heartbeats skip (nsqd's timer fires on its own schedule and
+        // one can land between the command and its OK); the real
+        // nsqd's success body is plain "OK".
+        if payload == b"_heartbeat_" {
+            return Ok(());
         }
+        if payload.starts_with(b"OK") {
+            return Ok(());
+        }
+        Err(BrokerError::Failed(format!(
+            "nsq {context}: {}",
+            String::from_utf8_lossy(&payload)
+        )))
     }
 
     /// The subscribe pump: dial, handshake (magic + IDENTIFY with
@@ -453,12 +458,12 @@ impl NsqBroker {
                         }
                     }
                 }
-                // Responses and errors: a non-+OK response breaks the
-                // pump (the error carries the reason server-side).
-                NsqFrame::Response(payload) if payload.starts_with(b"+OK") => {}
+                // Responses and errors: the real nsqd's success body
+                // is plain "OK" (no plus prefix — that spelling was
+                // the mock's invention, the live suite caught it).
+                NsqFrame::Response(payload) if payload.starts_with(b"OK") => {}
                 NsqFrame::Response(_) => {}
-                NsqFrame::Error(payload) => {
-                    let _ = payload;
+                NsqFrame::Error(_payload) => {
                     let _ = outbound_tx.send(Vec::new());
                     drop(outbound_tx);
                     writer_task.abort();
@@ -537,9 +542,18 @@ fn de64_of(text: &str) -> Vec<u8> {
 
 /// The `IDENTIFY` frame with heartbeats disabled.
 fn identify_frame() -> Vec<u8> {
-    let body = serde_json::json!({"heartbeat_interval": -1, "client_id": "rushwind"})
-        .to_string()
-        .into_bytes();
+    // The heartbeat interval's honest zero: a negative value requests
+    // "no heartbeats" in a way the real nsqd refuses at SUB time
+    // (E_INVALID "cannot SUB with heartbeats disabled" — negative is
+    // simply not a legal spelling), while zero legitimately disables
+    // the server's heartbeat. The mock reproduces the refusal so the
+    // offline pins carry the same handshake contract.
+    let body = serde_json::json!({
+        "heartbeat_interval": 0,
+        "client_id": "rushwind",
+    })
+    .to_string()
+    .into_bytes();
     command_with_body("IDENTIFY", &[], &body)
 }
 
@@ -622,37 +636,45 @@ async fn read_frame(reader: &mut tokio::net::tcp::OwnedReadHalf) -> Result<NsqFr
     }
 }
 
-/// Reads the +OK response after a client command.
+/// Reads the OK response after a client command (the real nsqd's
+/// success body is plain "OK" — the live suite caught the mock's
+/// invented "+OK" spelling). Heartbeat frames (`_heartbeat_`) skip:
+/// nsqd's ioloop delivers them whenever its timer fires, and one can
+/// land between a command and its OK.
 async fn expect_ok(socket: &mut TcpStream) -> Result<(), BrokerError> {
-    let mut size_buf = [0u8; 4];
-    socket
-        .read_exact(&mut size_buf)
-        .await
-        .map_err(|e| BrokerError::Failed(format!("nsq handshake: {e}")))?;
-    let size = u32::from_be_bytes(size_buf) as usize;
-    if size < 4 {
-        return Err(BrokerError::Failed(
-            "nsq handshake: frame too short".to_string(),
-        ));
-    }
-    // Skip the 4-byte frame type, then the payload.
-    let mut type_buf = [0u8; 4];
-    socket
-        .read_exact(&mut type_buf)
-        .await
-        .map_err(|e| BrokerError::Failed(format!("nsq handshake: {e}")))?;
-    let mut payload = vec![0u8; size - 4];
-    socket
-        .read_exact(&mut payload)
-        .await
-        .map_err(|e| BrokerError::Failed(format!("nsq handshake: {e}")))?;
-    if payload.first() == Some(&b'+') {
-        Ok(())
-    } else {
-        Err(BrokerError::Failed(format!(
+    loop {
+        let mut size_buf = [0u8; 4];
+        socket
+            .read_exact(&mut size_buf)
+            .await
+            .map_err(|e| BrokerError::Failed(format!("nsq handshake: {e}")))?;
+        let size = u32::from_be_bytes(size_buf) as usize;
+        if size < 4 {
+            return Err(BrokerError::Failed(
+                "nsq handshake: frame too short".to_string(),
+            ));
+        }
+        // Skip the 4-byte frame type, then the payload.
+        let mut type_buf = [0u8; 4];
+        socket
+            .read_exact(&mut type_buf)
+            .await
+            .map_err(|e| BrokerError::Failed(format!("nsq handshake: {e}")))?;
+        let mut payload = vec![0u8; size - 4];
+        socket
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| BrokerError::Failed(format!("nsq handshake: {e}")))?;
+        if payload == b"_heartbeat_" {
+            continue;
+        }
+        if payload.starts_with(b"OK") {
+            return Ok(());
+        }
+        return Err(BrokerError::Failed(format!(
             "nsq handshake: {}",
             String::from_utf8_lossy(&payload)
-        )))
+        )));
     }
 }
 
