@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use rushwind_storage::{ColumnKind, Repository, Schema};
+use rushwind_storage::{Repository, Schema};
 use rushwind_storage_cassandra::CassandraRepo;
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -34,14 +34,10 @@ async fn live_repo(schema: Schema) -> Arc<dyn Repository> {
 
 /// A fresh, empty table for every suite test.
 async fn fresh_repo() -> Arc<dyn Repository> {
-    let mut schema = Schema::builder("widgets", "id")
-        .column("name", ColumnKind::Text)
-        .column("age", ColumnKind::Int)
-        .column("score", ColumnKind::Real)
-        .column("owner_id", ColumnKind::Int)
-        .column("unit_id", ColumnKind::Int)
-        .build()
-        .expect("suite schema is valid");
+    // The shared suite schema — the JSON column rides CQL as its
+    // canonical text column and reads back typed, the same shape the
+    // offline pins freeze.
+    let mut schema = rushwind_testkit::storage_conformance::suite_schema();
     schema.table = format!("widgets_live_{}", SEQ.fetch_add(1, Ordering::Relaxed));
     live_repo(schema).await
 }

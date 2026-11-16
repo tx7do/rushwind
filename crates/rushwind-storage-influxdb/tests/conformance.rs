@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use rushwind_storage::{ColumnKind, Repository, Schema};
+use rushwind_storage::{Repository, Schema};
 use rushwind_storage_influxdb::InfluxRepo;
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -20,26 +20,42 @@ async fn live_repo(schema: Schema) -> Arc<dyn Repository> {
     let url = std::env::var("INFLUXDB_URL").expect("INFLUXDB_URL must point at a running InfluxDB");
     let database = std::env::var("INFLUXDB_DB").unwrap_or_else(|_| "rushwind".to_owned());
     let repo = InfluxRepo::new(url.clone(), database.clone(), schema);
-    // Reset the measurement: a plain InfluxQL drop is 200-tolerant.
+    // Reset the measurement: the drop is 200-tolerant AND eventually
+    // consistent — the query returns before the shard removes the
+    // points, so a seed issued immediately reuses the previous run's
+    // primary keys (the live suite caught the collision). Poll
+    // SHOW MEASUREMENTS until the name is gone.
     let client = reqwest::Client::new();
     let _ = client
         .post(format!("{}/query?db={}", url, database))
         .form(&[("q", format!("DROP MEASUREMENT \"{}\"", repo.schema().table))])
         .send()
         .await;
+    for _ in 0..100 {
+        let listed = match client
+            .post(format!("{}/query?db={}", url, database))
+            .form(&[("q", "SHOW MEASUREMENTS".to_string())])
+            .send()
+            .await
+        {
+            Ok(response) => response.text().await.unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        let gone = !listed.contains(&format!("\"{}\"", repo.schema().table));
+        if gone {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     Arc::new(repo)
 }
 
 /// A fresh, empty measurement for every suite test.
 async fn fresh_repo() -> Arc<dyn Repository> {
-    let mut schema = Schema::builder("widgets", "id")
-        .column("name", ColumnKind::Text)
-        .column("age", ColumnKind::Int)
-        .column("score", ColumnKind::Real)
-        .column("owner_id", ColumnKind::Int)
-        .column("unit_id", ColumnKind::Int)
-        .build()
-        .expect("suite schema is valid");
+    // The shared suite schema — the JSON column rides the line
+    // protocol as its canonical text field and reads back typed, the
+    // same shape the offline pins freeze.
+    let mut schema = rushwind_testkit::storage_conformance::suite_schema();
     schema.table = format!("widgets_live_{}", SEQ.fetch_add(1, Ordering::Relaxed));
     live_repo(schema).await
 }
