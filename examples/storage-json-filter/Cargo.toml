@@ -1,0 +1,18 @@
+[package]
+name = "storage-json-filter"
+description = "RushWind storage demo: the JSON and regex filter faces (JSON_CONTAINS/ARRAY_CONTAINS/json_path/REGEXP) over two engines — including the dialect that honestly refuses."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rushwind-storage = { workspace = true }
+rushwind-storage-memory = { workspace = true }
+rushwind-storage-seaorm = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

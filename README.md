@@ -325,6 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `examples/mqtt-ingest` | MQTT 消费演示：对接外部 broker，信号驱动的干净退出 |
 | `examples/bootstrap-demo` | 装配演示：一份 YAML + memory 引擎工厂 + 路由包，起完整服务 |
 | `examples/storage-basics` | 同一段 Repository 代码跑内存与 SQLite 双引擎，输出逐行一致 |
+| `examples/storage-json-filter` | JSON/regex 过滤面演示：ARRAY_CONTAINS/JSON_CONTAINS/json_path 双引擎结果一致，REGEXP 在内存引擎命中、在 SQLite 如实拒绝（无 regexp 函数——拒绝而非静默收窄） |
 | `examples/vector-multi-engine` | 向量检索演示：同一段检索代码跑内存 + qdrant/milvus/weaviate/neo4j 四外部引擎（各自 `VECTOR_*_URL` 环境变量启用） |
 | `examples/broker-manual-ack` | `AckMode::Manual` 端到端演示（MQTT）：well-formed 消息 ack、毒 payload nack 重投、错误观察点不杀订阅 |
 | `examples/oss-multipart` | 分片上传演示：乱序部分按部分号组装、abort 零残留、S3 半场铸 presigned GET 免凭据拉取 |
