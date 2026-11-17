@@ -22,6 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 const CODE_SEND_MESSAGE: i64 = 10;
 const CODE_PULL_MESSAGE: i64 = 20;
 const CODE_UPDATE_CONSUMER_OFFSET: i64 = 15;
+const CODE_HEARTBEAT: i64 = 34;
 
 struct StoredMessage {
     body: Vec<u8>,
@@ -141,7 +142,7 @@ async fn serve(mock: Arc<RocketmqMock>, mut socket: TcpStream) {
         let ext = header.get("extFields").cloned().unwrap_or(Value::Null);
         let (code, ext_fields, remark, response_body) = dispatch(&mock, code, &ext, &body);
         eprintln!(
-            "[mock-dbg] code={code} body_len={} head={:02x?}",
+            "[mock-dbg] code={code} body_len={} head={:02x?} ext={ext}",
             response_body.len(),
             &response_body[..12.min(response_body.len())]
         );
@@ -162,9 +163,9 @@ fn dispatch(
 ) -> (i64, Value, Option<String>, Vec<u8>) {
     match code {
         CODE_SEND_MESSAGE => {
-            let topic = ext.get("Topic").and_then(Value::as_str).unwrap_or_default();
+            let topic = ext.get("topic").and_then(Value::as_str).unwrap_or_default();
             let properties = ext
-                .get("Properties")
+                .get("properties")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
@@ -195,7 +196,11 @@ fn dispatch(
         }
         CODE_PULL_MESSAGE => {
             let topic = ext.get("topic").and_then(Value::as_str).unwrap_or_default();
-            let offset = ext.get("offset").and_then(Value::as_i64).unwrap_or(0);
+            let offset = ext
+                .get("queueOffset")
+                .or_else(|| ext.get("offset"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
             let max = ext.get("maxMsgNums").and_then(Value::as_i64).unwrap_or(32);
             let mut inner = mock.inner.lock().expect("mock");
             let state = inner.topics.entry(topic.to_string()).or_default();
@@ -299,6 +304,7 @@ fn dispatch(
             inner.topics.entry(topic.to_string()).or_default().committed = commit;
             (0, json!({}), None, Vec::new())
         }
+        CODE_HEARTBEAT => (0, json!({}), None, Vec::new()),
         _ => (1, json!({}), Some("unknown code".to_string()), Vec::new()),
     }
 }

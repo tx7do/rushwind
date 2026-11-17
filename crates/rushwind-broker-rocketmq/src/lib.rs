@@ -100,6 +100,7 @@ use tokio::sync::{mpsc, Notify};
 const CODE_SEND_MESSAGE: i32 = 10;
 const CODE_PULL_MESSAGE: i32 = 20;
 const CODE_UPDATE_CONSUMER_OFFSET: i32 = 15;
+const CODE_HEARTBEAT: i32 = 34;
 /// The success response code.
 const CODE_SUCCESS: i64 = 0;
 
@@ -108,6 +109,11 @@ const CODE_SUCCESS: i64 = 0;
 pub struct RocketmqOptions {
     /// The broker address (`host:10911`).
     pub broker_addr: String,
+    /// The broker name the sends carry (broker 5.x's mapping context
+    /// consults it; default `broker-a`, the container's default).
+    pub broker_name: String,
+    /// The producer group every send declares.
+    pub producer_group: String,
     /// The consumer group every subscribe uses.
     pub consumer_group: String,
     /// The acknowledgment policy. Default [`AckMode::Auto`].
@@ -120,6 +126,8 @@ impl Default for RocketmqOptions {
     fn default() -> Self {
         Self {
             broker_addr: String::new(),
+            broker_name: "broker-a".to_string(),
+            producer_group: "rushwind".to_string(),
             consumer_group: "rushwind".to_string(),
             ack_mode: AckMode::Auto,
             request_timeout: Duration::from_secs(10),
@@ -193,6 +201,8 @@ impl RocketmqBroker {
             .map_err(|e| BrokerError::Failed(format!("settings parse: {e}")))?;
         Self::new(RocketmqOptions {
             broker_addr: wire.broker_addr,
+            broker_name: "broker-a".to_string(),
+            producer_group: "rushwind".to_string(),
             consumer_group: wire
                 .consumer_group
                 .unwrap_or_else(|| "rushwind".to_string()),
@@ -209,8 +219,11 @@ impl Broker for RocketmqBroker {
 
     fn connect(&self) -> BoxFuture<'_, Result<(), BrokerError>> {
         // Connectionless: each remoting call dials the broker. Connect
-        // is the lifecycle's live mark.
-        Box::pin(async { Ok(()) })
+        // re-arms the lifecycle mark after a disconnect.
+        Box::pin(async move {
+            self.inner.closed.store(false, Ordering::SeqCst);
+            Ok(())
+        })
     }
 
     fn disconnect(&self) -> BoxFuture<'_, Result<(), BrokerError>> {
@@ -245,13 +258,28 @@ impl Broker for RocketmqBroker {
                 properties.push('\u{0001}');
                 properties.push_str(value);
             }
+            // Broker 5.x's SendMessageProcessor consults the topic-queue
+            // mapping context before anything else — the mapping manager
+            // keys on the brokerName, so the field must ride every send
+            // (its absence NPEs the mapping lookup before the topic
+            // resolve).
+            // The field names ride the Java header's exact spellings
+            // (all-lowercase camelCase) — the broker's JSON header
+            // decoder matches the field names precisely, and the
+            // Title-Case spellings decode to null (the live suite's
+            // NPE at the topic-queue mapping lookup was getTopic()
+            // reading null).
             let ext_fields = json!({
-                "Topic": topic,
-                "QueueId": 0,
-                "SysFlag": 0,
-                "BornTimestamp": unix_now(),
-                "Flag": 0,
-                "Properties": properties,
+                "producerGroup": self.inner.options.producer_group,
+                "topic": topic,
+                "defaultTopic": "TBW102",
+                "defaultTopicQueueNums": 8,
+                "brokerName": self.inner.options.broker_name,
+                "queueId": 0,
+                "sysFlag": 0,
+                "bornTimestamp": unix_now(),
+                "flag": 0,
+                "properties": properties,
             });
             call(
                 &self.inner.options,
@@ -352,6 +380,43 @@ async fn run_pump(
 ) {
     let (settle_tx, mut settle_rx) = mpsc::unbounded_channel::<SettleCommand>();
     let mut next_offset = 0i64;
+    // The registration chain: the real broker refuses PULLs from
+    // unregistered consumer groups (the NPE the live suite caught) —
+    // the pump opens with a HEARTBEAT carrying the group's
+    // subscription.
+    let heartbeat_body = serde_json::json!({
+        "clientID": "rushwind",
+        "consumerGroupDataSet": [{
+            "group": engine.inner.options.consumer_group,
+            "consumeType": "CONSUME_PASSIVELY",
+            "messageModel": "CLUSTERING",
+            "fromWhere": 0,
+            "subscriptionDataSet": [{
+                "topic": topic,
+                "subString": "*",
+                "expressionType": "TAG",
+                "type": "SUBSCRIPTION",
+            }],
+        }],
+    })
+    .to_string()
+    .into_bytes();
+    let registered = call(
+        &engine.inner.options,
+        CODE_HEARTBEAT,
+        Value::Null,
+        Some(&heartbeat_body),
+        "heartbeat",
+    )
+    .await;
+    eprintln!(
+        "[hb] registered = {:?}",
+        registered.as_ref().map(|(h, _)| h.get("code"))
+    );
+    if let Err(error) = &registered {
+        eprintln!("[hb] registration failed: {error}");
+        return; // The registration failed; the dial loop's caller retries.
+    }
     loop {
         if shared.stopped.load(Ordering::SeqCst) {
             return;
@@ -360,7 +425,8 @@ async fn run_pump(
             _ = shared.done.notified() => return,
             pulled = pull_batch(&engine.inner.options, &topic, next_offset) => match pulled {
                 Ok(batch) => batch,
-                Err(_) => {
+                Err(e) => {
+                    eprintln!("[pull-err] {e}");
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }

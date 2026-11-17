@@ -19,6 +19,8 @@ use common::spawn_rocketmq;
 fn engine(addr: &str, ack_mode: AckMode) -> RocketmqBroker {
     RocketmqBroker::new(RocketmqOptions {
         broker_addr: addr.to_string(),
+        broker_name: "broker-a".to_string(),
+        producer_group: "rushwind".to_string(),
         consumer_group: "rushwind".to_string(),
         ack_mode,
         request_timeout: Duration::from_secs(5),
