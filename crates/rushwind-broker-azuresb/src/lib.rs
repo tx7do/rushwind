@@ -53,7 +53,7 @@ use hmac::{KeyInit, Mac};
 use rushwind_broker::{
     AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, NackAction, Subscriber,
 };
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex};
 
 /// The `BrokerProperties` header — the metadata envelope the REST
 /// face carries the message id and lock token in. HTTP header names
@@ -101,11 +101,13 @@ struct Inner {
 
 #[derive(Debug)]
 struct SubscriptionShared {
-    done: Arc<Notify>,
-    /// The subscription's stop flag: the pump checks it each loop and
-    /// the delivery face guards the in-flight receive (a delivery
-    /// arriving after the stop drops — a stopped subscription's
-    /// handler sees nothing).
+    /// The subscription's stop flag: the pump checks it at each loop
+    /// top — a checked flag, not a one-shot wakeup, because a wakeup
+    /// landing between the pump's loop iterations is lost (a
+    /// `notify_waiters` with no waiter registered) and the pump would
+    /// keep receiving past the unsubscribe — and the delivery face
+    /// guards the in-flight delivery (a delivery arriving after the
+    /// stop drops — a stopped subscription's handler sees nothing).
     stopped: std::sync::atomic::AtomicBool,
 }
 
@@ -374,7 +376,6 @@ impl Broker for AzureSbBroker {
                 shared
                     .stopped
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                shared.done.notify_waiters();
             }
             Ok(())
         })
@@ -439,9 +440,7 @@ impl Broker for AzureSbBroker {
             if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(BrokerError::NotConnected);
             }
-            let done = Arc::new(Notify::new());
             let shared = Arc::new(SubscriptionShared {
-                done: done.clone(),
                 stopped: std::sync::atomic::AtomicBool::new(false),
             });
             {
@@ -454,7 +453,6 @@ impl Broker for AzureSbBroker {
             });
             let topic_for_task = topic.to_string();
             let handler = Arc::clone(&handler);
-            let task_done = done.clone();
             let ack_mode = self.inner.options.ack_mode;
             let (settle_tx, mut settle_rx) =
                 mpsc::unbounded_channel::<(String, String, SettleAction)>();
@@ -468,33 +466,44 @@ impl Broker for AzureSbBroker {
                     {
                         return;
                     }
-                    tokio::select! {
-                        _ = task_done.notified() => return,
-                        settle = settle_rx.recv() => match settle {
-                            Some((message_id, lock_token, action)) => {
-                                let _ = engine.settle(&message_id, &lock_token, action).await;
-                            }
-                            None => return,
-                        },
-                        received = engine.receive_dispatch(
+                    if pump_shared
+                        .stopped
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                    // Settle everything pending BEFORE the next
+                    // receive: the settle and the receive never
+                    // overlap. A receive racing a settle (the select
+                    // shape) completes the settle first and drops the
+                    // in-flight receive — and the entity has already
+                    // peek-locked that message server-side, its lock
+                    // token orphaned with no delivery to settle: the
+                    // message stops redelivering (the lock self-expires
+                    // only after the minutes-long server window).
+                    while let Ok((message_id, lock_token, action)) = settle_rx.try_recv() {
+                        let _ = engine.settle(&message_id, &lock_token, action).await;
+                    }
+                    match engine
+                        .receive_dispatch(
                             &topic_for_task,
                             ack_mode,
                             &pump_shared,
                             settle_tx.clone(),
                             handler.clone(),
-                        ) => match received {
-                            Ok(()) => {}
-                            Err(_) => {
-                                tokio::time::sleep(Duration::from_millis(250)).await;
-                            }
-                        },
+                        )
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
                     }
                 }
             });
 
             Ok(Box::new(AzureSbSubscriber {
                 topic: topic.to_string(),
-                done,
                 shared: Arc::clone(&shared),
             }) as Box<dyn Subscriber>)
         })
@@ -602,7 +611,6 @@ impl AzureSbBroker {
 /// receive loop.
 struct AzureSbSubscriber {
     topic: String,
-    done: Arc<Notify>,
     shared: Arc<SubscriptionShared>,
 }
 
@@ -615,7 +623,6 @@ impl Subscriber for AzureSbSubscriber {
         self.shared
             .stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.done.notify_waiters();
         Box::pin(async { Ok(()) })
     }
 }

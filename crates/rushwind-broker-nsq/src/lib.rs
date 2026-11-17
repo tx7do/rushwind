@@ -562,7 +562,8 @@ fn pub_frame(topic: &str, body: &[u8]) -> Vec<u8> {
     command_with_body(&format!("PUB {topic}"), &[], body)
 }
 
-/// `FIN <message-id>`.
+/// `FIN <message-id>` — the id as nsqd minted it (16 ASCII text
+/// characters carried raw in the message frame).
 fn fin_frame(id: &str) -> Vec<u8> {
     format!("FIN {id}\n").into_bytes()
 }
@@ -593,8 +594,9 @@ enum NsqFrame {
     Response(Vec<u8>),
     Error(Vec<u8>),
     Message {
-        /// The 16-byte message id, hex-encoded — the settlement key
-        /// FIN/REQ speak.
+        /// The message id — nsqd's 16 ASCII text characters carried
+        /// raw in the frame — the settlement key FIN/REQ speak
+        /// verbatim.
         id: String,
         payload: Vec<u8>,
     },
@@ -624,7 +626,14 @@ async fn read_frame(reader: &mut tokio::net::tcp::OwnedReadHalf) -> Result<NsqFr
                     "nsq frame: message payload too short".to_string(),
                 ));
             }
-            let id = hex_encode(&payload[10..26]);
+            // The id's 16 bytes carry a 16-character ASCII-hex string
+            // (nsqd mints them as text) — FIN/REQ echo that text
+            // verbatim; a hex re-encode of the raw bytes spells 32
+            // characters and the real nsqd answers E_INVALID
+            // "invalid message ID" (a fatal error that kills the
+            // connection — the live suite caught the mock's lenient
+            // spelling).
+            let id = String::from_utf8_lossy(&payload[10..26]).into_owned();
             Ok(NsqFrame::Message {
                 id,
                 payload: payload[26..].to_vec(),
@@ -676,8 +685,4 @@ async fn expect_ok(socket: &mut TcpStream) -> Result<(), BrokerError> {
             String::from_utf8_lossy(&payload)
         )));
     }
-}
-
-fn hex_encode(data: &[u8]) -> String {
-    data.iter().map(|byte| format!("{byte:02x}")).collect()
 }

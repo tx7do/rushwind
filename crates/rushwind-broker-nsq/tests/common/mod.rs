@@ -28,11 +28,11 @@ struct NsqMockInner {
     queue: BTreeMap<String, VecDeque<Vec<u8>>>,
     /// topics with a live SUB.
     subscribed: BTreeSet<String>,
-    /// hex id → in-flight body (REQ restores the body to the queue).
+    /// id text → in-flight body (REQ restores the body to the queue).
     in_flight: BTreeMap<String, Vec<u8>>,
-    /// hex id → FIN count.
+    /// id text → FIN count.
     fins: BTreeMap<String, i64>,
-    /// hex id → REQ count.
+    /// id text → REQ count.
     requeues: BTreeMap<String, i64>,
     last_identify_heartbeat: Option<i64>,
     next_id: u64,
@@ -136,15 +136,16 @@ impl NsqMock {
             }
             for body in drained {
                 inner.next_id += 1;
-                let id_bytes = inner.next_id.to_be_bytes();
-                let mut id = [0u8; 16];
-                id[8..].copy_from_slice(&id_bytes);
-                let hex = id.iter().map(|b| format!("{b:02x}")).collect::<String>();
-                inner.in_flight.insert(hex.clone(), body.clone());
+                // The id rides the frame's 16 raw bytes, and the
+                // bytes carry a 16-character ASCII-hex string —
+                // nsqd's real shape, whose FIN/REQ echo the text
+                // verbatim (not a hex re-encode of the raw bytes).
+                let id = format!("{:016x}", inner.next_id);
+                inner.in_flight.insert(id.clone(), body.clone());
                 // [8-byte timestamp][2-byte attempts][16-byte id][body]
                 let mut payload = vec![0u8; 10];
                 payload[9] = 0;
-                payload.extend_from_slice(&id);
+                payload.extend_from_slice(id.as_bytes());
                 payload.extend_from_slice(&body);
                 let size = (4 + payload.len()) as u32;
                 let mut frame = size.to_be_bytes().to_vec();

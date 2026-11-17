@@ -27,7 +27,10 @@ async fn broker() -> RabbitmqBroker {
 
 /// The round trip: bind a wildcard routing key, publish onto a
 /// matching key, and receive payload plus headers — RabbitMQ carries
-/// the headers table, the one engine that does.
+/// the headers table, the one engine that does. The routing keys are
+/// unique per pin (the shared `amq.topic` exchange carries every
+/// pin's traffic, so overlapping keys would let parallel pins steal
+/// each other's messages — the nsq suite's per-pin-topic rule).
 #[tokio::test]
 async fn publish_subscribes_and_delivers() {
     let broker = broker().await;
@@ -35,7 +38,7 @@ async fn publish_subscribes_and_delivers() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let mut subscriber = broker
         .subscribe(
-            "orders.*.created",
+            "rushwind-live.rabbit.order.*.created",
             Arc::new(move |event| {
                 let tx = tx.clone();
                 Box::pin(async move {
@@ -46,12 +49,12 @@ async fn publish_subscribes_and_delivers() {
         )
         .await
         .expect("subscribe must succeed");
-    assert_eq!(subscriber.topic(), "orders.*.created");
+    assert_eq!(subscriber.topic(), "rushwind-live.rabbit.order.*.created");
 
     let mut message = Message::from_payload(b"hello".to_vec()).with_header("origin", "rushwind");
     message.id = "carried-not".to_string();
     broker
-        .publish("orders.1.created", message)
+        .publish("rushwind-live.rabbit.order.1.created", message)
         .await
         .expect("publish must succeed");
 
@@ -59,7 +62,7 @@ async fn publish_subscribes_and_delivers() {
         .await
         .expect("delivery arrives")
         .expect("channel open");
-    assert_eq!(event.topic(), "orders.1.created");
+    assert_eq!(event.topic(), "rushwind-live.rabbit.order.1.created");
     assert_eq!(event.message().payload, b"hello".to_vec());
     assert_eq!(
         event.message().headers.get("origin").map(String::as_str),
@@ -70,7 +73,7 @@ async fn publish_subscribes_and_delivers() {
 }
 
 /// Topic routing follows AMQP rules: `#` matches zero or more words,
-/// so a bare `orders.#` filter also receives a one-word-key publish.
+/// so a bare `…hash.#` filter also receives a one-word-key publish.
 #[tokio::test]
 async fn hash_filter_matches_one_word_keys() {
     let broker = broker().await;
@@ -78,7 +81,7 @@ async fn hash_filter_matches_one_word_keys() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let mut subscriber = broker
         .subscribe(
-            "orders.#",
+            "rushwind-live.rabbit.hash.#",
             Arc::new(move |event| {
                 let tx = tx.clone();
                 Box::pin(async move {
@@ -91,7 +94,10 @@ async fn hash_filter_matches_one_word_keys() {
         .expect("subscribe must succeed");
 
     broker
-        .publish("orders", Message::from_payload(b"bare".to_vec()))
+        .publish(
+            "rushwind-live.rabbit.hash",
+            Message::from_payload(b"bare".to_vec()),
+        )
         .await
         .expect("publish must succeed");
 
@@ -99,7 +105,7 @@ async fn hash_filter_matches_one_word_keys() {
         .await
         .expect("delivery arrives")
         .expect("channel open");
-    assert_eq!(event.topic(), "orders");
+    assert_eq!(event.topic(), "rushwind-live.rabbit.hash");
     subscriber.unsubscribe().await.expect("unsubscribe");
 }
 
