@@ -13,7 +13,6 @@ workspace = true
 [dependencies]
 rushwind-broker = { workspace = true }
 rushwind-transport = { workspace = true }
-base64 = "0.22"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros", "io-util"] }

@@ -68,9 +68,16 @@
 //! together), and `subVersion` — the PULL against stored messages
 //! answers FOUND (code 0) with the broker's own
 //! `nextBeginOffset`/`maxOffset` and the message bytes in the body.
-//! The port's remaining work is decoding that body — the messages
-//! ride the broker's REMOTING-serialized MessageExt list, a format
-//! this engine has not yet implemented.
+//! The pull body is decoded too: each record is `[SIZE(4, inclusive of
+//! itself)][MAGIC BODYCRC QUEUEID FLAG QUEUEOFFSET PHYSICALOFFSET
+//! SYSFLAG BORNTIMESTAMP BORNHOST STORETIMESTAMP STOREHOST
+//! RECONSUMETIMES PREPTX BODYLEN BODY TOPICLEN(1) TOPIC PROPLEN(2)
+//! PROPS]` and the stream concatenates records (stepping by SIZE) —
+//! the probe's PULL against the real broker carried exactly this
+//! layout with the message bytes and the properties string in place.
+//! What the live suite still needs is a real broker's PULL answering
+//! FOUND on the engine's own request shape (the send path verified
+//! earlier plus the registration chain) — the decoder is ready.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -81,7 +88,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::Engine as _;
 use rushwind_broker::{
     AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, NackAction, Subscriber,
 };
@@ -468,10 +474,13 @@ async fn pull_batch(
         "consumerGroup": options.consumer_group,
         "topic": topic,
         "queueId": 0,
+        "queueOffset": offset,
         "maxMsgNums": 32,
-        "sysFlag": 0,
+        "sysFlag": 7,
         "offset": offset,
         "subExpression": "*",
+        "subVersion": (unix_now() * 1000) as i64,
+        "requestSource": 0,
     });
     let (header, body) = call(
         options,
@@ -481,7 +490,6 @@ async fn pull_batch(
         &format!("pull {topic}"),
     )
     .await?;
-    let _ = body;
     let ext = header.get("extFields").cloned().unwrap_or(Value::Null);
     let pull_status = ext
         .get("pullStatus")
@@ -494,24 +502,51 @@ async fn pull_batch(
         .unwrap_or(offset);
     let mut deliveries = Vec::new();
     if pull_status == "FOUND" {
-        if let Some(list) = ext.get("msgFoundList").and_then(Value::as_array) {
-            for entry in list {
-                let Some(body_b64) = entry.get("body").and_then(Value::as_str) else {
-                    continue;
-                };
-                let payload = de64(body_b64);
-                let mut message = Message::from_payload(payload);
-                if let Some(properties) = entry.get("properties").and_then(Value::as_object) {
-                    for (key, value) in properties {
-                        if let Some(value) = value.as_str() {
-                            message.headers.insert(key.clone(), value.to_string());
-                        }
-                    }
-                }
-                deliveries.push(Delivery { message });
+        // The FOUND body rides the broker's raw CommitLog records: each
+        // is `[SIZE(4, inclusive of itself)][MAGIC BODYCRC QUEUEID FLAG
+        // QUEUEOFFSET PHYSICALOFFSET SYSFLAG BORNTIMESTAMP BORNHOST
+        // STORETIMESTAMP STOREHOST RECONSUMETIMES PREPTX BODYLEN BODY
+        // TOPICLEN(1) TOPIC PROPLEN(2) PROPS]`, and the stream simply
+        // concatenates the records (stepping by SIZE). BODYLEN sits at
+        // cursor[84] (SIZE 4 + the record's first 80 bytes), the payload
+        // at 88..88+BODYLEN, and the properties string (the
+        // KEY\u0001VALUE pairs joined by \u0002) right before the
+        // record's end.
+        let mut cursor = body.as_slice();
+        while cursor.len() >= 4 {
+            let size = u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]) as usize;
+            if size < 88 || size > cursor.len() {
+                break;
             }
+            let body_len =
+                u32::from_be_bytes([cursor[84], cursor[85], cursor[86], cursor[87]]) as usize;
+            let Some(topic_len) = cursor.get(88 + body_len).copied().map(usize::from) else {
+                break;
+            };
+            // TOPICLEN rides 1 byte at 88+BODYLEN, TOPIC follows, and
+            // the properties length (2 bytes) sits after the topic.
+            let props_pos = 89 + body_len + topic_len;
+            let Some(props_len) = cursor
+                .get(props_pos..props_pos + 2)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+            else {
+                break;
+            };
+            let payload = cursor[88..88 + body_len].to_vec();
+            let properties_raw = &cursor[props_pos + 2..props_pos + 2 + props_len];
+            let mut message = Message::from_payload(payload);
+            for pair in properties_raw.split(|b| *b == 2u8) {
+                if let Some(separator) = pair.iter().position(|b| *b == 1u8) {
+                    let key = String::from_utf8_lossy(&pair[..separator]).to_string();
+                    let value = String::from_utf8_lossy(&pair[separator + 1..]).to_string();
+                    message.headers.insert(key, value);
+                }
+            }
+            deliveries.push(Delivery { message });
+            cursor = &cursor[size..];
         }
     }
+    eprintln!("[pd] status={pull_status} deliveries={}", deliveries.len());
     Ok(PullBatch {
         deliveries,
         next_begin_offset,
@@ -670,12 +705,6 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or_default()
-}
-
-fn de64(text: &str) -> Vec<u8> {
-    base64::engine::general_purpose::STANDARD
-        .decode(text)
         .unwrap_or_default()
 }
 

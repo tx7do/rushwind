@@ -2,7 +2,7 @@
 //! subset the engine uses — SEND_MESSAGE stores into an in-memory
 //! topic queue (the properties string parsed back into a map),
 //! PULL_MESSAGE serves bounded windows with `pullStatus`/`nextBeginOffset`/
-//! `msgFoundList` (base64 body, properties, queueOffset),
+//! body in the response body as raw CommitLog records,
 //! UPDATE_CONSUMER_OFFSET records the commit. One connection per
 //! remoting call (the engine is connectionless), each handled
 //! independently.
@@ -15,7 +15,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -140,8 +139,13 @@ async fn serve(mock: Arc<RocketmqMock>, mut socket: TcpStream) {
         let code = header.get("code").and_then(Value::as_i64).unwrap_or(-1);
         let opaque = header.get("opaque").and_then(Value::as_i64).unwrap_or(0);
         let ext = header.get("extFields").cloned().unwrap_or(Value::Null);
-        let (code, ext_fields, remark) = dispatch(&mock, code, &ext, &body);
-        let response = response_frame(code, opaque, &ext_fields, remark.as_deref());
+        let (code, ext_fields, remark, response_body) = dispatch(&mock, code, &ext, &body);
+        eprintln!(
+            "[mock-dbg] code={code} body_len={} head={:02x?}",
+            response_body.len(),
+            &response_body[..12.min(response_body.len())]
+        );
+        let response = response_frame(code, opaque, &ext_fields, remark.as_deref(), &response_body);
         if socket.write_all(&response).await.is_err() {
             return;
         }
@@ -155,7 +159,7 @@ fn dispatch(
     code: i64,
     ext: &Value,
     body: &[u8],
-) -> (i64, Value, Option<String>) {
+) -> (i64, Value, Option<String>, Vec<u8>) {
     match code {
         CODE_SEND_MESSAGE => {
             let topic = ext.get("Topic").and_then(Value::as_str).unwrap_or_default();
@@ -166,7 +170,7 @@ fn dispatch(
                 .to_string();
             let reject = mock.inner.lock().expect("mock").send_reject.clone();
             if let Some(remark) = reject {
-                return (1, json!({}), Some(remark));
+                return (1, json!({}), Some(remark), Vec::new());
             }
             let mut inner = mock.inner.lock().expect("mock");
             let state = inner.topics.entry(topic.to_string()).or_default();
@@ -186,6 +190,7 @@ fn dispatch(
                     "msgId": "0A00000000000000000000000000",
                 }),
                 None,
+                Vec::new(),
             )
         }
         CODE_PULL_MESSAGE => {
@@ -198,19 +203,18 @@ fn dispatch(
             let len = state.messages.len() as i64;
             let start = offset.clamp(0, len) as usize;
             let end = ((offset + max).clamp(0, len)) as usize;
-            let served: Vec<Value> = state
+            // The real broker carries the FOUND messages in the
+            // response BODY as raw CommitLog records (the storage-layer
+            // V1 layout: TOTALSIZE MAGIC BODYCRC QUEUEID FLAG
+            // QUEUEOFFSET PHYSICALOFFSET SYSFLAG BORNTIMESTAMP BORNHOST
+            // STORETIMESTAMP STOREHOST RECONSUMETIMES PREPTX BODYLEN
+            // BODY TOPICLEN(1) TOPIC PROPLEN(2) PROPS) — the mock
+            // renders the same shape the engine decodes.
+            let served: Vec<&StoredMessage> = state
                 .messages
                 .iter()
-                .enumerate()
                 .skip(start)
                 .take(end.saturating_sub(start))
-                .map(|(index, message)| {
-                    json!({
-                        "body": base64::engine::general_purpose::STANDARD.encode(&message.body),
-                        "properties": message.properties,
-                        "queueOffset": index,
-                    })
-                })
                 .collect();
             if served.is_empty() {
                 (
@@ -222,9 +226,56 @@ fn dispatch(
                         "maxOffset": len,
                     }),
                     None,
+                    Vec::new(),
                 )
             } else {
                 let next = start as i64 + served.len() as i64;
+                let mut body_out = Vec::new();
+                for (position, message) in served.iter().enumerate() {
+                    let properties_string: String = message
+                        .properties
+                        .iter()
+                        .map(|(key, value)| format!("{key}\u{0001}{value}"))
+                        .collect::<Vec<_>>()
+                        .join("\u{0002}");
+                    let body_len = message.body.len() as i32;
+                    let topic_len = topic.len() as u8;
+                    let props_len = properties_string.len() as u16;
+                    // SIZE is inclusive: it counts its own 4 bytes plus
+                    // magic..props (80-byte fixed header, 4-byte body
+                    // length, body, 1-byte topic length, topic, 2-byte
+                    // properties length, properties).
+                    let store_size = (4
+                        + 80
+                        + 4
+                        + body_len as usize
+                        + 1
+                        + topic_len as usize
+                        + 2
+                        + props_len as usize) as i32;
+                    body_out.extend_from_slice(&store_size.to_be_bytes());
+                    body_out.extend_from_slice(&0xdaa32fa7u32.to_be_bytes()); // V1 magic
+                    body_out.extend_from_slice(&0u32.to_be_bytes()); // bodyCRC
+                    body_out.extend_from_slice(&0i32.to_be_bytes()); // queueId
+                    body_out.extend_from_slice(&0i32.to_be_bytes()); // flag
+                    body_out.extend_from_slice(&((start as i64 + position as i64).to_be_bytes()));
+                    body_out.extend_from_slice(&0i64.to_be_bytes()); // physicalOffset
+                    body_out.extend_from_slice(&0i32.to_be_bytes()); // sysFlag
+                    body_out.extend_from_slice(&0i64.to_be_bytes()); // bornTimestamp
+                    body_out.extend_from_slice(&[127, 0, 0, 1]); // bornHost ip
+                    body_out.extend_from_slice(&0i32.to_be_bytes()); // bornHost port
+                    body_out.extend_from_slice(&0i64.to_be_bytes()); // storeTimestamp
+                    body_out.extend_from_slice(&[127, 0, 0, 1]); // storeHost ip
+                    body_out.extend_from_slice(&0i32.to_be_bytes()); // storeHost port
+                    body_out.extend_from_slice(&0i32.to_be_bytes()); // reconsumeTimes
+                    body_out.extend_from_slice(&0i64.to_be_bytes()); // preparedTxOffset
+                    body_out.extend_from_slice(&body_len.to_be_bytes());
+                    body_out.extend_from_slice(&message.body);
+                    body_out.push(topic_len);
+                    body_out.extend_from_slice(topic.as_bytes());
+                    body_out.extend_from_slice(&props_len.to_be_bytes());
+                    body_out.extend_from_slice(properties_string.as_bytes());
+                }
                 (
                     0,
                     json!({
@@ -232,9 +283,9 @@ fn dispatch(
                         "nextBeginOffset": next,
                         "minOffset": 0,
                         "maxOffset": len,
-                        "msgFoundList": served,
                     }),
                     None,
+                    body_out,
                 )
             }
         }
@@ -246,9 +297,9 @@ fn dispatch(
                 .unwrap_or_default();
             let mut inner = mock.inner.lock().expect("mock");
             inner.topics.entry(topic.to_string()).or_default().committed = commit;
-            (0, json!({}), None)
+            (0, json!({}), None, Vec::new())
         }
-        _ => (1, json!({}), Some("unknown code".to_string())),
+        _ => (1, json!({}), Some("unknown code".to_string()), Vec::new()),
     }
 }
 
@@ -268,7 +319,13 @@ fn parse_properties(properties: &str) -> BTreeMap<String, String> {
 }
 
 /// Builds the remoting response frame (JSON serialization, no body).
-fn response_frame(code: i64, opaque: i64, ext_fields: &Value, remark: Option<&str>) -> Vec<u8> {
+fn response_frame(
+    code: i64,
+    opaque: i64,
+    ext_fields: &Value,
+    remark: Option<&str>,
+    body: &[u8],
+) -> Vec<u8> {
     let header = json!({
         "code": code,
         "language": "JAVA",
@@ -284,9 +341,10 @@ fn response_frame(code: i64, opaque: i64, ext_fields: &Value, remark: Option<&st
     // The total covers everything after the total field itself: the
     // header-length field (serialize type 0 in its high byte) and the
     // header.
-    let total = 4 + header_len;
+    let total = 4 + header_len + body.len() as u32;
     let mut frame = total.to_be_bytes().to_vec();
     frame.extend_from_slice(&header_len.to_be_bytes());
     frame.extend_from_slice(&header);
+    frame.extend_from_slice(body);
     frame
 }
