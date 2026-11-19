@@ -16,4 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # cargo-deny-action 的默认工具链是 musl 静态构建，而 rust-toolchain.toml
+      # 钉的是 host 默认的 stable——rustup 解析到 toolchain 文件后找不到该
+      # override，deny 一步在装完即报 "uninstalled toolchain"。显式对齐。
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          toolchain: stable

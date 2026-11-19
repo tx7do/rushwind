@@ -27,6 +27,12 @@ ignore = [
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.37 via sqlx-sqlite 0.9.0 under sea-orm 2.0.4; sqlx 0.9.0 is the newest release and caps the requirement at ^0.37, so 0.39.x is unreachable until sqlx ships it" },
     # serde_yaml 0.9 (deprecated) -> unsafe-libyaml, its parser backend
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained with no fixed release; it rides in through serde_yaml 0.9, itself deprecated upstream — re-evaluate on a serde_yaml successor" },
+    # chrono unmaintained (RUSTSEC-2026-0543): rides in through sea-orm/sqlx's
+    # time stack, the storage ecosystem this workspace is built on — no
+    # dependency bump inside the workspace can remove it, and switching the
+    # storage stack to a successor (jiff/time) is an upstream sea-orm decision.
+    # Re-evaluate when sea-orm ships a chrono-free release.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained via sea-orm/sqlx's date-time stack; the replacement (jiff/time) is a storage-ecosystem migration, not a workspace dependency bump" },
 ]
 
 [licenses]
