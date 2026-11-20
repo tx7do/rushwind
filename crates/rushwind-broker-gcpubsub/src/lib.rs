@@ -22,19 +22,34 @@
 //!   message eligible for immediate redelivery, the honest Requeue.
 //!   A [`NackAction::Drop`] under Manual acknowledges the poison
 //!   message away (settled, never redelivered).
+//! - The pull pump is a sequential loop: the checked `stopped` flag is
+//!   read at every loop top and before every dispatch, every pending
+//!   settle drains before the next pull, and one pull runs to
+//!   completion — a stop (unsubscribe, drop of the handle, or
+//!   disconnect) lands at the next loop top regardless of timing, and
+//!   a delivery already pulled when the stop lands is dropped without
+//!   dispatch (its ack deadline redelivers it server-side). A
+//!   duplicate subscribe retires the previous pump — the newest
+//!   handler owns the filter, the rabbitmq/redis shape. Settles
+//!   enqueued by handlers whose pump has already exited fail with a
+//!   clear error: the message redelivers after its ack deadline.
 //! - **Auth** is a bearer token the deployment supplies
 //!   ([`GcpPubSubOptions::token`]) — obtaining and refreshing the
 //!   service-account token is the deployment's business (mirroring
 //!   the OIDC engine's stance: the engine consumes credentials, the
 //!   deployment owns their lifecycle).
-//! - Base64 payloads decode/encode at the engine boundary; header
-//!   maps pass through as Pub/Sub attributes.
+//! - Base64 payloads decode/encode at the engine boundary; a body
+//!   that does not decode as the envelope rides as its own bytes (a
+//!   foreign producer's raw data — failing the batch instead would
+//!   starve the subscription on one undecodable message). Header maps
+//!   pass through as Pub/Sub attributes.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,7 +58,7 @@ use rushwind_broker::{
     AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, NackAction, Subscriber,
 };
 use serde_json::json;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex};
 
 /// The default REST endpoint; a mock or emulator overrides it.
 const DEFAULT_ENDPOINT: &str = "https://pubsub.googleapis.com";
@@ -51,6 +66,10 @@ const DEFAULT_ENDPOINT: &str = "https://pubsub.googleapis.com";
 /// The per-pull message cap — bounded so the pump stays
 /// cancellation-responsive and a burst cannot stall shutdown.
 const PULL_BATCH: i64 = 32;
+
+/// The pull loop's empty-poll spacing: with `returnImmediately: true`
+/// an empty subscription would otherwise hot-poll the endpoint.
+const EMPTY_PULL_BACKOFF: Duration = Duration::from_millis(200);
 
 /// The engine's settings.
 #[derive(Debug, Clone)]
@@ -91,13 +110,18 @@ impl Default for GcpPubSubOptions {
 struct Inner {
     options: GcpPubSubOptions,
     http: reqwest::Client,
-    closed: std::sync::atomic::AtomicBool,
+    closed: AtomicBool,
     subscriptions: Mutex<HashMap<String, Arc<SubscriptionShared>>>,
 }
 
+/// One subscription's stop face. A checked flag — read at the pump's
+/// loop top and before every dispatch — not a wakeup: a notify-style
+/// signal landing between the pump's await points would be lost, and
+/// the pump would keep pulling (and, under Auto, acknowledging)
+/// messages for a subscription that was unsubscribed.
 #[derive(Debug)]
 struct SubscriptionShared {
-    done: Arc<Notify>,
+    stopped: AtomicBool,
 }
 
 /// The Google Cloud Pub/Sub broker.
@@ -126,7 +150,7 @@ impl GcpPubSubBroker {
         Ok(Self {
             inner: Arc::new(Inner {
                 http: reqwest::Client::new(),
-                closed: std::sync::atomic::AtomicBool::new(false),
+                closed: AtomicBool::new(false),
                 subscriptions: Mutex::new(HashMap::new()),
                 options,
             }),
@@ -251,12 +275,10 @@ impl Broker for GcpPubSubBroker {
 
     fn disconnect(&self) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
-            self.inner
-                .closed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.inner.closed.store(true, Ordering::SeqCst);
             let subscriptions = self.inner.subscriptions.lock().await;
             for shared in subscriptions.values() {
-                shared.done.notify_waiters();
+                shared.stopped.store(true, Ordering::SeqCst);
             }
             Ok(())
         })
@@ -268,7 +290,7 @@ impl Broker for GcpPubSubBroker {
         message: Message,
     ) -> BoxFuture<'a, Result<(), BrokerError>> {
         Box::pin(async move {
-            if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.inner.closed.load(Ordering::SeqCst) {
                 return Err(BrokerError::NotConnected);
             }
             let data = base64::engine::general_purpose::STANDARD.encode(&message.payload);
@@ -301,119 +323,150 @@ impl Broker for GcpPubSubBroker {
         handler: Handler,
     ) -> BoxFuture<'a, Result<Box<dyn Subscriber>, BrokerError>> {
         Box::pin(async move {
-            if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.inner.closed.load(Ordering::SeqCst) {
                 return Err(BrokerError::NotConnected);
             }
-            let done = Arc::new(Notify::new());
-            let shared = Arc::new(SubscriptionShared { done: done.clone() });
+            let shared = Arc::new(SubscriptionShared {
+                stopped: AtomicBool::new(false),
+            });
             {
                 let mut subscriptions = self.inner.subscriptions.lock().await;
+                // A duplicate subscribe retires the old pump — the
+                // rabbitmq/redis engines' same-topic shape: the newest
+                // handler owns the filter, and the previous pump exits at
+                // its next loop top instead of leaking past the
+                // overwritten registry entry.
+                if let Some(previous) = subscriptions.get(topic) {
+                    previous.stopped.store(true, Ordering::SeqCst);
+                }
                 subscriptions.insert(topic.to_string(), Arc::clone(&shared));
             }
 
             let engine = Arc::new(self.clone_inner());
             let topic_for_task = topic.to_string();
             let handler = Arc::clone(&handler);
-            let task_done = done.clone();
             let ack_mode = self.inner.options.ack_mode;
             // Manual settlement rides this channel back to the pump —
             // the settle calls need the engine's &self, which only the
             // pump holds.
+            let shared_for_handle = Arc::clone(&shared);
             let (settle_tx, settle_rx) = mpsc::unbounded_channel::<(String, SettleAction)>();
             tokio::spawn(async move {
                 let mut settle_rx = settle_rx;
                 loop {
-                    let closed = engine
-                        .inner
-                        .closed
-                        .load(std::sync::atomic::Ordering::SeqCst);
-                    if closed {
+                    // The checked stop, read at every loop top: there is
+                    // no wakeup to lose — the flag is the signal, so a
+                    // stop landing between the pump's await points takes
+                    // effect here regardless of timing.
+                    if engine.inner.closed.load(Ordering::SeqCst)
+                        || shared.stopped.load(Ordering::SeqCst)
+                    {
                         return;
                     }
-                    tokio::select! {
-                        _ = task_done.notified() => return,
-                        settle = settle_rx.recv() => match settle {
-                            Some((ack_id, action)) => {
-                                let _ = engine.settle(&ack_id, action).await;
-                            }
-                            None => return,
-                        },
-                        pulled = engine.pull_once(&topic_for_task, settle_tx.clone()) => match pulled {
-                            Ok(deliveries) => {
-                                for delivery in deliveries {
-                                    match ack_mode {
-                                        AckMode::Auto => {
-                                            let event = Event::new(
-                                                delivery.topic.clone(),
-                                                delivery.message.clone(),
-                                            );
-                                            tokio::spawn(handler(event));
-                                            let _ = engine
-                                                .settle(&delivery.ack_id, SettleAction::Ack)
-                                                .await;
-                                        }
-                                        AckMode::Manual => {
-                                            let ack_tx = delivery.settle_tx.clone();
-                                            let ack_id = delivery.ack_id.clone();
-                                            let nack_tx = delivery.settle_tx.clone();
-                                            let nack_id = delivery.ack_id.clone();
-                                            let event = Event::settle_with(
-                                                delivery.topic.clone(),
-                                                delivery.message.clone(),
-                                                move || {
-                                                    let tx = ack_tx.clone();
-                                                    let id = ack_id.clone();
-                                                    Box::pin(async move {
-                                                        tx.send((id, SettleAction::Ack))
-                                                            .map_err(|e| BrokerError::Failed(
-                                                                format!("gcpubsub settle: {e}"),
-                                                            ))
+                    // Every pending settle drains before the next pull:
+                    // settles and pulls never overlap and no settle is
+                    // abandoned mid-request. A settle enqueued while the
+                    // pull is in flight waits for the next loop top —
+                    // the pull is never cancelled under it.
+                    while let Ok((ack_id, action)) = settle_rx.try_recv() {
+                        let _ = engine.settle(&ack_id, action).await;
+                    }
+                    match engine.pull_once(&topic_for_task, settle_tx.clone()).await {
+                        Ok(deliveries) if deliveries.is_empty() => {
+                            tokio::time::sleep(EMPTY_PULL_BACKOFF).await;
+                        }
+                        Ok(deliveries) => {
+                            for delivery in deliveries {
+                                // The delivery-face stop: a delivery already
+                                // pulled when the stop lands is dropped
+                                // without dispatch — the destructive Auto
+                                // acknowledge must not run for a stopped
+                                // subscription, and under Manual the event
+                                // would settle into a channel no pump drains
+                                // anymore. The message's ack deadline
+                                // redelivers it server-side.
+                                if shared.stopped.load(Ordering::SeqCst)
+                                    || engine.inner.closed.load(Ordering::SeqCst)
+                                {
+                                    break;
+                                }
+                                match ack_mode {
+                                    AckMode::Auto => {
+                                        let event = Event::new(
+                                            delivery.topic.clone(),
+                                            delivery.message.clone(),
+                                        );
+                                        tokio::spawn(handler(event));
+                                        let _ = engine
+                                            .settle(&delivery.ack_id, SettleAction::Ack)
+                                            .await;
+                                    }
+                                    AckMode::Manual => {
+                                        let ack_tx = delivery.settle_tx.clone();
+                                        let ack_id = delivery.ack_id.clone();
+                                        let nack_tx = delivery.settle_tx.clone();
+                                        let nack_id = delivery.ack_id.clone();
+                                        let event = Event::settle_with(
+                                            delivery.topic.clone(),
+                                            delivery.message.clone(),
+                                            move || {
+                                                let tx = ack_tx.clone();
+                                                let id = ack_id.clone();
+                                                Box::pin(async move {
+                                                    tx.send((id, SettleAction::Ack)).map_err(|e| {
+                                                        BrokerError::Failed(format!(
+                                                            "gcpubsub settle: {e}"
+                                                        ))
                                                     })
-                                                        as BoxFuture<'static, Result<(), BrokerError>>
-                                                },
-                                                move |action| {
-                                                    let tx = nack_tx.clone();
-                                                    let id = nack_id.clone();
-                                                    Box::pin(async move {
-                                                        let settled = match action {
-                                                            // No NACK frame in
-                                                            // Pub/Sub: a zeroed
-                                                            // ack deadline makes
-                                                            // the message
-                                                            // immediately
-                                                            // redeliverable.
-                                                            NackAction::Requeue => SettleAction::Requeue,
-                                                            // Settled away —
-                                                            // acknowledged, never
-                                                            // redelivered.
-                                                            NackAction::Drop => SettleAction::Ack,
-                                                        };
-                                                        tx.send((id, settled))
-                                                            .map_err(|e| BrokerError::Failed(
-                                                                format!("gcpubsub settle: {e}"),
-                                                            ))
+                                                })
+                                                    as BoxFuture<'static, Result<(), BrokerError>>
+                                            },
+                                            move |action| {
+                                                let tx = nack_tx.clone();
+                                                let id = nack_id.clone();
+                                                Box::pin(async move {
+                                                    let settled = match action {
+                                                        // No NACK frame in
+                                                        // Pub/Sub: a zeroed
+                                                        // ack deadline makes
+                                                        // the message
+                                                        // immediately
+                                                        // redeliverable.
+                                                        NackAction::Requeue => {
+                                                            SettleAction::Requeue
+                                                        }
+                                                        // Settled away —
+                                                        // acknowledged, never
+                                                        // redelivered.
+                                                        NackAction::Drop => SettleAction::Ack,
+                                                    };
+                                                    tx.send((id, settled)).map_err(|e| {
+                                                        BrokerError::Failed(format!(
+                                                            "gcpubsub settle: {e}"
+                                                        ))
                                                     })
-                                                        as BoxFuture<'static, Result<(), BrokerError>>
-                                                },
-                                            );
-                                            tokio::spawn(handler(event));
-                                        }
+                                                })
+                                                    as BoxFuture<'static, Result<(), BrokerError>>
+                                            },
+                                        );
+                                        tokio::spawn(handler(event));
                                     }
                                 }
                             }
-                            // A transient pull failure backs off briefly;
-                            // the loop keeps pulling.
-                            Err(_) => {
-                                tokio::time::sleep(Duration::from_millis(250)).await;
-                            }
-                        },
+                        }
+                        // A transient pull failure backs off briefly; the
+                        // loop keeps pulling.
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
                     }
                 }
             });
 
             Ok(Box::new(GcpPubSubSubscriber {
                 topic: topic.to_string(),
-                done,
+                shared: shared_for_handle,
+                inner: Arc::clone(&self.inner),
             }) as Box<dyn Subscriber>)
         })
     }
@@ -489,9 +542,16 @@ impl GcpPubSubBroker {
                 .get("data")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let payload = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .map_err(|e| BrokerError::Failed(format!("gcpubsub payload decode: {e}")))?;
+            let payload = match base64::engine::general_purpose::STANDARD.decode(data) {
+                Ok(bytes) => bytes,
+                // Not the engine's envelope: a foreign producer's raw
+                // data rides as its own bytes. Failing the batch here
+                // would starve the whole subscription — one undecodable
+                // message would redeliver forever (its ack deadline
+                // keeps lapsing) and nothing after it would ever get
+                // through.
+                Err(_) => data.as_bytes().to_vec(),
+            };
             let mut message = Message::from_payload(payload);
             if let Some(attributes) = message_body.get("attributes").and_then(Value::as_object) {
                 for (key, value) in attributes {
@@ -516,11 +576,32 @@ impl GcpPubSubBroker {
     }
 }
 
-/// The subscription handle: dropping it (or calling unsubscribe)
-/// stops the pull loop.
+/// The subscription handle. `unsubscribe` stops the pull loop
+/// authoritatively; dropping it stops the same loop best-effort — the
+/// registry's lock may be contended at drop time, in which case only
+/// the explicit call is guaranteed.
 struct GcpPubSubSubscriber {
     topic: String,
-    done: Arc<Notify>,
+    shared: Arc<SubscriptionShared>,
+    inner: Arc<Inner>,
+}
+
+impl GcpPubSubSubscriber {
+    /// Stops the pump this handle owns, if it still owns the registry
+    /// entry: a duplicate subscribe replaces the entry, and a stale
+    /// handle's teardown must then touch nothing — stopping the
+    /// replacement's pump would orphan its deliveries.
+    async fn stop_owned(&self) {
+        let mut subscriptions = self.inner.subscriptions.lock().await;
+        let owned = subscriptions
+            .get(&self.topic)
+            .map(|current| Arc::ptr_eq(current, &self.shared))
+            .unwrap_or(false);
+        if owned {
+            self.shared.stopped.store(true, Ordering::SeqCst);
+            subscriptions.remove(&self.topic);
+        }
+    }
 }
 
 impl Subscriber for GcpPubSubSubscriber {
@@ -529,8 +610,28 @@ impl Subscriber for GcpPubSubSubscriber {
     }
 
     fn unsubscribe(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
-        self.done.notify_waiters();
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.stop_owned().await;
+            Ok(())
+        })
+    }
+}
+
+impl Drop for GcpPubSubSubscriber {
+    fn drop(&mut self) {
+        // The best-effort half of the stop contract: try_lock fails
+        // under an active holder, and only the explicit unsubscribe
+        // guarantees the stop.
+        if let Ok(mut subscriptions) = self.inner.subscriptions.try_lock() {
+            let owned = subscriptions
+                .get(&self.topic)
+                .map(|current| Arc::ptr_eq(current, &self.shared))
+                .unwrap_or(false);
+            if owned {
+                self.shared.stopped.store(true, Ordering::SeqCst);
+                subscriptions.remove(&self.topic);
+            }
+        }
     }
 }
 

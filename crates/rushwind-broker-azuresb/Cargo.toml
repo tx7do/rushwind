@@ -23,4 +23,5 @@ base64 = "0.22"
 percent-encoding = "2"
 
 [dev-dependencies]
+rushwind-testkit = { workspace = true, features = ["broker"] }
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }

@@ -1,15 +1,18 @@
 //! An in-process mock of the SQS Query API subset the engine speaks —
 //! SendMessage into an in-memory queue, ReceiveMessage (visibility
-//! timeout semantics), DeleteMessage, ChangeMessageVisibility. Form
-//! bodies parsed; signatures accepted (the signing chain is pinned
-//! separately against the reference vector).
+//! timeout semantics with a real in-flight table), DeleteMessage,
+//! ChangeMessageVisibility. Form bodies parsed; signatures accepted
+//! (the signing chain is pinned separately against the reference
+//! vector). Responses render XML-escaped text the way the real service
+//! does, and carry `MD5OfBody`, so the engine's decode path (entities,
+//! integrity check, base64 envelope) runs end to end.
 
 #![cfg(test)]
 // The shared mock compiles into every test crate; the pins a given
 // crate does not use read as dead code there.
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
@@ -19,6 +22,29 @@ struct Received {
     attributes: Vec<(String, String)>,
 }
 
+/// XML text-node escaping, the way the real responses render text.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Hex MD5 — the response's body-integrity digest, over the unescaped
+/// body string (the same input the engine verifies against).
+fn md5_hex(data: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[derive(Default)]
 pub struct SqsMock {
     inner: Mutex<SqsMockInner>,
@@ -26,12 +52,24 @@ pub struct SqsMock {
 
 #[derive(Default)]
 struct SqsMockInner {
+    /// Visible messages, in queue order.
     queue: VecDeque<Received>,
+    /// receipt handle → the message sitting in flight (received,
+    /// visibility running). Delete removes it; a zeroed visibility
+    /// returns it to the queue — SQS's requeue.
+    in_flight: BTreeMap<String, Received>,
     /// receipt handle → deleted count (the settle pins read it).
-    deleted: std::collections::BTreeMap<String, i64>,
-    /// receipt handle → current visibility timeout.
-    visibility: std::collections::BTreeMap<String, i64>,
+    deleted: BTreeMap<String, i64>,
+    /// receipt handle → the visibility timeout last set (the settle
+    /// pins read it).
+    visibility: BTreeMap<String, i64>,
     next_receipt: i64,
+    /// The receipt minted by the latest receive — survives the
+    /// message leaving the in-flight table (a requeue moves it back to
+    /// the queue), so the settle pins can name it.
+    last_receipt: Option<String>,
+    /// ReceiveMessage call count — the stop pins read it.
+    receives: u64,
 }
 
 impl SqsMock {
@@ -45,6 +83,12 @@ impl SqsMock {
             .unwrap_or(0)
     }
 
+    /// Total DeleteMessage calls across all receipts — the settle
+    /// assertion for pins that do not know the minted receipt.
+    pub fn deleted_total(&self) -> i64 {
+        self.inner.lock().expect("mock").deleted.values().sum()
+    }
+
     pub fn visibility(&self, receipt: &str) -> Option<i64> {
         self.inner
             .lock()
@@ -54,7 +98,22 @@ impl SqsMock {
             .copied()
     }
 
-    /// Plants a message: body plus one attribute.
+    /// The receipt minted by the latest receive (messages arrive one
+    /// batch at a time in these pins, so "last" is "the pin's").
+    pub fn last_receipt(&self) -> Option<String> {
+        self.inner.lock().expect("mock").last_receipt.clone()
+    }
+
+    /// The ReceiveMessage call count, for the stop pins: a stopped
+    /// pump must stop receiving.
+    pub fn receive_count(&self) -> u64 {
+        self.inner.lock().expect("mock").receives
+    }
+
+    /// Plants a message: body plus one attribute. The body rides as
+    /// the queue's raw text — the mock escapes it on render, the way
+    /// the real service escapes, so the engine's decode path sees the
+    /// real shape.
     pub fn enqueue(&self, body: &str, attribute_key: &str, attribute_value: &str) {
         let mut inner = self.inner.lock().expect("mock");
         inner.queue.push_back(Received {
@@ -109,6 +168,7 @@ impl SqsMock {
                 (200, "<SendMessageResponse><SendMessageResult/></SendMessageResponse>".into())
             }
             "ReceiveMessage" => {
+                inner.receives += 1;
                 let max = get("MaxNumberOfMessages")
                     .parse::<usize>()
                     .unwrap_or(10)
@@ -121,17 +181,23 @@ impl SqsMock {
                     inner.next_receipt += 1;
                     let receipt = format!("receipt-{}", inner.next_receipt);
                     message.receipt = receipt.clone();
+                    inner.last_receipt = Some(receipt.clone());
                     inner.visibility.insert(receipt.clone(), 30);
+                    inner.in_flight.insert(receipt.clone(), message.clone());
                     let mut xml = format!(
-                        "<Message><ReceiptHandle>{receipt}</ReceiptHandle><Body>{}</Body>",
-                        message.body
+                        "<Message><ReceiptHandle>{receipt}</ReceiptHandle><MD5OfBody>{}</MD5OfBody><Body>{}</Body>",
+                        md5_hex(message.body.as_bytes()),
+                        xml_escape(&message.body)
                     );
                     // The real response shape: repeated unnumbered
                     // <MessageAttribute> elements with the value nested
-                    // inside <Value>.
+                    // inside <Value>, text escaped the way the service
+                    // escapes it.
                     for (name, value) in message.attributes.iter() {
                         xml.push_str(&format!(
-                            "<MessageAttribute><Name>{name}</Name><Value><StringValue>{value}</StringValue></Value></MessageAttribute>"
+                            "<MessageAttribute><Name>{}</Name><Value><StringValue>{}</StringValue></Value></MessageAttribute>",
+                            xml_escape(name),
+                            xml_escape(value)
                         ));
                     }
                     xml.push_str("</Message>");
@@ -148,13 +214,22 @@ impl SqsMock {
             "DeleteMessage" => {
                 let receipt = get("ReceiptHandle");
                 inner.visibility.remove(&receipt);
+                inner.in_flight.remove(&receipt);
                 *inner.deleted.entry(receipt).or_insert(0) += 1;
                 (200, "<DeleteMessageResponse/>".into())
             }
             "ChangeMessageVisibility" => {
                 let receipt = get("ReceiptHandle");
                 let timeout = get("VisibilityTimeout").parse::<i64>().unwrap_or(30);
-                inner.visibility.insert(receipt, timeout);
+                inner.visibility.insert(receipt.clone(), timeout);
+                // A zeroed timeout is SQS's requeue: the message leaves
+                // the in-flight table and re-enters the visible queue,
+                // so the next ReceiveMessage really redelivers it.
+                if timeout == 0 {
+                    if let Some(message) = inner.in_flight.remove(&receipt) {
+                        inner.queue.push_back(message);
+                    }
+                }
                 (200, "<ChangeMessageVisibilityResponse/>".into())
             }
             _ => (400, format!("<ErrorResponse><Error><Message>unknown action {action}</Message></Error></ErrorResponse>")),

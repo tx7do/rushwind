@@ -12,16 +12,56 @@
 //! and [`json_message`] builds a JSON-encoded [`Message`].
 //!
 //! [`Event::ack`] acknowledges a delivery: engines whose deliveries
-//! need acknowledging (Kafka offsets, RabbitMQ acks) wire the native
-//! ack into the event; engines with implicit acknowledgment (MQTT)
-//! leave it a no-op. [`Event::nack`] is the rejection half — the face
-//! poison-message routing needs: an engine whose native delivery
-//! supports negative acknowledgment wires a [`Nacker`] into the event
-//! and [`NackAction`] asks requeue or drop; implicit-ack engines
-//! leave it the documented no-op (the delivery is already settled —
-//! there is nothing to hand back). Today every engine runs implicit
-//! acknowledgment; the nacker face is wired per engine as each grows
-//! a manual-ack mode.
+//! need acknowledging wire the native settlement into the event.
+//! [`Event::nack`] is the rejection half — the face poison-message
+//! routing needs: an engine whose native delivery supports negative
+//! acknowledgment wires a [`Nacker`] into the event and [`NackAction`]
+//! asks requeue or drop. Nine engines carry the manual face
+//! (`memory`, `azuresb`, `sqs`, `gcpubsub`, `nsq`, `rocketmq`,
+//! `rabbitmq`, `mqtt`, `stomp` — with per-engine granularity noted
+//! below); four are structurally implicit (`kafka` fetch-batch
+//! offsets, `nats` core at-most-once, `redis` pub/sub, `pulsar` as
+//! shipped) and document the no-op rather than pretend at an option.
+//!
+//! **The `ack`/`nack` return value is "accepted", not "settled"** on
+//! engines whose settlement rides a channel back to a pump
+//! (`azuresb`, `sqs`, `gcpubsub`, `pulsar`): the hook enqueues the
+//! command and returns `Ok` before the wire call runs, and a failed
+//! wire settlement surfaces as a server-side redelivery, not as an
+//! `Err` to the handler. The remaining engines settle inline or
+//! serially on the pump and propagate real failures. A handler that
+//! never settles parks the delivery per the engine's own policy
+//! (`memory`/`rocketmq` park until settled; the timeout-redelivery
+//! engines re-deliver after their native visibility deadline) —
+//! [`Event`]'s move semantics make double-settlement unrepresentable
+//! for one event; a *broadcast* delivery's per-handler events may
+//! each attempt settlement, and the engine's first-settle-wins (or
+//! native cumulative semantics) governs.
+//!
+//! **Unsubscribing (or disconnecting) while a delivery is in flight**
+//! is governed per engine and pinned in each engine's suite: the
+//! stopped pump drops the delivery without dispatch and without
+//! settlement, and the message redelivers server-side (azuresb's
+//! lock self-expires, sqs/gcpubsub visibility and deadline lapse,
+//! nsq's in-flight timeout, memory's requeue). A settle enqueued
+//! after the pump exits fails with a clear `Failed` error where the
+//! channel is observable (`azuresb`, `sqs`, `gcpubsub`), or is
+//! dropped with the socket (`nsq`, `mqtt`, `stomp`) — the message
+//! redelivers either way.
+//!
+//! **Handler panics** are the tokio spawn boundary's business: the
+//! dispatch task dies, the subscription does not; the delivery's
+//! settlement follows the same rules as a handler that never
+//! settles. There is no engine-side `catch_unwind`.
+//!
+//! **Multi-consumer fan-out** — the same `subscribe` topic under
+//! concurrent handlers — is intentionally per-engine and documented
+//! in each crate: `memory` and `nsq` are competing consumers (one
+//! delivery per message); `mqtt` is broadcast across matching
+//! filters; `rabbitmq`/`redis` retire the previous flow on a
+//! duplicate subscribe; `azuresb`/`sqs`/`gcpubsub` retire the
+//! previous pump the same way. Code that needs a specific fan-out
+//! shape reads the engine's docs.
 //!
 //! [`with_error_handler`] is the error-handler hook: it wraps a
 //! [`Handler`] so handler errors reach an [`ErrorHandler`] observation
@@ -90,13 +130,18 @@ impl std::error::Error for BrokerError {}
 #[derive(Debug, Clone, Default)]
 pub struct Message {
     /// Message id. Engines generate one when the native message
-    /// carries none.
+    /// carries one (azuresb's `MessageId`, gcpubsub's `messageId`);
+    /// engines whose native delivery has no id (`memory`,
+    /// `rabbitmq`, `mqtt`) leave it empty — the field is a pass-through
+    /// of what the wire carries, not a contract-minted identity.
     pub id: String,
     /// String headers carried with the message.
     pub headers: HashMap<String, String>,
     /// The payload bytes.
     pub payload: Vec<u8>,
-    /// The ordering key — Kafka's key, RabbitMQ's routing key.
+    /// The ordering key — Kafka's key. RabbitMQ's routing key is the
+    /// publish topic, not this field; engines that have no key
+    /// concept leave it empty.
     pub key: String,
     /// Additional string metadata about the message.
     pub metadata: HashMap<String, String>,
@@ -150,9 +195,19 @@ pub type Acker = Box<dyn FnOnce() -> BoxFuture<'static, Result<(), BrokerError>>
 /// [`Event::nack`](Event::nack) hooks carry the engine's native
 /// settlement, so a handler that errors can requeue or drop the
 /// poison message. Engines whose native delivery has no
-/// acknowledgment surface (core NATS, Redis pub/sub) stay `Auto`
-/// structurally: their options accept the mode and document that
-/// manual settlement has nothing to settle onto.
+/// acknowledgment surface (`kafka`, `nats`, `redis`, `pulsar` as
+/// shipped) don't offer the option at all — providing `Manual` where
+/// nothing can settle would be a lie; their crate docs state the
+/// structural implicit-ack instead.
+///
+/// The option's *granularity* is per engine (this is the one
+/// contract shape not yet unified): `memory` takes it per
+/// subscription (`subscribe_with_mode`); `rabbitmq`, `mqtt` and
+/// `stomp` take it per broker construction; `azuresb`, `sqs`,
+/// `gcpubsub`, `nsq` and `rocketmq` carry it on their options
+/// struct. A `subscribe`-call-level entry is the follow-up that
+/// would make the granularity portable; until then, engine docs
+/// carry the authoritative shape.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AckMode {
@@ -259,8 +314,12 @@ impl Event {
         &self.message
     }
 
-    /// Acknowledges the delivery. A no-op for engines with implicit
-    /// acknowledgment, such as MQTT.
+    /// Acknowledges the delivery. A no-op for the structurally
+    /// implicit engines (`kafka`, `nats`, `redis`, `pulsar` as
+    /// shipped). On the channel-queued engines (`azuresb`, `sqs`,
+    /// `gcpubsub`) `Ok` reads *accepted* — the pump performs the wire
+    /// settlement and a failure there surfaces as a server-side
+    /// redelivery, not as this call's error.
     pub async fn ack(self) -> Result<(), BrokerError> {
         match self.acker {
             Some(acker) => acker().await,

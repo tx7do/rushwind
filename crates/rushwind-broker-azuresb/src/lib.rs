@@ -16,7 +16,13 @@
 //!   body, the headers as user-property headers, the message id in
 //!   the `BrokerProperties` header (`{"MessageId": …}`). Property
 //!   names ride HTTP, so names must be header-safe (letters, digits,
-//!   dash) — the honest constraint of the REST face.
+//!   dash) — the honest constraint of the REST face — and they come
+//!   back **lowercased**: HTTP header names fold on the wire (the
+//!   client's header map stores the folded form), so a header
+//!   published as `Origin` reads back `origin`. A header name
+//!   published on this engine will not round-trip its casing — the
+//!   rabbitmq engine preserves it, so cross-engine header-casing
+//!   fidelity is not portable (the rest of the header surface is).
 //! - Deliveries ride the head-of-queue receives:
 //!   [`AckMode::Auto`] (the default) uses the destructive receive
 //!   (`DELETE {entity}/messages/head`) — settle at dispatch, the

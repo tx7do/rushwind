@@ -6952,6 +6952,7 @@ dependencies = [
  "percent-encoding",
  "reqwest 0.12.28",
  "rushwind-broker",
+ "rushwind-testkit",
  "rushwind-transport",
  "serde",
  "serde_json",
@@ -6966,6 +6967,7 @@ dependencies = [
  "base64 0.22.1",
  "reqwest 0.12.28",
  "rushwind-broker",
+ "rushwind-testkit",
  "rushwind-transport",
  "serde",
  "serde_json",
@@ -6991,6 +6993,7 @@ name = "rushwind-broker-memory"
 version = "0.0.1"
 dependencies = [
  "rushwind-broker",
+ "rushwind-testkit",
  "rushwind-transport",
  "serde_json",
  "tokio",
@@ -7029,6 +7032,7 @@ version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "rushwind-broker",
+ "rushwind-testkit",
  "rushwind-transport",
  "serde",
  "serde_json",
@@ -7081,6 +7085,7 @@ name = "rushwind-broker-rocketmq"
 version = "0.0.1"
 dependencies = [
  "rushwind-broker",
+ "rushwind-testkit",
  "rushwind-transport",
  "serde",
  "serde_json",
@@ -7091,10 +7096,13 @@ dependencies = [
 name = "rushwind-broker-sqs"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "form_urlencoded",
  "hmac 0.13.0",
+ "md-5",
  "reqwest 0.12.28",
  "rushwind-broker",
+ "rushwind-testkit",
  "rushwind-transport",
  "serde",
  "serde_json",
@@ -8035,6 +8043,7 @@ dependencies = [
 name = "rushwind-testkit"
 version = "0.0.1"
 dependencies = [
+ "rushwind-broker",
  "rushwind-core",
  "rushwind-lock",
  "rushwind-password",

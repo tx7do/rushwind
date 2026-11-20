@@ -25,11 +25,17 @@ struct GcpPubSubMockInner {
     topics: BTreeMap<String, VecDeque<Value>>,
     /// The redelivery queue: settled-with-zero messages re-enter here.
     redelivery: VecDeque<Value>,
+    /// ackId → the pulled message held in flight. Acknowledge removes
+    /// it; a zeroed deadline returns it to the redelivery queue —
+    /// Pub/Sub's requeue, with the message's real body.
+    in_flight: BTreeMap<String, Value>,
     last_bearer: String,
     /// ackId → settled count, for the pins.
     settled: BTreeMap<String, i64>,
     ack_deadlines: BTreeMap<String, i64>,
     next_ack_id: i64,
+    /// Pull call count — the stop pins read it.
+    pulls: u64,
 }
 
 impl GcpPubSubMock {
@@ -45,6 +51,17 @@ impl GcpPubSubMock {
             .get(ack_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Total settle calls across all ack ids — the settle assertion
+    /// for pins that do not track individual ids.
+    pub fn settled_total(&self) -> i64 {
+        self.inner.lock().expect("mock").settled.values().sum()
+    }
+
+    /// The pull call count: a stopped pump must stop pulling.
+    pub fn pull_count(&self) -> u64 {
+        self.inner.lock().expect("mock").pulls
     }
 
     pub fn deadline(&self, ack_id: &str) -> Option<i64> {
@@ -72,6 +89,29 @@ impl GcpPubSubMock {
             .or_default()
             .push_back(json!({
                 "data": data,
+                "attributes": {attribute_key: attribute_value},
+                "messageId": id,
+            }));
+        inner.next_ack_id += 1;
+    }
+
+    /// Plants a message whose `data` is *not* the engine's base64
+    /// envelope — the foreign-producer shape the passthrough pin reads.
+    pub fn publish_raw(
+        &self,
+        topic: &str,
+        raw_data: &str,
+        attribute_key: &str,
+        attribute_value: &str,
+    ) {
+        let mut inner = self.inner.lock().expect("mock");
+        let id = format!("m-{}", inner.next_ack_id);
+        inner
+            .topics
+            .entry(topic.to_string())
+            .or_default()
+            .push_back(json!({
+                "data": raw_data,
                 "attributes": {attribute_key: attribute_value},
                 "messageId": id,
             }));
@@ -111,6 +151,7 @@ impl GcpPubSubMock {
                 let (name, action) = rest;
                 let _ = name;
                 if action == "pull" {
+                    inner.pulls += 1;
                     let mut received = Vec::new();
                     // Redeliveries first, then fresh messages — the mock
                     // serves the one topic the engine is configured for.
@@ -133,6 +174,7 @@ impl GcpPubSubMock {
                         let ack_id = format!("ack-{}", inner.next_ack_id);
                         inner.next_ack_id += 1;
                         inner.ack_deadlines.insert(ack_id.clone(), 10);
+                        inner.in_flight.insert(ack_id.clone(), message.clone());
                         received.push(json!({
                             "ackId": ack_id,
                             "message": message,
@@ -149,6 +191,7 @@ impl GcpPubSubMock {
                     for ack_id in ack_ids {
                         let ack_id = ack_id.as_str().unwrap_or_default().to_string();
                         inner.ack_deadlines.remove(&ack_id);
+                        inner.in_flight.remove(&ack_id);
                         *inner.settled.entry(ack_id).or_insert(0) += 1;
                     }
                     return ok(json!({}));
@@ -166,13 +209,14 @@ impl GcpPubSubMock {
                     for ack_id in ack_ids {
                         let ack_id = ack_id.as_str().unwrap_or_default().to_string();
                         if deadline == 0 {
-                            // Requeue: the message re-enters the pull
-                            // stream; we synthesize its body from the
-                            // settle-time snapshot the engine does not
-                            // carry, so the mock parks a placeholder —
-                            // the pins only assert the deadline, not the
-                            // payload round trip.
+                            // Requeue: the message leaves the in-flight
+                            // table and re-enters the pull stream with
+                            // its real body — the next pull really
+                            // redelivers it.
                             inner.ack_deadlines.insert(ack_id.clone(), 0);
+                            if let Some(message) = inner.in_flight.remove(&ack_id) {
+                                inner.redelivery.push_back(message);
+                            }
                         } else {
                             inner.ack_deadlines.insert(ack_id.clone(), deadline);
                         }

@@ -17,10 +17,13 @@
 //!   [`NackAction::Requeue`] returns it to the topic queue head —
 //!   immediate redelivery to the next subscriber slot — and
 //!   [`NackAction::Drop`] settles it away. Redelivery is real, not
-//!   simulated. A handler that neither acks nor nacks leaves the
-//!   message in-flight forever — the honest consequence; production
-//!   brokers time it out, the reference engine's pins drive
-//!   settlement explicitly.
+//!   simulated, and bounded: a message requeued more than
+//!   [`REQUEUE_CAP`] times stops re-entering the queue and parks
+//!   in-flight (observable, never silently lost, and the poison
+//!   handler's nack cannot spin the pump forever). A handler that
+//!   neither acks nor nacks leaves the message in-flight forever —
+//!   the honest consequence; production brokers time it out, the
+//!   reference engine's pins drive settlement explicitly.
 //! - `disconnect` marks the engine down (publish/subscribe refuse);
 //!   queued-but-undelivered messages were never handed out and
 //!   survive; in-flight messages are dropped (their subscribers were
@@ -42,11 +45,26 @@ use rushwind_broker::{
 #[derive(Debug, Clone, Default)]
 pub struct MemoryBrokerOptions {}
 
+/// How many times one delivery may be requeued before it parks
+/// in-flight instead of re-entering the queue — the poison-handler
+/// backstop: an endless nack(Requeue) loop must not spin the pump.
+pub const REQUEUE_CAP: u32 = 8;
+
+/// The message metadata key carrying a delivery's requeue count
+/// across redelivery cycles (the pump parks with it, the requeue hook
+/// increments it).
+const REQUEUE_COUNT_KEY: &str = "rushwind.requeues";
+
 #[derive(Clone)]
 struct SubscriberSlot {
     id: u64,
     handler: Handler,
     ack_mode: AckMode,
+    /// The slot's liveness, shared with the owning handle: pump
+    /// snapshots are taken under the subscriptions lock but dispatched
+    /// after it releases — the flag closes that window, so a delivery
+    /// never reaches a handler whose unsubscribe already landed.
+    active: Arc<AtomicBool>,
 }
 
 impl Inner {
@@ -73,8 +91,9 @@ impl Default for Inner {
 struct Inner {
     /// topic → queued messages (not yet handed to a subscriber).
     queue: Mutex<HashMap<String, VecDeque<Message>>>,
-    /// hex id → parked Manual delivery (topic + message).
-    in_flight: Mutex<HashMap<String, (String, Message)>>,
+    /// hex id → parked Manual delivery (topic + message + requeue
+    /// count against [`REQUEUE_CAP`]).
+    in_flight: Mutex<HashMap<String, (String, Message, u32)>>,
     /// topic → live subscriber slots.
     subscriptions: Mutex<HashMap<String, Vec<SubscriberSlot>>>,
     connected: AtomicBool,
@@ -150,6 +169,17 @@ fn pump(inner: &Arc<Inner>, topic: &str) {
     let mut slot_index = inner.cursor.fetch_add(0, Ordering::SeqCst) as usize;
     while !queue_for_topic.is_empty() {
         let slot = &slots[slot_index % slots.len()];
+        if !slot.active.load(Ordering::SeqCst) {
+            // Unsubscribed between the snapshot and this dispatch: the
+            // message returns to the queue head for the next slot.
+            let message = queue_for_topic.pop_front();
+            if let Some(message) = message {
+                queue_for_topic.push_front(message);
+            }
+            slot_index += 1;
+            inner.cursor.store(slot_index as u64, Ordering::SeqCst);
+            continue;
+        }
         let Some(message) = queue_for_topic.pop_front() else {
             break;
         };
@@ -161,11 +191,15 @@ fn pump(inner: &Arc<Inner>, topic: &str) {
             }
             AckMode::Manual => {
                 let id = format!("mf-{}", inner.next_id.fetch_add(1, Ordering::SeqCst));
-                inner
-                    .in_flight
-                    .lock()
-                    .expect("in-flight poisoned")
-                    .insert(id.clone(), (dispatch_topic.clone(), message.clone()));
+                let requeues = message
+                    .metadata
+                    .get(REQUEUE_COUNT_KEY)
+                    .and_then(|count| count.parse::<u32>().ok())
+                    .unwrap_or(0);
+                inner.in_flight.lock().expect("in-flight poisoned").insert(
+                    id.clone(),
+                    (dispatch_topic.clone(), message.clone(), requeues),
+                );
                 let ack_inner = Arc::clone(inner);
                 let ack_id = id.clone();
                 let nack_inner = Arc::clone(inner);
@@ -194,17 +228,38 @@ fn pump(inner: &Arc<Inner>, topic: &str) {
                                 .lock()
                                 .expect("in-flight poisoned")
                                 .remove(&id);
-                            let Some((topic, message)) = parked else {
+                            let Some((topic, message, requeues)) = parked else {
                                 return Ok(());
                             };
                             if action == NackAction::Requeue {
+                                if requeues >= REQUEUE_CAP {
+                                    // The poison backstop: this delivery
+                                    // has cycled the cap — it parks
+                                    // in-flight again (observable, never
+                                    // silently lost) instead of spinning
+                                    // the pump forever.
+                                    inner
+                                        .in_flight
+                                        .lock()
+                                        .expect("in-flight poisoned")
+                                        .insert(id, (topic, message, requeues));
+                                    return Ok(());
+                                }
+                                // The count rides the message's metadata:
+                                // the re-parked redelivery reads it back,
+                                // so the cycle accumulates toward the cap.
+                                let mut redelivery = message;
+                                redelivery.metadata.insert(
+                                    REQUEUE_COUNT_KEY.to_string(),
+                                    (requeues + 1).to_string(),
+                                );
                                 inner
                                     .queue
                                     .lock()
                                     .expect("queue poisoned")
                                     .entry(topic.clone())
                                     .or_default()
-                                    .push_front(message);
+                                    .push_front(redelivery);
                                 // Redeliver immediately: the hook holds the
                                 // shared state, so it re-pumps the topic
                                 // itself.
@@ -298,6 +353,7 @@ impl Broker for MemoryBroker {
                 return Err(BrokerError::NotConnected);
             }
             let slot_id = self.inner.next_slot.fetch_add(1, Ordering::SeqCst);
+            let active = Arc::new(AtomicBool::new(true));
             self.inner
                 .subscriptions
                 .lock()
@@ -308,12 +364,14 @@ impl Broker for MemoryBroker {
                     id: slot_id,
                     handler,
                     ack_mode: AckMode::Auto,
+                    active: Arc::clone(&active),
                 });
             self.pump_topic(topic);
             Ok(Box::new(MemorySubscriber {
                 topic: topic.to_string(),
                 registry: Arc::clone(&self.inner),
                 slot_id,
+                active,
             }) as Box<dyn Subscriber>)
         })
     }
@@ -351,6 +409,7 @@ impl MemoryBroker {
                 return Err(BrokerError::NotConnected);
             }
             let slot_id = self.inner.next_slot.fetch_add(1, Ordering::SeqCst);
+            let active = Arc::new(AtomicBool::new(true));
             self.inner
                 .subscriptions
                 .lock()
@@ -361,23 +420,29 @@ impl MemoryBroker {
                     id: slot_id,
                     handler,
                     ack_mode,
+                    active: Arc::clone(&active),
                 });
             pump(&self.inner, topic);
             Ok(Box::new(MemorySubscriber {
                 topic: topic.to_string(),
                 registry: Arc::clone(&self.inner),
                 slot_id,
+                active,
             }) as Box<dyn Subscriber>)
         })
     }
 }
 
 /// The subscription handle: unsubscribing removes the slot so no
-/// further dispatch reaches its handler.
+/// further dispatch reaches its handler. The removal and the slot's
+/// active flag together close the pump's snapshot window — a delivery
+/// already dispatched under the stale snapshot sees the flag down and
+/// returns its message to the queue.
 struct MemorySubscriber {
     topic: String,
     registry: Arc<Inner>,
     slot_id: u64,
+    active: Arc<AtomicBool>,
 }
 
 impl Subscriber for MemorySubscriber {
@@ -390,6 +455,10 @@ impl Subscriber for MemorySubscriber {
         if let Some(slots) = subscriptions.get_mut(&self.topic) {
             slots.retain(|slot| slot.id != self.slot_id);
         }
+        // The flag is the load-bearing half: it closes the window
+        // between the pump's lock-release and its dispatch.
+        self.active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
 }

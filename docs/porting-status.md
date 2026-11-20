@@ -31,6 +31,20 @@
 
 testkit 套件增量：storage 一致性套件增 iexact 钉子（折叠大小写不折叠形状）。
 
+## broker 泵审计与收口（2026-11-20）
+
+全仓审计确认 bead335 注记的五引擎泵隐患全部属实并加码，一次收口（各引擎套件 + testkit 一致性套件全绿，fmt/clippy -D warnings 干净）：
+
+- **mqtt**：`set_manual_acks(true)` 是本战役最大的意外捕获——rumqttc 默认在协议层自动 PUBACK 每条 QoS 1 交付，Auto 臂的 `client.ack` 是第二个 PUBACK（协议违规面），而 Manual 的「扣住 PUBACK」在库层**从来不可能成立**（毒消息一直被背后 ack）。nacker 修正为真语义拆分（Requeue=扣住、Drop=PUBACK——3.1.1 无 NACK 帧下的诚实形状）+ 每包 first-settle-wins 门（广播多 handler 只发一个 PUBACK）+ disconnect 的 checked 标志兜底（notify 落在泵 await 间隙即丢失的「断连复活」洞）+ 退避 sleep 可打断。Manual 线形由最小帧级 mock 钉死（CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH/PUBACK、UNSUBSCRIBE/UNSUBACK 四对包，读循环永不取消 + watch 门控的写任务——mock 自身的 select 撕帧曾产出幻影 PUBACK，教训与引擎侧同构）。
+- **sqs/gcpubsub**：泵改 azuresb 顺序循环形状——checked stopped 标志循环顶+派发前双查（退订后 Auto 继续消费服务器侧消息的丢消息级洞）、settle 先排空、一次接收 await 到底（在途请求永不被 select 取消）、空轮询退避。重复订阅退休旧泵（rabbitmq/redis 形状）；subscriber 带所有权守卫的退订 + Drop 尽力停泵（文档承诺兑现）。sqs 另收：payload 走 base64 信封（二进制载荷由 from_utf8_lossy 静默损坏改为逐字节往返，外部纯文本生产者原样透传）、XML 实体解码（转义文本往返）、MD5OfBody 校验（先解码后校验——AWS 摘要盖未转义体）、无 ReceiptHandle 消息跳过（不可结算的交付不再派发）、BinaryValue 属性解码。
+- **gcpubsub 毒消息穿透**：非信封 body 原样透传——原整批 Err 的形状让一条解码失败的消息饿死整个订阅（ack deadline 循环重投）。
+- **nsq**：stopped 标志 + dial 窗口检查 + 退避可查（退订/断连的停泵不再依赖 notify），reader 任务推完整帧（泵的等待是 cancel-safe 的 channel recv，半帧字节不再丢）；mock 三处诚实化：in_flight 带上 topic（原空字符串键位让 REQ 重投静默无效）、REQ 立即重投（真 nsqd 形状）、连接关闭时清 deliverer + delivered 计数按实际送达。停泵/退休/REQ 离线真重投三钉进 wire 套件。
+- **rocketmq**：CommitLog 解码 `props_len` 上界检查（截断记录→panic 杀泵→订阅无声死亡→改为 break）；Manual parked 窗口查 stopped（原唯一出口是 notify——unsubscribe 停不住 park 的泵）；HEARTBEAT 注册带可查退避重试（原失败即永久死订阅而注释谎称有重拨循环）+ code≠0 不再当成功；pull 顺序化（在途请求不被 select 取消）；debug eprintln 与陈旧模块文档清理。
+- **stomp**：Manual 订阅改 `ack:client-individual`（1.2 逐条模式——原 `ack:client` 会隐式结算此前全部未 ack 消息，逐事件契约不成立）；连接任务读写拆分（reader 任务推完整帧，泵的等待全 cancel-safe——原 select 撕半截入站帧→流失步→MESSAGE 静默丢）；CONNECT 带 `heart-beat:0,0` 拒绝协商 + 帧读取剥前导 EOL（服务器硬发的心跳字节不再毁帧）；connected 标志写按 generation 门控（旧任务的断连不再清掉新任务的标志——发布面假死洞）。
+- **memory**：泵派发前查 slot 活性标志（快照-派发竞态关闭——退订后的消息回队首而非派给已移除 slot）；nack(Requeue) 上限 `REQUEUE_CAP=8`（计数经 metadata 随重投周期累计，到帽 park in-flight——可观测、不静默丢、毒 handler 不再热循环泵）。
+- **契约文档**：九引擎 Manual 面的现状如实化（原「every engine runs implicit acknowledgment」过时三处）；`ack`/`nack` 的 Ok 语义（排队型引擎=已受理，错误面是服务器侧重投）、handler panic 语义（tokio spawn 边界，订阅不死）、settle-after-unsubscribe 归属、多消费者 fan-out 矩阵（memory/nsq 竞争、mqtt 广播、rabbitmq/redis 退休、azuresb/sqs/gcpubsub 退休）进契约文档；AckMode 粒度差异（每订阅/每构造/每 options）如实写明，契约级入口留作后续；azuresb header 大小写不对称如实声明（HTTP 头名线路折叠，跨引擎保真度边界）；Message::id/key/metadata 的引擎现实对齐。
+- **testkit broker 一致性套件**：新 `broker` feature + `broker_conformance` 模块——`BrokerHarness` 两方法桥（build/subscribe，契约粒度差异在引擎侧消化），七钉：round trip、退订停投递、handler 错误不杀订阅、handler panic 不杀订阅（毒载荷条件化——panic 杀的是派发任务不是订阅）、Manual park-until-acked、nack(Requeue) 真重投、nack(Drop) 终结。每 pin 唯一 topic（per-pin-topic 规则）；每 build 换新 mock（跨 pin 零残留）。套件自身的两课：subscriber 句柄必须绑定保活（带 Drop 停泵的引擎上，未绑定的临时值会当掉订阅——rocketmq 因无 Drop 而「绿」恰是对照面）；错误/panic 钉的断言对象是订阅自身而非兄弟消费者（竞争型引擎上失败的兄弟吃光消息是合法行为）。六离线引擎（memory/nsq/sqs/gcpubsub/azuresb/rocketmq）全部接green；live 引擎（mqtt/stomp/rabbitmq/redis/nats/kafka/pulsar）的接线随各自 live 套件立项。
+
 
 ## 独立路线增量（2026-11-11）
 

@@ -46,24 +46,56 @@
 //!
 //! Live conformance tests run against a real broker (EMQX works) via
 //! the `live` feature; there is no embedded MQTT broker for CI's unit
-//! lanes.
+//! lanes. The one wire face that a real broker is required to observe
+//! — which PUBACKs the engine emits under each acknowledgment policy —
+//! is pinned by a minimal frame-level mock ([`tests/manual.rs`]): it
+//! speaks just CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH and PUBACK,
+//! which is enough to pin Auto's settle-on-dispatch, Manual's ack, and
+//! Manual's Requeue-withholds / Drop-PUBACKs split.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rushwind_broker::{
-    AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, Subscriber,
+    AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, NackAction, Subscriber,
 };
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 /// How long an unsubscribe waits for the broker's UNSUBACK before
 /// failing — the bound upstream's `token.WaitTimeout(10s)` used.
 const UNSUB_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One pump generation's stop face. The `Notify` gives the pump a
+/// prompt exit; the `retired` flag is the checked fallback that makes
+/// the stop loss-proof: a `notify_waiters` landing between the pump's
+/// await points registers no waiter and is lost, but the flag is read
+/// at every loop top regardless of notification timing — without it a
+/// lost notification means the pump re-dials through rumqttc's
+/// automatic reconnect and resurrects the broker that was asked to
+/// shut down.
+struct PumpStop {
+    notify: Arc<Notify>,
+    retired: Arc<AtomicBool>,
+}
+
+impl PumpStop {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            retired: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn stop(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
 
 struct Shared {
     /// The subscriptions' topic filters and their handlers, re-armed
@@ -95,8 +127,8 @@ pub struct MqttBroker {
     shared: Arc<Shared>,
     /// The live pump generation; older pumps exit when it moves on.
     generation: Arc<AtomicU64>,
-    /// Per-generation pump shutdown.
-    shutdown: Mutex<Option<Arc<Notify>>>,
+    /// Per-generation pump stop face (prompt notify + checked flag).
+    shutdown: Mutex<Option<Arc<PumpStop>>>,
     /// The subscription acknowledgment policy (see [`AckMode`]).
     ack_mode: AckMode,
 }
@@ -137,9 +169,20 @@ impl MqttBroker {
 
     /// Builds the broker under an explicit acknowledgment policy.
     /// [`AckMode::Manual`] hands the MQTT PUBACK to handlers through
-    /// the event's ack hook; MQTT 3.1.1 has no native NACK frame, so
-    /// the nack hook's honest shape is *withholding* the PUBACK —
-    /// redelivery becomes the broker's re-send timer's decision.
+    /// the event's ack hook. MQTT 3.1.1 has no native NACK frame, so
+    /// the nack hook's honest split is: [`NackAction::Requeue`]
+    /// *withholds* the PUBACK — the message stays unacknowledged and
+    /// redelivery becomes the broker's decision (MQTT 3.1.1 brokers
+    /// re-send unacknowledged QoS 1 messages on session resume) —
+    /// while [`NackAction::Drop`] sends the PUBACK, the only wire
+    /// action that stops the re-sends.
+    ///
+    /// A publish matching several handlers is broadcast: every handler
+    /// gets its own event with its own settle hooks, but one packet id
+    /// admits a single PUBACK — the first settle (ack or Drop) wins
+    /// and sends it; later settles are honest no-ops. A Manual filter
+    /// whose handlers only ever `Requeue` therefore never PUBACKs, and
+    /// the broker's in-flight window eventually forces the re-sends.
     pub fn with_ack_mode(options: MqttOptions, ack_mode: AckMode) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         Self {
@@ -195,6 +238,14 @@ fn to_rumqtt_options(options: &MqttOptions) -> rumqttc::MqttOptions {
         port_of(&options.addr),
     );
     mqtt.set_keep_alive(options.keep_alive);
+    // The engine owns every PUBACK: Auto's settle-on-dispatch and the
+    // Manual hooks both go through `client.ack`. Without manual acks,
+    // rumqttc auto-acknowledges at the protocol layer — Auto would
+    // double-PUBACK every delivery (a protocol violation a strict
+    // broker answers with a disconnect), and Manual's withheld PUBACK
+    // would silently become an ack (the poison message confirmed and
+    // never redelivered).
+    mqtt.set_manual_acks(true);
     if let Some(username) = &options.username {
         mqtt.set_credentials(
             username.clone(),
@@ -256,17 +307,19 @@ impl Broker for MqttBroker {
 
     fn connect(&self) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
-            // Retire the previous pump generation.
+            // Retire the previous pump generation — both the prompt
+            // notify and the checked flag, so the exit survives a
+            // notify landing between the old pump's await points.
             if let Some(previous) = self.shutdown.lock().await.take() {
-                previous.notify_waiters();
+                previous.stop();
             }
             let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
             let (client, mut eventloop) = fresh_client(&self.mqtt_options);
             *self.client.lock().await = Some(client.clone());
 
-            let shutdown = Arc::new(Notify::new());
-            *self.shutdown.lock().await = Some(Arc::clone(&shutdown));
+            let stop = Arc::new(PumpStop::new());
+            *self.shutdown.lock().await = Some(Arc::clone(&stop));
 
             let shared = Arc::clone(&self.shared);
             let generations = Arc::clone(&self.generation);
@@ -274,11 +327,17 @@ impl Broker for MqttBroker {
             tokio::spawn(async move {
                 let mut backoff_secs = 1u64;
                 loop {
-                    if generations.load(Ordering::SeqCst) != generation {
+                    // The checked stop: read at every loop top, so a
+                    // lost `notify_waiters` still retires this pump at
+                    // its next iteration instead of resurrecting the
+                    // broker through rumqttc's automatic reconnect.
+                    if generations.load(Ordering::SeqCst) != generation
+                        || stop.retired.load(Ordering::SeqCst)
+                    {
                         return;
                     }
                     let reconnect = tokio::select! {
-                        _ = shutdown.notified() => return,
+                        _ = stop.notify.notified() => return,
                         _ = shared.rearm.notified() => false,
                         result = eventloop.poll() => match result {
                             Ok(event) => {
@@ -327,6 +386,14 @@ impl Broker for MqttBroker {
                                                 let _ = client.ack(&publish).await;
                                             }
                                             AckMode::Manual => {
+                                                // One packet id admits one
+                                                // PUBACK: the settle flag makes
+                                                // the broadcast honest — the
+                                                // first settle (ack or Drop)
+                                                // sends it, later settles are
+                                                // no-ops against a packet the
+                                                // broker has already confirmed.
+                                                let settled = Arc::new(AtomicBool::new(false));
                                                 for handler in handlers {
                                                     // Each hook owns its own
                                                     // client/publish copies: the
@@ -334,13 +401,18 @@ impl Broker for MqttBroker {
                                                     // rest of the pump loop.
                                                     let ack_client = client.clone();
                                                     let ack_publish = publish.clone();
+                                                    let ack_gate = Arc::clone(&settled);
                                                     let nack_client = client.clone();
                                                     let nack_publish = publish.clone();
+                                                    let nack_gate = Arc::clone(&settled);
                                                     let event = Event::settle_with(
                                                         topic.clone(),
                                                         Message::from_payload(payload.clone()),
                                                         move || {
                                                             Box::pin(async move {
+                                                                if ack_gate.swap(true, Ordering::SeqCst) {
+                                                                    return Ok(());
+                                                                }
                                                                 ack_client.ack(&ack_publish).await.map_err(
                                                                     |e| BrokerError::Failed(
                                                                         format!("mqtt ack: {e}"),
@@ -350,15 +422,29 @@ impl Broker for MqttBroker {
                                                                 as BoxFuture<'static, Result<(), BrokerError>>
                                                         },
                                                         // MQTT 3.1.1 carries no NACK
-                                                        // frame: the honest rejection
-                                                        // is *withholding* the PUBACK —
-                                                        // redelivery is then the
-                                                        // broker's re-send timer's
-                                                        // decision, for both actions.
-                                                        move |_action| {
+                                                        // frame. Requeue's honest
+                                                        // shape is *withholding* the
+                                                        // PUBACK — the packet stays
+                                                        // unacknowledged and the
+                                                        // broker re-sends it on session
+                                                        // resume. Drop takes the
+                                                        // PUBACK: it is the only wire
+                                                        // action that stops the
+                                                        // re-sends.
+                                                        move |action| {
                                                             Box::pin(async move {
-                                                                let _ = nack_client.ack(&nack_publish).await;
-                                                                Ok(())
+                                                                if action == NackAction::Requeue {
+                                                                    return Ok(());
+                                                                }
+                                                                if nack_gate.swap(true, Ordering::SeqCst) {
+                                                                    return Ok(());
+                                                                }
+                                                                nack_client
+                                                                    .ack(&nack_publish)
+                                                                    .await
+                                                                    .map_err(|e| BrokerError::Failed(
+                                                                        format!("mqtt nack drop: {e}"),
+                                                                    ))
                                                             })
                                                                 as BoxFuture<'static, Result<(), BrokerError>>
                                                         },
@@ -398,7 +484,14 @@ impl Broker for MqttBroker {
                     if reconnect {
                         // rumqttc's poll retries the connection on the
                         // next call; the backoff just spaces the polls.
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        // The sleep stays interruptible: a stop (or a
+                        // fresh subscription's rearm) must not wait out
+                        // a 30 s backoff step.
+                        tokio::select! {
+                            _ = stop.notify.notified() => return,
+                            _ = shared.rearm.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                        }
                         backoff_secs = (backoff_secs * 2).min(30);
                     } else {
                         backoff_secs = 1;
@@ -436,8 +529,14 @@ impl Broker for MqttBroker {
                 None => Ok(()),
             };
             self.client.lock().await.take();
+            // The checked stop is the load-bearing half: a
+            // notify_waiters landing between the pump's await points
+            // (subscription re-arm, delivery dispatch, ack flush)
+            // registers no waiter and is lost — without the flag the
+            // pump re-dials on rumqttc's automatic reconnect and
+            // resurrects the broker that was asked to shut down.
             if let Some(previous) = self.shutdown.lock().await.take() {
-                previous.notify_waiters();
+                previous.stop();
             }
             enqueued.map_err(|e| BrokerError::Failed(format!("mqtt disconnect: {e}")))
         })

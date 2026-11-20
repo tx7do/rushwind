@@ -53,6 +53,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+#[cfg(feature = "broker")]
+pub mod broker_conformance;
 mod conformance;
 #[cfg(feature = "lock")]
 pub mod lock_conformance;
@@ -64,6 +66,8 @@ pub mod storage_conformance;
 #[cfg(feature = "vector")]
 pub mod vector_conformance;
 
+#[cfg(feature = "broker")]
+pub use rushwind_broker;
 pub use rushwind_core;
 #[cfg(feature = "lock")]
 pub use rushwind_lock;

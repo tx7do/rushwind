@@ -9,8 +9,13 @@
 //! exchange with the topic as the routing key, the same wire surface
 //! the RabbitMQ engine uses. Payloads are binary-safe: every SEND
 //! carries a `content-length` header, and MESSAGE frames are decoded
-//! honoring it. Subscriptions use `ack:auto` — STOMP over RabbitMQ
-//! acknowledges implicitly, so the event ack is a no-op.
+//! honoring it. Subscriptions use `ack:auto` under [`AckMode::Auto`]
+//! (the server settles implicitly, the event's ack is a no-op) and
+//! `ack:client-individual` under [`AckMode::Manual`] — the 1.2
+//! per-message mode, where the frame's `ack` id settles exactly one
+//! delivery (plain `ack:client` would cumulative-settle every earlier
+//! unacked message on the subscription, breaking the per-event
+//! contract).
 //!
 //! One TCP connection carries every subscription. A single
 //! connection task owns the socket: it performs the CONNECT
@@ -33,6 +38,13 @@
 //!   payload travels alone, as in the MQTT and Redis engines.
 //! - `Broker::disconnect` closes the socket; subscriptions resume on
 //!   the next `connect` rather than surviving the disconnect.
+//! - `connect` returns `Err` after ten seconds without a handshake,
+//!   but the connection task keeps dialing in the background — a late
+//!   success revives the broker's publish and delivery faces. Call
+//!   `disconnect` to stop the background dialing.
+//! - Heart-beats are refused at negotiation (`heart-beat:0,0`): the
+//!   engine sends none and accepts none, and lone-EOL heartbeat bytes
+//!   that a server emits anyway are stripped before frame parsing.
 //!
 //! # Testing
 //!
@@ -195,10 +207,23 @@ struct Frame {
 }
 
 /// Reads one STOMP frame from the stream: headers to the blank line,
-/// body either by `content-length` or to the terminating NUL.
+/// body either by `content-length` or to the terminating NUL. Leading
+/// EOL bytes (a server-emitted heartbeat, lone CR/LF/CRLF) are
+/// stripped first — parsed as command bytes they would corrupt every
+/// frame after them.
 async fn read_frame(reader: &mut OwnedReadHalf) -> Result<Frame, BrokerError> {
     let mut byte = [0u8; 1];
-    let mut buffer = Vec::new();
+    loop {
+        reader
+            .read_exact(&mut byte)
+            .await
+            .map_err(|e| BrokerError::Failed(format!("stomp read: {e}")))?;
+        if byte[0] == b'\n' || byte[0] == b'\r' {
+            continue;
+        }
+        break;
+    }
+    let mut buffer = vec![byte[0]];
     loop {
         reader
             .read_exact(&mut byte)
@@ -311,6 +336,11 @@ async fn connection_loop(
             &[
                 ("accept-version", "1.2".to_string()),
                 ("host", "/".to_string()),
+                // Refuse heart-beats both ways: the engine sends none
+                // and accepts none (a server emitting lone-EOL
+                // heartbeats anyway still survives the frame reader's
+                // leading-EOL strip).
+                ("heart-beat", "0,0".to_string()),
             ],
             &[],
         ) {
@@ -356,6 +386,29 @@ async fn connection_loop(
             *shared.connected.lock().await = true;
         }
 
+        // The reader task owns the read half and pushes complete
+        // frames — the pump's wait below is a channel recv
+        // (cancellation-safe), so a completing settle-side arm can
+        // never drop a half-read frame with its consumed bytes (the
+        // old select-over-read lost bytes and desynchronized the
+        // stream, silently swallowing every MESSAGE after the tear).
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let reader_task = tokio::spawn(async move {
+            loop {
+                match read_frame(&mut reader).await {
+                    Ok(frame) => {
+                        if inbound_tx.send(Ok(frame)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = inbound_tx.send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+
         loop {
             if shared.generation.load(Ordering::SeqCst) != generation {
                 if let Ok(frame) = encode_frame("DISCONNECT", &[], &[]) {
@@ -374,31 +427,42 @@ async fn connection_loop(
                     Some(frame) => write_frame(&mut writer, &frame).await.is_err(),
                     None => return,
                 },
-                read = read_frame(&mut reader) => match read {
-                    Ok(frame) => {
+                frame = inbound_rx.recv() => match frame {
+                    Some(Ok(frame)) => {
                         route_message(&shared, frame, ack_mode).await;
                         false
                     }
-                    Err(_) => true,
+                    Some(Err(_)) | None => true,
                 },
             };
             if broken {
+                reader_task.abort();
                 break;
             }
             backoff_secs = 1;
         }
-        *shared.connected.lock().await = false;
+        // The flag write is generation-gated: a superseded task's
+        // socket error must not clear the flag a newer task just set —
+        // the old shape left the broker publishing-failing-forever on a
+        // live connection.
+        if shared.generation.load(Ordering::SeqCst) == generation {
+            *shared.connected.lock().await = false;
+        }
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(30);
     }
 }
 
-/// The SUBSCRIBE ack header per mode: `auto` settles at the server,
-/// `client` hands each MESSAGE's ack id to the consumer.
+/// The SUBSCRIBE ack header per mode: `auto` settles at the server;
+/// `client-individual` is STOMP 1.2's per-message mode — the frame's
+/// ack id settles exactly that delivery. Plain `ack:client` would
+/// cumulative-settle every earlier unacked message on the
+/// subscription (the server-side semantics), which the per-event
+/// contract cannot express.
 fn ack_header(mode: AckMode) -> &'static str {
     match mode {
         AckMode::Auto => "auto",
-        AckMode::Manual => "client",
+        AckMode::Manual => "client-individual",
     }
 }
 

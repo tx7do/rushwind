@@ -37,16 +37,21 @@
 #![deny(missing_debug_implementations)]
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// The idle-tick spacing: heartbeats are disabled at IDENTIFY, so a
+/// quiet topic sends no frames and the stop flags would otherwise go
+/// unread for as long as the broker stays silent.
+const IDLE_CHECK: Duration = Duration::from_millis(500);
 
 use rushwind_broker::{
     AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, NackAction, Subscriber,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex};
 
 /// The engine's settings.
 #[derive(Debug, Clone)]
@@ -82,9 +87,15 @@ struct Inner {
     subscriptions: Mutex<HashMap<String, Arc<SubscriptionShared>>>,
 }
 
+/// One subscription's stop face. A checked flag — read at the pump's
+/// loop top, after the dial, and before every dispatch — not a wakeup:
+/// a notify-style signal landing between the pump's await points
+/// (the whole dial/handshake window, the frame read, a settle flush)
+/// would be lost, and the pump would keep consuming for a
+/// subscription that was unsubscribed.
 #[derive(Debug)]
 struct SubscriptionShared {
-    done: Arc<Notify>,
+    stopped: AtomicBool,
 }
 
 /// The NSQ broker.
@@ -144,12 +155,10 @@ impl Broker for NsqBroker {
 
     fn disconnect(&self) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
-            self.inner
-                .closed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.inner.closed.store(true, Ordering::SeqCst);
             let subscriptions = self.inner.subscriptions.lock().await;
             for shared in subscriptions.values() {
-                shared.done.notify_waiters();
+                shared.stopped.store(true, Ordering::SeqCst);
             }
             Ok(())
         })
@@ -161,7 +170,7 @@ impl Broker for NsqBroker {
         message: Message,
     ) -> BoxFuture<'a, Result<(), BrokerError>> {
         Box::pin(async move {
-            if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.inner.closed.load(Ordering::SeqCst) {
                 return Err(BrokerError::NotConnected);
             }
             // The envelope: payload base64, headers in the map.
@@ -181,30 +190,40 @@ impl Broker for NsqBroker {
             if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(BrokerError::NotConnected);
             }
-            let done = Arc::new(Notify::new());
-            let shared = Arc::new(SubscriptionShared { done: done.clone() });
+            let shared = Arc::new(SubscriptionShared {
+                stopped: AtomicBool::new(false),
+            });
             {
                 let mut subscriptions = self.inner.subscriptions.lock().await;
+                // A duplicate subscribe retires the old pump — the
+                // rabbitmq/redis engines' same-topic shape: the newest
+                // handler owns the filter, and the previous pump exits at
+                // its next check instead of leaking past the overwritten
+                // registry entry.
+                if let Some(previous) = subscriptions.get(topic) {
+                    previous.stopped.store(true, Ordering::SeqCst);
+                }
                 subscriptions.insert(topic.to_string(), Arc::clone(&shared));
             }
 
+            let shared_for_handle = Arc::clone(&shared);
             let engine = NsqBroker {
                 inner: Arc::clone(&self.inner),
             };
             let topic_for_task = topic.to_string();
             let handler = Arc::clone(&handler);
-            let task_done = done.clone();
             let ack_mode = self.inner.options.ack_mode;
             let channel = self.inner.options.channel_id.clone();
             tokio::spawn(async move {
                 engine
-                    .run_pump(&topic_for_task, &channel, handler, ack_mode, task_done)
+                    .run_pump(&topic_for_task, &channel, handler, ack_mode, shared)
                     .await;
             });
 
             Ok(Box::new(NsqSubscriber {
                 topic: topic.to_string(),
-                done,
+                shared: shared_for_handle,
+                inner: Arc::clone(&self.inner),
             }) as Box<dyn Subscriber>)
         })
     }
@@ -223,11 +242,32 @@ impl Broker for NsqBroker {
     }
 }
 
-/// The subscriber handle: dropping it (or unsubscribing) stops the
-/// pump.
+/// The subscription handle. `unsubscribe` stops the pump
+/// authoritatively; dropping it stops the same pump best-effort — the
+/// registry's lock may be contended at drop time, in which case only
+/// the explicit call is guaranteed.
 struct NsqSubscriber {
     topic: String,
-    done: Arc<Notify>,
+    shared: Arc<SubscriptionShared>,
+    inner: Arc<Inner>,
+}
+
+impl NsqSubscriber {
+    /// Stops the pump this handle owns, if it still owns the registry
+    /// entry: a duplicate subscribe replaces the entry, and a stale
+    /// handle's teardown must then touch nothing — stopping the
+    /// replacement's pump would orphan its deliveries.
+    async fn stop_owned(&self) {
+        let mut subscriptions = self.inner.subscriptions.lock().await;
+        let owned = subscriptions
+            .get(&self.topic)
+            .map(|current| Arc::ptr_eq(current, &self.shared))
+            .unwrap_or(false);
+        if owned {
+            self.shared.stopped.store(true, Ordering::SeqCst);
+            subscriptions.remove(&self.topic);
+        }
+    }
 }
 
 impl Subscriber for NsqSubscriber {
@@ -236,8 +276,28 @@ impl Subscriber for NsqSubscriber {
     }
 
     fn unsubscribe(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
-        self.done.notify_waiters();
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.stop_owned().await;
+            Ok(())
+        })
+    }
+}
+
+impl Drop for NsqSubscriber {
+    fn drop(&mut self) {
+        // The best-effort half of the stop contract: try_lock fails
+        // under an active holder, and only the explicit unsubscribe
+        // guarantees the stop.
+        if let Ok(mut subscriptions) = self.inner.subscriptions.try_lock() {
+            let owned = subscriptions
+                .get(&self.topic)
+                .map(|current| Arc::ptr_eq(current, &self.shared))
+                .unwrap_or(false);
+            if owned {
+                self.shared.stopped.store(true, Ordering::SeqCst);
+                subscriptions.remove(&self.topic);
+            }
+        }
     }
 }
 
@@ -277,12 +337,17 @@ impl NsqBroker {
                 "nsq {context}: frame too short"
             )));
         }
-        // Skip the 4-byte frame type, then the payload.
+        // Skip the 4-byte frame type, then the payload. Both reads ride
+        // the same timeout as their neighbors — a server stopping
+        // mid-frame must not hang the publish forever.
         let mut type_buf = [0u8; 4];
-        socket
-            .read_exact(&mut type_buf)
-            .await
-            .map_err(|e| BrokerError::Failed(format!("nsq {context}: {e}")))?;
+        tokio::time::timeout(
+            self.inner.options.request_timeout,
+            socket.read_exact(&mut type_buf),
+        )
+        .await
+        .map_err(|_| BrokerError::Failed(format!("nsq {context}: response timeout")))?
+        .map_err(|e| BrokerError::Failed(format!("nsq {context}: {e}")))?;
         let mut payload = vec![0u8; size - 4];
         tokio::time::timeout(
             self.inner.options.request_timeout,
@@ -315,26 +380,32 @@ impl NsqBroker {
         channel: &str,
         handler: Handler,
         ack_mode: AckMode,
-        task_done: Arc<Notify>,
+        shared: Arc<SubscriptionShared>,
     ) {
+        let stopped =
+            || self.inner.closed.load(Ordering::SeqCst) || shared.stopped.load(Ordering::SeqCst);
         loop {
-            if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            if stopped() {
                 return;
             }
-            let backoff_secs = 1u64;
             match self
-                .dial_pump(topic, channel, &handler, ack_mode, &task_done)
+                .dial_pump(topic, channel, &handler, ack_mode, &shared)
                 .await
             {
                 PumpOutcome::Closed => return,
                 PumpOutcome::Broken => {
                     // Backoff, then retry the whole dial; un-acked
-                    // messages redeliver server-side.
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(backoff_secs),
-                        task_done.notified(),
-                    )
-                    .await;
+                    // messages redeliver server-side. The sleep stays
+                    // checkable: ten short sleeps with a flag check
+                    // between each, so a stop landing during the backoff
+                    // takes effect within a tenth of a second instead of
+                    // waiting out a lost notification.
+                    for _ in 0..10 {
+                        if stopped() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
         }
@@ -346,12 +417,18 @@ impl NsqBroker {
         channel: &str,
         handler: &Handler,
         ack_mode: AckMode,
-        task_done: &Arc<Notify>,
+        shared: &SubscriptionShared,
     ) -> PumpOutcome {
+        let stopped =
+            || self.inner.closed.load(Ordering::SeqCst) || shared.stopped.load(Ordering::SeqCst);
         let connect = async {
-            let mut socket = TcpStream::connect(&self.inner.options.addr)
-                .await
-                .map_err(|e| BrokerError::Failed(format!("nsq connect: {e}")))?;
+            let mut socket = tokio::time::timeout(
+                self.inner.options.request_timeout,
+                TcpStream::connect(&self.inner.options.addr),
+            )
+            .await
+            .map_err(|_| BrokerError::Failed("nsq connect: timeout".to_string()))?
+            .map_err(|e| BrokerError::Failed(format!("nsq connect: {e}")))?;
             socket
                 .write_all(NSQ_MAGIC)
                 .await
@@ -379,6 +456,12 @@ impl NsqBroker {
             Ok(socket) => socket,
             Err(_) => return PumpOutcome::Broken,
         };
+        // The stop may have landed during the dial — the whole
+        // handshake is a notify-loss window unless the flag is read
+        // right here, before RDY opens the flow.
+        if stopped() {
+            return PumpOutcome::Closed;
+        }
 
         let (reader, mut writer) = socket.into_split();
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -391,26 +474,62 @@ impl NsqBroker {
             }
         });
 
+        // The reader task: complete frames only, pushed to the pump's
+        // channel. The pump's wait is a channel recv (cancellation-safe)
+        // — no read is ever dropped mid-frame with its bytes.
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel();
         let mut reader = reader;
-        loop {
-            let frame = tokio::select! {
-                _ = task_done.notified() => {
-                    let _ = outbound_tx.send(closing_frame());
-                    return PumpOutcome::Closed;
+        let reader_task = tokio::spawn(async move {
+            loop {
+                match read_frame(&mut reader).await {
+                    Ok(frame) => {
+                        if frames_tx.send(Ok(frame)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = frames_tx.send(Err(e));
+                        return;
+                    }
                 }
-                read = read_frame(&mut reader) => match read {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        // Broken: drop the writer task and retry the dial.
-                        let _ = outbound_tx.send(Vec::new());
+            }
+        });
+
+        loop {
+            if stopped() {
+                // CLS rides the writer best-effort; un-acked messages
+                // redeliver server-side either way (the socket closes
+                // with this pump).
+                let _ = outbound_tx.send(closing_frame());
+                drop(outbound_tx);
+                reader_task.abort();
+                return PumpOutcome::Closed;
+            }
+            let frame = tokio::select! {
+                frame = frames_rx.recv() => match frame {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(_)) | None => {
+                        // Broken: the socket died — drop the writer and
+                        // retry the dial.
                         drop(outbound_tx);
                         writer_task.abort();
                         return PumpOutcome::Broken;
                     }
                 },
+                // The idle tick: a quiet topic (heartbeats disabled)
+                // sends no frames, so the stop flags would otherwise go
+                // unread for as long as the broker stays silent.
+                _ = tokio::time::sleep(IDLE_CHECK) => continue,
             };
             match frame {
                 NsqFrame::Message { id, payload } => {
+                    // The delivery-face stop: a message already read when
+                    // the stop lands is dropped without dispatch — no FIN
+                    // is sent, so nsqd redelivers it to whoever receives
+                    // next after the in-flight timeout.
+                    if stopped() {
+                        continue;
+                    }
                     let message = json_de_envelope(&payload);
                     match ack_mode {
                         AckMode::Auto => {
@@ -464,7 +583,6 @@ impl NsqBroker {
                 NsqFrame::Response(payload) if payload.starts_with(b"OK") => {}
                 NsqFrame::Response(_) => {}
                 NsqFrame::Error(_payload) => {
-                    let _ = outbound_tx.send(Vec::new());
                     drop(outbound_tx);
                     writer_task.abort();
                     return PumpOutcome::Broken;

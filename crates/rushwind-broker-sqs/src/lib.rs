@@ -8,20 +8,39 @@
 //! - A contract **topic** is the queue name suffix of
 //!   [`SqsOptions::queue_url`]; the queue url is the engine's own —
 //!   one queue per engine, every subscribe shares it.
-//! - Publish rides `Action=SendMessage` (the payload as
-//!   `MessageBody`, the headers as numbered `MessageAttribute.N`
-//!   entries — SQS's ten-attribute cap refuses the eleventh header
-//!   with a typed failure rather than silently dropping one).
+//! - Publish rides `Action=SendMessage`: the payload rides `MessageBody`
+//!   in a base64 envelope (SQS's body is a text field, the contract's
+//!   payload is bytes — the same stance gcpubsub and nsq take), and the
+//!   headers ride numbered `MessageAttribute.N` entries — SQS's
+//!   ten-attribute cap refuses the eleventh header with a typed failure
+//!   rather than silently dropping one. On receive, a body that decodes
+//!   as the envelope yields its bytes; one that does not — a foreign
+//!   producer's plain text — rides as its own bytes.
 //! - Deliveries ride `Action=ReceiveMessage` (bounded batches,
-//!   `WaitTimeSeconds: 0` so the pump stays cancellation-responsive).
-//!   [`AckMode::Auto`] (the default) deletes every received message at
-//!   dispatch — SQS redelivers only messages whose visibility timeout
-//!   lapses, so settling on dispatch means never redelivering.
-//!   [`AckMode::Manual`] hands the receipt handle to the handler:
-//!   the ack hook deletes (settled, never redelivered), the nack hook
-//!   zeroes the visibility timeout for [`NackAction::Requeue`] (the
-//!   message re-enters the receive stream immediately) and deletes for
-//!   [`NackAction::Drop`] (settled away).
+//!   `WaitTimeSeconds: 0` so the pump stays cancellation-responsive,
+//!   an empty poll spacing itself with a short backoff). The response's
+//!   body MD5 is verified — a mismatch fails the receive and the
+//!   messages ride their visibility timeout rather than delivering
+//!   corrupt text once. [`AckMode::Auto`] (the default) deletes every
+//!   received message at dispatch — SQS redelivers only messages whose
+//!   visibility timeout lapses, so settling on dispatch means never
+//!   redelivering. [`AckMode::Manual`] hands the receipt handle to the
+//!   handler: the ack hook deletes (settled, never redelivered), the
+//!   nack hook zeroes the visibility timeout for [`NackAction::Requeue`]
+//!   (the message re-enters the receive stream immediately) and deletes
+//!   for [`NackAction::Drop`] (settled away).
+//! - The receive pump is a sequential loop: the checked `stopped` flag
+//!   is read at every loop top and before every dispatch, every pending
+//!   settle drains before the next receive, and one receive runs to
+//!   completion — a stop (unsubscribe, drop of the handle, or
+//!   disconnect) lands at the next loop top regardless of timing, and
+//!   a delivery already received when the stop lands is dropped without
+//!   dispatch (its visibility timeout returns it to the queue
+//!   server-side). A duplicate subscribe retires the previous pump —
+//!   the newest handler owns the filter, the rabbitmq/redis shape.
+//!   Settles enqueued by handlers whose pump has already exited fail
+//!   with a clear error: the message re-enters the receive stream after
+//!   its visibility timeout.
 //! - **Auth**: static keys
 //!   ([`SqsOptions::access_key`] / [`SqsOptions::secret_key`]) signed
 //!   per request — SigV4 computed by [`sigv4_post`], the same
@@ -34,14 +53,22 @@
 #![deny(missing_debug_implementations)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use hmac::{KeyInit, Mac};
 use rushwind_broker::{
     AckMode, BoxFuture, Broker, BrokerError, Event, Handler, Message, NackAction, Subscriber,
 };
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex};
+
+/// The receive loop's empty-poll spacing: with `WaitTimeSeconds: 0`
+/// (kept for cancellation responsiveness) an empty queue would
+/// otherwise hot-poll the endpoint.
+const EMPTY_POLL_BACKOFF: Duration = Duration::from_millis(200);
 
 /// The engine's settings.
 #[derive(Debug, Clone, Default)]
@@ -68,13 +95,18 @@ pub struct SqsOptions {
 struct Inner {
     options: SqsOptions,
     http: reqwest::Client,
-    closed: std::sync::atomic::AtomicBool,
+    closed: AtomicBool,
     subscriptions: Mutex<HashMap<String, Arc<SubscriptionShared>>>,
 }
 
+/// One subscription's stop face. A checked flag — read at the pump's
+/// loop top and before every dispatch — not a wakeup: a notify-style
+/// signal landing between the pump's await points would be lost, and
+/// the pump would keep receiving (and, under Auto, deleting) messages
+/// for a subscription that was unsubscribed.
 #[derive(Debug)]
 struct SubscriptionShared {
-    done: Arc<Notify>,
+    stopped: AtomicBool,
 }
 
 /// The Amazon SQS broker.
@@ -96,7 +128,7 @@ impl SqsBroker {
         Ok(Self {
             inner: Arc::new(Inner {
                 http: reqwest::Client::new(),
-                closed: std::sync::atomic::AtomicBool::new(false),
+                closed: AtomicBool::new(false),
                 subscriptions: Mutex::new(HashMap::new()),
                 options,
             }),
@@ -273,12 +305,10 @@ impl Broker for SqsBroker {
 
     fn disconnect(&self) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
-            self.inner
-                .closed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.inner.closed.store(true, Ordering::SeqCst);
             let subscriptions = self.inner.subscriptions.lock().await;
             for shared in subscriptions.values() {
-                shared.done.notify_waiters();
+                shared.stopped.store(true, Ordering::SeqCst);
             }
             Ok(())
         })
@@ -290,7 +320,7 @@ impl Broker for SqsBroker {
         message: Message,
     ) -> BoxFuture<'a, Result<(), BrokerError>> {
         Box::pin(async move {
-            if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.inner.closed.load(Ordering::SeqCst) {
                 return Err(BrokerError::NotConnected);
             }
             let _ = topic; // The engine's queue is the destination.
@@ -299,10 +329,14 @@ impl Broker for SqsBroker {
                     "sqs: more than ten message attributes".to_string(),
                 ));
             }
-            let mut params: Vec<(String, String)> = vec![(
-                "MessageBody".to_string(),
-                String::from_utf8_lossy(&message.payload).to_string(),
-            )];
+            // SQS's MessageBody is a text field and the contract's
+            // payload is bytes: the payload rides the same base64
+            // envelope the gcpubsub and nsq engines use. On receive, a
+            // body that decodes as the envelope yields its bytes; one
+            // that does not — a foreign producer's plain text, or the
+            // mock's planted bodies — rides as its own bytes.
+            let mut params: Vec<(String, String)> =
+                vec![("MessageBody".to_string(), BASE64.encode(&message.payload))];
             for (index, (key, value)) in message.headers.iter().enumerate() {
                 params.push((format!("MessageAttribute.{}.Name", index + 1), key.clone()));
                 params.push((
@@ -326,13 +360,22 @@ impl Broker for SqsBroker {
         handler: Handler,
     ) -> BoxFuture<'a, Result<Box<dyn Subscriber>, BrokerError>> {
         Box::pin(async move {
-            if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.inner.closed.load(Ordering::SeqCst) {
                 return Err(BrokerError::NotConnected);
             }
-            let done = Arc::new(Notify::new());
-            let shared = Arc::new(SubscriptionShared { done: done.clone() });
+            let shared = Arc::new(SubscriptionShared {
+                stopped: AtomicBool::new(false),
+            });
             {
                 let mut subscriptions = self.inner.subscriptions.lock().await;
+                // A duplicate subscribe retires the old pump — the
+                // rabbitmq/redis engines' same-topic shape: the newest
+                // handler owns the filter, and the previous pump exits at
+                // its next loop top instead of leaking past the
+                // overwritten registry entry.
+                if let Some(previous) = subscriptions.get(topic) {
+                    previous.stopped.store(true, Ordering::SeqCst);
+                }
                 subscriptions.insert(topic.to_string(), Arc::clone(&shared));
             }
 
@@ -341,97 +384,123 @@ impl Broker for SqsBroker {
             });
             let topic_for_task = topic.to_string();
             let handler = Arc::clone(&handler);
-            let task_done = done.clone();
             let ack_mode = self.inner.options.ack_mode;
+            let shared_for_handle = Arc::clone(&shared);
             let (settle_tx, settle_rx) = mpsc::unbounded_channel::<(String, SettleAction)>();
             tokio::spawn(async move {
                 let mut settle_rx = settle_rx;
                 loop {
-                    if engine
-                        .inner
-                        .closed
-                        .load(std::sync::atomic::Ordering::SeqCst)
+                    // The checked stop, read at every loop top: there is
+                    // no wakeup to lose — the flag is the signal, so a
+                    // stop landing between the pump's await points takes
+                    // effect here regardless of timing.
+                    if engine.inner.closed.load(Ordering::SeqCst)
+                        || shared.stopped.load(Ordering::SeqCst)
                     {
                         return;
                     }
-                    tokio::select! {
-                        _ = task_done.notified() => return,
-                        settle = settle_rx.recv() => match settle {
-                            Some((receipt, action)) => {
-                                let _ = engine.settle(&receipt, action).await;
-                            }
-                            None => return,
-                        },
-                        received = engine.receive_once(&topic_for_task, settle_tx.clone()) => match received {
-                            Ok(deliveries) => {
-                                for delivery in deliveries {
-                                    match ack_mode {
-                                        AckMode::Auto => {
-                                            let event = Event::new(
-                                                delivery.topic.clone(),
-                                                delivery.message.clone(),
-                                            );
-                                            tokio::spawn(handler(event));
-                                            let _ = engine
-                                                .settle(&delivery.receipt, SettleAction::Delete)
-                                                .await;
-                                        }
-                                        AckMode::Manual => {
-                                            let ack_tx = delivery.settle_tx.clone();
-                                            let ack_receipt = delivery.receipt.clone();
-                                            let nack_tx = delivery.settle_tx.clone();
-                                            let nack_receipt = delivery.receipt.clone();
-                                            let event = Event::settle_with(
-                                                delivery.topic.clone(),
-                                                delivery.message.clone(),
-                                                move || {
-                                                    let tx = ack_tx.clone();
-                                                    let receipt = ack_receipt.clone();
-                                                    Box::pin(async move {
-                                                        tx.send((receipt, SettleAction::Delete))
-                                                            .map_err(|e| BrokerError::Failed(
-                                                                format!("sqs settle: {e}"),
+                    // Every pending settle drains before the next receive:
+                    // settles and receives never overlap and no settle is
+                    // abandoned mid-request. A settle enqueued while the
+                    // receive is in flight waits for the next loop top —
+                    // the receive is never cancelled under it.
+                    while let Ok((receipt, action)) = settle_rx.try_recv() {
+                        let _ = engine.settle(&receipt, action).await;
+                    }
+                    match engine
+                        .receive_once(&topic_for_task, settle_tx.clone())
+                        .await
+                    {
+                        Ok(deliveries) if deliveries.is_empty() => {
+                            tokio::time::sleep(EMPTY_POLL_BACKOFF).await;
+                        }
+                        Ok(deliveries) => {
+                            for delivery in deliveries {
+                                // The delivery-face stop: a delivery already
+                                // received when the stop lands is dropped
+                                // without dispatch — the destructive Auto
+                                // delete must not run for a stopped
+                                // subscription, and under Manual the event
+                                // would settle into a channel no pump drains
+                                // anymore. The message's visibility timeout
+                                // returns it to the queue server-side.
+                                if shared.stopped.load(Ordering::SeqCst)
+                                    || engine.inner.closed.load(Ordering::SeqCst)
+                                {
+                                    break;
+                                }
+                                match ack_mode {
+                                    AckMode::Auto => {
+                                        let event = Event::new(
+                                            delivery.topic.clone(),
+                                            delivery.message.clone(),
+                                        );
+                                        tokio::spawn(handler(event));
+                                        let _ = engine
+                                            .settle(&delivery.receipt, SettleAction::Delete)
+                                            .await;
+                                    }
+                                    AckMode::Manual => {
+                                        let ack_tx = delivery.settle_tx.clone();
+                                        let ack_receipt = delivery.receipt.clone();
+                                        let nack_tx = delivery.settle_tx.clone();
+                                        let nack_receipt = delivery.receipt.clone();
+                                        let event = Event::settle_with(
+                                            delivery.topic.clone(),
+                                            delivery.message.clone(),
+                                            move || {
+                                                let tx = ack_tx.clone();
+                                                let receipt = ack_receipt.clone();
+                                                Box::pin(async move {
+                                                    tx.send((receipt, SettleAction::Delete))
+                                                        .map_err(|e| {
+                                                            BrokerError::Failed(format!(
+                                                                "sqs settle: {e}"
                                                             ))
+                                                        })
+                                                })
+                                                    as BoxFuture<'static, Result<(), BrokerError>>
+                                            },
+                                            move |action| {
+                                                let tx = nack_tx.clone();
+                                                let receipt = nack_receipt.clone();
+                                                Box::pin(async move {
+                                                    let settled = match action {
+                                                        // The zeroed visibility
+                                                        // timeout requeues
+                                                        // immediately.
+                                                        NackAction::Requeue => {
+                                                            SettleAction::Requeue
+                                                        }
+                                                        // Deleted poison —
+                                                        // settled away.
+                                                        NackAction::Drop => SettleAction::Delete,
+                                                    };
+                                                    tx.send((receipt, settled)).map_err(|e| {
+                                                        BrokerError::Failed(format!(
+                                                            "sqs settle: {e}"
+                                                        ))
                                                     })
-                                                        as BoxFuture<'static, Result<(), BrokerError>>
-                                                },
-                                                move |action| {
-                                                    let tx = nack_tx.clone();
-                                                    let receipt = nack_receipt.clone();
-                                                    Box::pin(async move {
-                                                        let settled = match action {
-                                                            // The zeroed visibility
-                                                            // timeout requeues
-                                                            // immediately.
-                                                            NackAction::Requeue => SettleAction::Requeue,
-                                                            // Deleted poison —
-                                                            // settled away.
-                                                            NackAction::Drop => SettleAction::Delete,
-                                                        };
-                                                        tx.send((receipt, settled))
-                                                            .map_err(|e| BrokerError::Failed(
-                                                                format!("sqs settle: {e}"),
-                                                            ))
-                                                    })
-                                                        as BoxFuture<'static, Result<(), BrokerError>>
-                                                },
-                                            );
-                                            tokio::spawn(handler(event));
-                                        }
+                                                })
+                                                    as BoxFuture<'static, Result<(), BrokerError>>
+                                            },
+                                        );
+                                        tokio::spawn(handler(event));
                                     }
                                 }
                             }
-                            Err(_) => {
-                                tokio::time::sleep(Duration::from_millis(250)).await;
-                            }
-                        },
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
                     }
                 }
             });
 
             Ok(Box::new(SqsSubscriber {
                 topic: topic.to_string(),
-                done,
+                shared: shared_for_handle,
+                inner: Arc::clone(&self.inner),
             }) as Box<dyn Subscriber>)
         })
     }
@@ -479,9 +548,35 @@ impl SqsBroker {
             .await?;
         let mut deliveries = Vec::new();
         for block in split_xml_blocks(&xml, "Message") {
-            let receipt = xml_tag(&block, "ReceiptHandle").unwrap_or_default();
-            let body = xml_tag(&block, "Body").unwrap_or_default();
-            let mut message = Message::from_payload(body.into_bytes());
+            // A message without a receipt handle can never be settled:
+            // skipping it leaves the message to its visibility timeout
+            // instead of dispatching an event whose every settlement
+            // would fail invisibly.
+            let Some(receipt) = xml_tag(&block, "ReceiptHandle") else {
+                continue;
+            };
+            let body_raw = xml_tag(&block, "Body").unwrap_or_default();
+            let body = xml_decode(&body_raw);
+            // The response's integrity check: the MD5 of the body as the
+            // sender wrote it (the digest covers the unescaped body, so
+            // it verifies after the entity decode). A mismatch fails the
+            // whole receive — the messages ride their visibility timeout
+            // back into the queue instead of delivering a corrupt
+            // payload once.
+            if let Some(expected) = xml_tag(&block, "MD5OfBody") {
+                if md5_hex(body.as_bytes()) != expected {
+                    return Err(BrokerError::Failed(
+                        "sqs receive: body MD5 mismatch".to_string(),
+                    ));
+                }
+            }
+            let payload = match BASE64.decode(body.as_bytes()) {
+                Ok(bytes) => bytes,
+                // Not the engine's envelope: a foreign producer's plain
+                // text rides as its own bytes.
+                Err(_) => body.into_bytes(),
+            };
+            let mut message = Message::from_payload(payload);
             for (key, value) in extract_attributes(&block) {
                 message.headers.insert(key, value);
             }
@@ -496,11 +591,32 @@ impl SqsBroker {
     }
 }
 
-/// The subscription handle: dropping it (or unsubscribing) stops the
-/// receive loop.
+/// The subscription handle. `unsubscribe` stops the receive loop
+/// authoritatively; dropping it stops the same loop best-effort — the
+/// registry's lock may be contended at drop time, in which case only
+/// the explicit call is guaranteed.
 struct SqsSubscriber {
     topic: String,
-    done: Arc<Notify>,
+    shared: Arc<SubscriptionShared>,
+    inner: Arc<Inner>,
+}
+
+impl SqsSubscriber {
+    /// Stops the pump this handle owns, if it still owns the registry
+    /// entry: a duplicate subscribe replaces the entry, and a stale
+    /// handle's teardown must then touch nothing — stopping the
+    /// replacement's pump would orphan its deliveries.
+    async fn stop_owned(&self) {
+        let mut subscriptions = self.inner.subscriptions.lock().await;
+        let owned = subscriptions
+            .get(&self.topic)
+            .map(|current| Arc::ptr_eq(current, &self.shared))
+            .unwrap_or(false);
+        if owned {
+            self.shared.stopped.store(true, Ordering::SeqCst);
+            subscriptions.remove(&self.topic);
+        }
+    }
 }
 
 impl Subscriber for SqsSubscriber {
@@ -509,8 +625,28 @@ impl Subscriber for SqsSubscriber {
     }
 
     fn unsubscribe(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
-        self.done.notify_waiters();
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.stop_owned().await;
+            Ok(())
+        })
+    }
+}
+
+impl Drop for SqsSubscriber {
+    fn drop(&mut self) {
+        // The best-effort half of the stop contract: try_lock fails
+        // under an active holder, and only the explicit unsubscribe
+        // guarantees the stop.
+        if let Ok(mut subscriptions) = self.inner.subscriptions.try_lock() {
+            let owned = subscriptions
+                .get(&self.topic)
+                .map(|current| Arc::ptr_eq(current, &self.shared))
+                .unwrap_or(false);
+            if owned {
+                self.shared.stopped.store(true, Ordering::SeqCst);
+                subscriptions.remove(&self.topic);
+            }
+        }
     }
 }
 
@@ -677,12 +813,79 @@ fn xml_tag(block: &str, tag: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Decodes the XML entities the Query API escapes text values with —
+/// the five named entities plus decimal and hex numeric references. A
+/// malformed reference (no closing `;`, unknown name) passes its `&`
+/// through literally.
+fn xml_decode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let Some(end) = tail.find(';') else {
+            out.push('&');
+            rest = &rest[at + 1..];
+            continue;
+        };
+        let entity = &tail[1..end];
+        let decoded = match entity {
+            "amp" => Some('&'.to_string()),
+            "lt" => Some('<'.to_string()),
+            "gt" => Some('>'.to_string()),
+            "quot" => Some('"'.to_string()),
+            "apos" => Some('\''.to_string()),
+            _ => {
+                if let Some(digits) = entity.strip_prefix('#') {
+                    let code = match digits
+                        .strip_prefix('x')
+                        .or_else(|| digits.strip_prefix('X'))
+                    {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => digits.parse::<u32>().ok(),
+                    };
+                    code.and_then(char::from_u32).map(|c| c.to_string())
+                } else {
+                    None
+                }
+            }
+        };
+        match decoded {
+            Some(text) => {
+                out.push_str(&text);
+                rest = &tail[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[at + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Hex MD5 — the response's body-integrity digest.
+fn md5_hex(data: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// The `MessageAttribute.N` entries of a receive block, as key-values.
 fn extract_attributes(block: &str) -> Vec<(String, String)> {
     // The ReceiveMessage response nests each attribute as a repeated
     // `<MessageAttribute>` element (no numbered suffix — that shape
     // belongs to the *request* parameters), with the value inside a
     // nested `<Value>`: `<Name>hop</Name><Value><StringValue>one`.
+    // Binary attributes (`BinaryValue`, base64) decode into the same
+    // String header as lossy UTF-8 — the contract's header is a
+    // String, so the bytes render with U+FFFD replacements.
     let mut attributes = Vec::new();
     let mut rest = block;
     while let Some(start) = rest.find("<MessageAttribute>") {
@@ -695,8 +898,57 @@ fn extract_attributes(block: &str) -> Vec<(String, String)> {
         let Some(name) = xml_tag(entry, "Name") else {
             continue;
         };
-        let value = xml_tag(entry, "StringValue").unwrap_or_default();
-        attributes.push((name, value));
+        let value = match xml_tag(entry, "StringValue") {
+            Some(text) => xml_decode(&text),
+            None => match xml_tag(entry, "BinaryValue") {
+                Some(binary) => match BASE64.decode(binary.as_bytes()) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                    Err(_) => binary,
+                },
+                None => String::new(),
+            },
+        };
+        attributes.push((xml_decode(&name), value));
     }
     attributes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The entity decode: named entities, decimal and hex numeric
+    /// references, and malformed references passing their `&` through.
+    #[test]
+    fn xml_decode_expands_named_and_numeric_entities() {
+        assert_eq!(xml_decode("a&amp;b"), "a&b");
+        assert_eq!(xml_decode("&lt;tag&gt;"), "<tag>");
+        assert_eq!(xml_decode("&quot;q&quot; &apos;a&apos;"), "\"q\" 'a'");
+        assert_eq!(xml_decode("&#65;&#x42;"), "AB");
+        assert_eq!(xml_decode("no-semi&amp"), "no-semi&amp");
+        assert_eq!(xml_decode("unknown&bogus;entity"), "unknown&bogus;entity");
+    }
+
+    /// The payload's decode stance: the envelope decodes to its bytes;
+    /// a non-envelope body (a foreign producer's plain text — note the
+    /// `-` outside the base64 alphabet) rides as its own bytes.
+    #[test]
+    fn body_decode_prefers_the_envelope_and_falls_back_to_raw() {
+        let encoded = BASE64.encode(b"plain");
+        assert_eq!(BASE64.decode(encoded.as_bytes()).unwrap(), b"plain");
+        assert!(BASE64.decode(b"delivered-text").is_err());
+    }
+
+    /// Binary attributes decode as lossy UTF-8 into the String header.
+    #[test]
+    fn binary_attributes_decode_as_lossy_utf8() {
+        let block = format!(
+            "<MessageAttribute><Name>blob</Name><Value><BinaryValue>{}</BinaryValue></Value></MessageAttribute>",
+            BASE64.encode([0u8, 255])
+        );
+        let attributes = extract_attributes(&block);
+        assert_eq!(attributes.len(), 1);
+        assert_eq!(attributes[0].0, "blob");
+        assert_eq!(attributes[0].1, "\u{0}\u{FFFD}");
+    }
 }

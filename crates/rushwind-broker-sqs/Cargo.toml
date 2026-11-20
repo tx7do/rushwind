@@ -18,6 +18,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 hmac = { workspace = true }
+base64 = { workspace = true }
+md-5 = { workspace = true }
 sha2 = { workspace = true }
 form_urlencoded = "1"
 
@@ -25,5 +27,7 @@ form_urlencoded = "1"
 live = []
 
 [dev-dependencies]
+rushwind-testkit = { workspace = true, features = ["broker"] }
+md-5 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }
 reqwest = { workspace = true, default-features = false, features = ["json"] }

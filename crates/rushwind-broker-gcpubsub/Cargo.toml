@@ -20,4 +20,5 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 base64 = "0.22"
 
 [dev-dependencies]
+rushwind-testkit = { workspace = true, features = ["broker"] }
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }

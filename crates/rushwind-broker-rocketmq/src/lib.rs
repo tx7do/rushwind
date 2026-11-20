@@ -14,10 +14,18 @@
 //!   RocketMQ's `\u0001`/`\u0002`-joined properties string.
 //! - `PULL_MESSAGE` (20) — a bounded pull from the queue's committed
 //!   offset; the response's `extFields` carries `pullStatus`
-//!   (`FOUND`/`NO_NEW_MSG`), `nextBeginOffset`, and `msgFoundList` —
-//!   JSON-mode MessageExt objects whose `body` (base64), `properties`
-//!   map, and `queueOffset` the engine reads.
-//! - `UPDATE_CONSUMER_OFFSET` (15) — the settlement wire face.
+//!   (`FOUND`/`NO_NEW_MSG`) and `nextBeginOffset`, and the body rides
+//!   the broker's CommitLog record stream (`[SIZE(4, inclusive of
+//!   itself)][…BODYLEN BODY TOPICLEN TOPIC PROPLEN PROPS]` per record),
+//!   walked by SIZE — payload at `BODYLEN`, properties as the
+//!   `\u0001`/`\u0002`-joined KEY/VALUE string. A record that
+//!   truncates or misaligns ends the decode (the batch's remaining
+//!   records drop, the offset still commits — at-least-once tolerates
+//!   the redelivery; a panic here would kill the subscription
+//!   silently, so every slice is bounds-checked).
+//! - `UPDATE_CONSUMER_OFFSET` (15) — the settlement wire face
+//!   (fire-and-forget: a failed commit surfaces as duplicate
+//!   deliveries after a restart, never as loss).
 //!
 //! # Settlement semantics
 //!
@@ -32,15 +40,21 @@
 //! committed offset, redelivering the unsettled messages, RocketMQ's
 //! own at-least-once shape. A handler that never settles parks the
 //! window — the honest consequence without per-message visibility
-//! timers.
+//! timers (an unsubscribe closes a parked window within the poll
+//! tick and commits nothing; the batch redelivers from its start on
+//! the next subscription).
 //!
 //! # The minimal honest subset
 //!
 //! The deployment provides the broker address directly
 //! ([`RocketmqOptions::broker_addr`]) — nameserver routing is out of
-//! scope. One queue (`queueId: 0`) per engine. Heartbeats are not
-//! sent: this engine is pull-only and never rebalances, so RocketMQ's
-//! heartbeat/rebalance machinery has nothing to track.
+//! scope. One queue (`queueId: 0`) per engine. The pump opens with a
+//! single `HEARTBEAT` registration carrying the consumer group's
+//! subscription — the real broker refuses PULLs from unregistered
+//! groups — and retries it with a checkable backoff while the
+//! subscription lives; there is no heartbeat *keepalive* (this engine
+//! is pull-only and never rebalances, so RocketMQ's
+//! heartbeat/rebalance machinery has nothing to track).
 //!
 //! **Compatibility note**: the protocol faces below are pinned by the
 //! in-process mock (the frames are byte-self-consistent between the
@@ -352,6 +366,10 @@ struct PullBatch {
     next_begin_offset: i64,
 }
 
+/// The parked Manual window's poll spacing: an unsubscribe closes the
+/// window within this bound even when no settle command ever arrives.
+const WINDOW_POLL: Duration = Duration::from_millis(100);
+
 /// One settle command from a handler hook to the pump.
 enum SettleCommand {
     /// The handler acked (or dropped the poison): the window may close
@@ -401,36 +419,51 @@ async fn run_pump(
     })
     .to_string()
     .into_bytes();
-    let registered = call(
-        &engine.inner.options,
-        CODE_HEARTBEAT,
-        Value::Null,
-        Some(&heartbeat_body),
-        "heartbeat",
-    )
-    .await;
-    eprintln!(
-        "[hb] registered = {:?}",
-        registered.as_ref().map(|(h, _)| h.get("code"))
-    );
-    if let Err(error) = &registered {
-        eprintln!("[hb] registration failed: {error}");
-        return; // The registration failed; the dial loop's caller retries.
+    // The registration chain: a broker that is briefly unreachable (or
+    // answers a non-zero code) retries with a checkable backoff — the
+    // old single-shot shape returned and claimed "the dial loop's
+    // caller retries", but no caller retried: the subscription died
+    // silently while its handle stayed live.
+    loop {
+        if shared.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        let registered = call(
+            &engine.inner.options,
+            CODE_HEARTBEAT,
+            Value::Null,
+            Some(&heartbeat_body),
+            "heartbeat",
+        )
+        .await;
+        let code = registered
+            .as_ref()
+            .ok()
+            .and_then(|(header, _)| header.get("code").and_then(Value::as_i64));
+        if code == Some(0) {
+            break;
+        }
+        for _ in 0..20 {
+            if shared.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     loop {
         if shared.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let pulled = tokio::select! {
-            _ = shared.done.notified() => return,
-            pulled = pull_batch(&engine.inner.options, &topic, next_offset) => match pulled {
-                Ok(batch) => batch,
-                Err(e) => {
-                    eprintln!("[pull-err] {e}");
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-            },
+        // One pull runs to completion — no select around it, so a stop
+        // (or anything else) can never cancel an in-flight request
+        // mid-call. The stop takes effect at the next loop top; the
+        // pull is bounded by the request timeout.
+        let pulled = match pull_batch(&engine.inner.options, &topic, next_offset).await {
+            Ok(batch) => batch,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
         };
         let batch_start = next_offset;
         let window_next = pulled.next_begin_offset;
@@ -495,8 +528,16 @@ async fn run_pump(
             let mut outstanding = dispatched;
             let mut requeued = false;
             while outstanding > 0 {
+                // The stop must reach a *parked* window: the bare
+                // notified() wait lost notifications landing between
+                // recv polls and hung here forever — the tick re-checks
+                // the flag, so an unsubscribe closes the window within
+                // WINDOW_POLL even when no settle ever arrives.
+                if shared.stopped.load(Ordering::SeqCst) {
+                    return;
+                }
                 let command = tokio::select! {
-                    _ = shared.done.notified() => return,
+                    _ = tokio::time::sleep(WINDOW_POLL) => continue,
                     command = settle_rx.recv() => match command {
                         Some(command) => command,
                         None => return,
@@ -599,7 +640,12 @@ async fn pull_batch(
                 break;
             };
             let payload = cursor[88..88 + body_len].to_vec();
-            let properties_raw = &cursor[props_pos + 2..props_pos + 2 + props_len];
+            // The properties length rides the data too: a truncated or
+            // misaligned record must end the decode, not panic the
+            // pump task (a panic here kills the subscription silently).
+            let Some(properties_raw) = cursor.get(props_pos + 2..props_pos + 2 + props_len) else {
+                break;
+            };
             let mut message = Message::from_payload(payload);
             for pair in properties_raw.split(|b| *b == 2u8) {
                 if let Some(separator) = pair.iter().position(|b| *b == 1u8) {
@@ -612,7 +658,7 @@ async fn pull_batch(
             cursor = &cursor[size..];
         }
     }
-    eprintln!("[pd] status={pull_status} deliveries={}", deliveries.len());
+
     Ok(PullBatch {
         deliveries,
         next_begin_offset,
