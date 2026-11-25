@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 tracing = { workspace = true }
+rushwind-panic = { workspace = true }
 rushwind-health = { workspace = true, optional = true }
 rushwind-metrics-prometheus = { workspace = true, optional = true }
 

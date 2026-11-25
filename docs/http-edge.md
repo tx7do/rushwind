@@ -36,8 +36,8 @@
 
 | 请求序 | 包装器 | 语义 |
 |:---|:---|:---|
-| 1 | `with_recovery` | axum 无内建 panic 隔离（panic 直接断连接）；`catch_unwind` 后回 `500/INTERNAL_PANIC` 信封，payload 只进日志 |
-| 2 | `with_request_id` | 回显入站 `x-request-id`，缺失则 OS CSPRNG 铸 32 hex（与 session 引擎同形）；插 `RequestId` 扩展 + 响应头 |
+| 1 | `with_request_id` | 回显入站 `x-request-id`，缺失则 OS CSPRNG 铸 32 hex（与 session 引擎同形）；插 `RequestId` 扩展 + 响应头。最外层——recovery 层在 panic 上下文里要读它 |
+| 2 | `with_recovery` | axum 无内建 panic 隔离（panic 直接断连接）；把请求身份（request_id/method/path）挂成 `rushwind-panic` 上下文后 `catch_unwind`，回 `500/INTERNAL_PANIC` 信封。报告由进程级 hook 单行输出（target `rushwind.panic`，带请求上下文），本层不再自打日志——无双报 |
 | 3 | `with_logging` | 每请求一个 `rushwind.http` span（与 storage-observe 的 `rushwind.storage` 同约定），记 method/path/request_id/status/latency；导出交 subscriber |
 | 4 | `with_cors` | `CorsOptions`（origin 列表 + credentials + methods/headers/expose/max_age）→ tower-http 层；`*` + credentials 走逐请求镜像（浏览器拒绝 `*` 与 `ACAC: true` 并存） |
 | 5 | `with_timeout` | 预算到点丢弃内层 future，回 `504/DEADLINE_EXCEEDED`——客户端见信封，handler 直接消失 |
@@ -76,5 +76,5 @@ security 契约明说 HTTP 逐路由执法是应用的中间件，本 crate 把�
 | 错误载体 | `HttpError: IntoResponse`，`Result<T, HttpError>` 即渲染 |
 | 引擎错误拒绝码 | 锚 403，reason 取分类学 code |
 | CORS | tower-http `cors` feature 承载预检语义，策略面收敛为 `CorsOptions` |
-| panic 恢复 | `catch_unwind`（panic=unwind 前提下） |
+| panic 恢复 | `catch_unwind`（panic=unwind 前提下）；请求身份挂 `rushwind-panic` 上下文，报告由进程 hook 单行输出，本层不自打日志 |
 | 请求上下文 | 请求扩展（`RequestId`/`AuthClaims`/`AuthContext`）+ 提取器，无贯穿式上下文参数 |

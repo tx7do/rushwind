@@ -100,6 +100,7 @@ rushwind-circuitbreaker = { path = "crates/rushwind-circuitbreaker", version = "
 rushwind-transaction = { path = "crates/rushwind-transaction", version = "0.0.1" }
 rushwind-transaction-dtm = { path = "crates/rushwind-transaction-dtm", version = "0.0.1" }
 rushwind-metrics = { path = "crates/rushwind-metrics", version = "0.0.1" }
+rushwind-panic = { path = "crates/rushwind-panic", version = "0.0.1" }
 prometheus = "0.14"
 rushwind-authn = { path = "crates/rushwind-authn", version = "0.0.1" }
 rushwind-authn-apikey = { path = "crates/rushwind-authn-apikey", version = "0.0.1" }

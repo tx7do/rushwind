@@ -495,7 +495,7 @@ async fn route_message(shared: &Shared, frame: Frame, ack_mode: AckMode) {
     };
     if ack_mode == AckMode::Auto {
         let event = Event::new(topic, Message::from_payload(frame.body));
-        tokio::spawn(handler(event));
+        rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
         return;
     }
     // Manual: the server-issued ack id rides the event's hooks.
@@ -509,7 +509,7 @@ async fn route_message(shared: &Shared, frame: Frame, ack_mode: AckMode) {
         // that omits it has handed us an unsettleable frame — deliver
         // it as an auto event rather than silently swallow it.
         let event = Event::new(topic, Message::from_payload(frame.body));
-        tokio::spawn(handler(event));
+        rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
         return;
     };
     let frames_tx = shared.frames.lock().await.clone();
@@ -550,7 +550,7 @@ async fn route_message(shared: &Shared, frame: Frame, ack_mode: AckMode) {
             }) as BoxFuture<'static, Result<(), BrokerError>>
         },
     );
-    tokio::spawn(handler(event));
+    rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
 }
 
 impl Broker for StompBroker {

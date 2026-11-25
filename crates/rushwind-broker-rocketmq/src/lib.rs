@@ -473,7 +473,7 @@ async fn run_pump(
             match ack_mode {
                 AckMode::Auto => {
                     let event = Event::new(dispatch_topic, delivery.message);
-                    tokio::spawn(handler(event));
+                    rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                 }
                 AckMode::Manual => {
                     let ack_tx = settle_tx.clone();
@@ -507,7 +507,7 @@ async fn run_pump(
                                 as BoxFuture<'static, Result<(), BrokerError>>
                         },
                     );
-                    tokio::spawn(handler(event));
+                    rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                 }
             }
         }

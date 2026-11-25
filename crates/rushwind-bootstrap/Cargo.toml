@@ -44,11 +44,13 @@ rushwind-oss = { workspace = true }
 rushwind-ai = { workspace = true }
 rushwind-script = { workspace = true }
 rushwind-http = { workspace = true }
+rushwind-panic = { workspace = true, features = ["tracing"] }
 axum = { version = "0.8", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 getrandom = { workspace = true }
+tracing = { workspace = true }
 # Feature-gated engine + mount surfaces; see [features] above.
 rushwind-health = { workspace = true, optional = true }
 rushwind-metrics-prometheus = { workspace = true, optional = true }

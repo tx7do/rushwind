@@ -83,6 +83,29 @@ pub struct BootstrapConfig {
     /// fails the assembly when the feature is compiled out.
     #[serde(default)]
     pub tracer: Option<serde_json::Value>,
+    /// Process-level panic reporting (the `rushwind-panic` tracing
+    /// reporter, target `rushwind.panic`). Omitting the section keeps
+    /// the default-on behavior.
+    #[serde(default)]
+    pub panic_reporting: Option<PanicReportingConfig>,
+}
+
+/// The panic-reporting toggle: whether assembly plugs the default
+/// `rushwind-panic` tracing reporter. There is no engine selection
+/// here — panic reporting is a process-level switch, not a backend
+/// family; applications wanting a different reporter turn this off and
+/// plug their own through `rushwind-panic` directly.
+#[derive(Debug, Default, Deserialize)]
+pub struct PanicReportingConfig {
+    /// Plugs the default `TracingReporter` (target `rushwind.panic`)
+    /// at assembly time. Defaults to true — omitting the whole
+    /// `panic_reporting` section keeps reporting on.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Application identity and lifecycle settings.

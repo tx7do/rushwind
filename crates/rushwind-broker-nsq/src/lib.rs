@@ -534,7 +534,7 @@ impl NsqBroker {
                     match ack_mode {
                         AckMode::Auto => {
                             let event = Event::new(topic.to_string(), message);
-                            tokio::spawn(handler(event));
+                            rushwind_broker::spawn_dispatch(event, Arc::clone(handler));
                             let _ = outbound_tx.send(fin_frame(&id));
                         }
                         AckMode::Manual => {
@@ -573,7 +573,7 @@ impl NsqBroker {
                                         as BoxFuture<'static, Result<(), BrokerError>>
                                 },
                             );
-                            tokio::spawn(handler(event));
+                            rushwind_broker::spawn_dispatch(event, Arc::clone(handler));
                         }
                     }
                 }

@@ -958,3 +958,93 @@ async fn tracer_section_requires_the_feature() {
         BootstrapError::Failed(msg) if msg.contains("feature 'trace'")
     ));
 }
+
+/// The panic-reporting section parses, and its absence keeps the
+/// default-on behavior.
+#[test]
+fn panic_reporting_config_defaults_on() {
+    let absent: BootstrapConfig =
+        serde_yaml::from_str("app: {}").expect("an absent section must parse");
+    assert!(absent.panic_reporting.as_ref().map_or(true, |p| p.enabled));
+
+    let off: BootstrapConfig = serde_yaml::from_str("panic_reporting:\n  enabled: false")
+        .expect("the explicit section must parse");
+    assert!(!off.panic_reporting.as_ref().expect("section").enabled);
+}
+
+/// Assembly plugs the default reporter per the toggle: on by default,
+/// unplugged under `enabled: false`.
+#[tokio::test]
+async fn panic_reporting_guard_rides_the_assembly() {
+    let on = Bootstrap::from_yaml_str("app:\n  name: panic-on\nservers: []")
+        .expect("yaml must parse")
+        .build()
+        .await
+        .expect("assembly must succeed");
+    assert!(on.panic_reporting.is_some());
+
+    let off = Bootstrap::from_yaml_str(
+        "app:\n  name: panic-off\nservers: []\npanic_reporting:\n  enabled: false",
+    )
+    .expect("yaml must parse")
+    .build()
+    .await
+    .expect("assembly must succeed");
+    assert!(off.panic_reporting.is_none());
+}
+
+/// A server whose start fails immediately — the non-cooperative
+/// terminal outcome's fixture.
+struct FailingServer;
+
+impl rushwind_transport::Server for FailingServer {
+    fn endpoint(&self) -> Result<String, ServerError> {
+        Ok("tcp://127.0.0.1:0".to_owned())
+    }
+
+    fn start(&self, _stop: StopSignal) -> rushwind_transport::ServerFuture<'_> {
+        Box::pin(async { Err(ServerError::Failed("failing fixture".to_owned())) })
+    }
+
+    fn stop(&self) -> rushwind_transport::ServerFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// `run_logged` passes the cooperative terminal through untouched: a
+/// pre-fired external stop over an empty application ends `Ok`.
+#[tokio::test]
+async fn run_logged_passes_the_cooperative_outcome_through() {
+    let bootstrapped = Bootstrap::from_yaml_str("servers: []")
+        .expect("yaml must parse")
+        .build()
+        .await
+        .expect("assembly must succeed");
+
+    let external = StopSignal::new();
+    external.signal();
+    let outcome = bootstrapped.run_logged(external).await;
+    assert!(outcome.is_ok());
+}
+
+/// `run_logged` surfaces the non-cooperative terminal — the log line
+/// rides the same observation (tracing to no subscriber is a no-op).
+#[tokio::test]
+async fn run_logged_surfaces_the_non_cooperative_outcome() {
+    let bootstrapped = Bootstrap::from_yaml_str("servers:\n  - kind: failing\n")
+        .expect("yaml must parse")
+        .server_factory(
+            "failing",
+            |_settings: serde_json::Value, _input: RouteInput| async {
+                Ok(Arc::new(FailingServer) as Arc<dyn rushwind_transport::Server>)
+            },
+        )
+        .build()
+        .await
+        .expect("assembly must succeed");
+
+    let outcome = bootstrapped.run_logged(StopSignal::new()).await;
+    assert!(
+        matches!(outcome, Err(ServerError::Failed(message)) if message.contains("failing fixture"))
+    );
+}

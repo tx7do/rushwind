@@ -187,7 +187,7 @@ fn pump(inner: &Arc<Inner>, topic: &str) {
         match slot.ack_mode {
             AckMode::Auto => {
                 let event = Event::new(dispatch_topic, message);
-                tokio::spawn((slot.handler)(event));
+                rushwind_broker::spawn_dispatch(event, Arc::clone(&slot.handler));
             }
             AckMode::Manual => {
                 let id = format!("mf-{}", inner.next_id.fetch_add(1, Ordering::SeqCst));
@@ -269,7 +269,7 @@ fn pump(inner: &Arc<Inner>, topic: &str) {
                         }) as BoxFuture<'static, Result<(), BrokerError>>
                     },
                 );
-                tokio::spawn((slot.handler)(event));
+                rushwind_broker::spawn_dispatch(event, Arc::clone(&slot.handler));
             }
         }
         slot_index += 1;

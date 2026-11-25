@@ -11,8 +11,10 @@ use crate::{cors, cors_compat, logging, recovery, request_id, timeout};
 /// The request-stack builder. Defaults: recovery, request-id and
 /// logging on; CORS and timeout off until configured. [`HttpEdge::wrap`]
 /// applies the enabled middlewares so that at request time they run in
-/// canonical order — recovery, request-id, logging, CORS,
-/// timeout — no matter the order the options were set in.
+/// canonical order — request-id, recovery, logging, CORS,
+/// timeout — no matter the order the options were set in. Request-id
+/// outermost lets the recovery layer scope its panic reports with the
+/// request identity.
 #[derive(Clone)]
 pub struct HttpEdge {
     request_id: Option<Arc<dyn Fn() -> String + Send + Sync>>,
@@ -101,7 +103,9 @@ impl HttpEdge {
     /// the protected subtrees first, then hand the merged router here.
     pub fn wrap(&self, router: Router) -> Router {
         // Later `layer` calls wrap earlier ones, so applying in reverse
-        // request order puts recovery outermost.
+        // request order puts request-id outermost — the recovery layer
+        // beneath it can then read the RequestId extension and scope
+        // its panic reports with the request identity.
         let mut wrapped = router;
         if let Some(budget) = self.timeout {
             wrapped = timeout::with_timeout(wrapped, budget);
@@ -116,11 +120,11 @@ impl HttpEdge {
         if self.logging {
             wrapped = logging::with_logging(wrapped);
         }
-        if let Some(generate) = &self.request_id {
-            wrapped = request_id::with_request_id_generator(wrapped, Arc::clone(generate));
-        }
         if self.recovery {
             wrapped = recovery::with_recovery(wrapped);
+        }
+        if let Some(generate) = &self.request_id {
+            wrapped = request_id::with_request_id_generator(wrapped, Arc::clone(generate));
         }
         wrapped
     }

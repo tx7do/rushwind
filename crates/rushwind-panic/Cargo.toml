@@ -1,0 +1,37 @@
+[package]
+name = "rushwind-panic"
+description = "Pluggable process-level panic reporting for RushWind: a race-free reporter registry over the one panic-hook slot, with the tracing reporter as the default backend."
+version.workspace = true
+edition.workspace = true
+# `PanicHookInfo` (the hook's parameter type name) stabilized in 1.82; the
+# workspace floor is 1.81, so this crate carries its own one-patch floor.
+rust-version = "1.82"
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The default tracing backend (`TracingReporter`, target `rushwind.panic`).
+# Optional so the contract itself stays dependency-free.
+tracing = ["dep:tracing"]
+# The metrics bridge (`MetricsReporter`): a `panics_total` counter over
+# the rushwind-metrics contract, so panic counts reach whatever engine
+# the application assembled.
+metrics = ["dep:rushwind-metrics"]
+
+[dependencies]
+tracing = { workspace = true, optional = true }
+rushwind-metrics = { workspace = true, optional = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rushwind-metrics = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "cost"
+harness = false

@@ -52,7 +52,12 @@
 //! **Handler panics** are the tokio spawn boundary's business: the
 //! dispatch task dies, the subscription does not; the delivery's
 //! settlement follows the same rules as a handler that never
-//! settles. There is no engine-side `catch_unwind`.
+//! settles. There is no engine-side `catch_unwind`. Every handler
+//! spawn goes through [`spawn_dispatch`], which scopes the delivery's
+//! identity — topic, and message id when the wire carried one — so
+//! the process-wide `rushwind-panic` hook attaches it to the
+//! `rushwind.panic` report: a panicking handler names its delivery,
+//! not just its code location.
 //!
 //! **Multi-consumer fan-out** — the same `subscribe` topic under
 //! concurrent handlers — is intentionally per-engine and documented
@@ -372,6 +377,28 @@ pub fn with_error_handler(handler: Handler, error_handler: ErrorHandler) -> Hand
     })
 }
 
+/// Spawns one handler dispatch with the delivery's panic context
+/// attached — the topic, plus the message id when the wire carried
+/// one. The process-wide `rushwind-panic` hook reads the scope at
+/// raise time, so a panicking handler produces a `rushwind.panic`
+/// report that names its delivery, not just its code location.
+///
+/// This is the engines' dispatch shape: every handler spawn goes
+/// through here, the join handle stays detached (handler panics are
+/// the spawn boundary's business — the subscription survives, and the
+/// hook is that boundary's reporter).
+pub fn spawn_dispatch(
+    event: Event,
+    handler: Handler,
+) -> tokio::task::JoinHandle<Result<(), BrokerError>> {
+    let mut context: Vec<(&'static str, String)> = vec![("topic", event.topic().to_owned())];
+    let message_id = event.message().id.clone();
+    if !message_id.is_empty() {
+        context.push(("message_id", message_id));
+    }
+    tokio::spawn(rushwind_panic::scoped(context, handler(event)))
+}
+
 /// The subscription handle.
 pub trait Subscriber: Send {
     /// The subscribed topic.
@@ -651,6 +678,69 @@ mod tests {
         ))
         .await;
         assert!(result.is_err(), "decode failure must surface as an error");
+    }
+
+    /// A reporter capturing the reports spawn_dispatch's scope rides.
+    struct DispatchRecorder {
+        reports: std::sync::Mutex<Vec<rushwind_panic::PanicReport>>,
+    }
+
+    impl rushwind_panic::PanicReporter for DispatchRecorder {
+        fn report(&self, report: &rushwind_panic::PanicReport) {
+            self.reports
+                .lock()
+                .expect("recorder poisoned")
+                .push(report.clone());
+        }
+    }
+
+    /// A panicking handler dispatched through `spawn_dispatch` produces
+    /// a report carrying the delivery identity: the topic always, the
+    /// message id when the wire carried one.
+    #[tokio::test]
+    async fn spawn_dispatch_scopes_the_delivery_identity() {
+        let recorder = Arc::new(DispatchRecorder {
+            reports: std::sync::Mutex::new(Vec::new()),
+        });
+        let _guard =
+            rushwind_panic::plug(recorder.clone() as Arc<dyn rushwind_panic::PanicReporter>);
+
+        let handler: Handler = Arc::new(|_event: Event| {
+            Box::pin(async {
+                panic!("dispatch-boom");
+                #[allow(unreachable_code)]
+                Ok(())
+            }) as BoxFuture<'static, Result<(), BrokerError>>
+        });
+        let message = Message {
+            id: "m-9".to_owned(),
+            ..Message::from_payload(b"x".to_vec())
+        };
+        spawn_dispatch(Event::new("orders", message), Arc::clone(&handler));
+
+        // The dispatch task is detached; wait for its report to land.
+        for _ in 0..200 {
+            if !recorder
+                .reports
+                .lock()
+                .expect("recorder poisoned")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let reports = recorder.reports.lock().expect("recorder poisoned");
+        let report = reports
+            .iter()
+            .find(|report| report.message.contains("dispatch-boom"))
+            .expect("the panicking dispatch reported");
+        assert!(report
+            .context
+            .contains(&("topic".to_owned(), "orders".to_owned())));
+        assert!(report
+            .context
+            .contains(&("message_id".to_owned(), "m-9".to_owned())));
     }
 
     /// Headers and metadata follow last-write-wins builder semantics.

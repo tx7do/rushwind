@@ -435,7 +435,10 @@ impl Broker for SqsBroker {
                                             delivery.topic.clone(),
                                             delivery.message.clone(),
                                         );
-                                        tokio::spawn(handler(event));
+                                        rushwind_broker::spawn_dispatch(
+                                            event,
+                                            Arc::clone(&handler),
+                                        );
                                         let _ = engine
                                             .settle(&delivery.receipt, SettleAction::Delete)
                                             .await;
@@ -485,7 +488,10 @@ impl Broker for SqsBroker {
                                                     as BoxFuture<'static, Result<(), BrokerError>>
                                             },
                                         );
-                                        tokio::spawn(handler(event));
+                                        rushwind_broker::spawn_dispatch(
+                                            event,
+                                            Arc::clone(&handler),
+                                        );
                                     }
                                 }
                             }

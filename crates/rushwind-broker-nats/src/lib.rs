@@ -218,7 +218,7 @@ impl Broker for NatsBroker {
                     let subject = message.subject.to_string();
                     let payload = message.payload.to_vec();
                     let event = Event::new(subject, Message::from_payload(payload));
-                    tokio::spawn(handler(event));
+                    rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                 }
             });
 

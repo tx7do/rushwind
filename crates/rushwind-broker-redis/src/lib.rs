@@ -307,7 +307,7 @@ impl Broker for RedisBroker {
                         // Fire-and-forget dispatch: a handler error or
                         // panic cannot kill the reader loop — each
                         // delivery lives in its own task.
-                        tokio::spawn(handler(event));
+                        rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                     }
                 });
                 *shared.reader.write().await = Some(reader);

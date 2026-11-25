@@ -354,7 +354,7 @@ async fn dispatch(delivery: Delivery, handler: &Handler, mode: AckMode) {
     match mode {
         AckMode::Auto => {
             let event = Event::new(routing_key, message);
-            tokio::spawn(handler(event));
+            rushwind_broker::spawn_dispatch(event, Arc::clone(handler));
             let _ = delivery.ack(BasicAckOptions::default()).await;
         }
         AckMode::Manual => {
@@ -391,7 +391,7 @@ async fn dispatch(delivery: Delivery, handler: &Handler, mode: AckMode) {
                     }) as BoxFuture<'static, Result<(), BrokerError>>
                 },
             );
-            tokio::spawn(handler(event));
+            rushwind_broker::spawn_dispatch(event, Arc::clone(handler));
         }
     }
 }

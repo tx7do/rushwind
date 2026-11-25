@@ -378,7 +378,7 @@ impl Broker for MqttBroker {
                                                         topic.clone(),
                                                         Message::from_payload(payload.clone()),
                                                     );
-                                                    tokio::spawn(handler(event));
+                                                    rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                                                 }
                                                 // Settle on dispatch: the
                                                 // PUBACK rides once, whatever
@@ -449,7 +449,7 @@ impl Broker for MqttBroker {
                                                                 as BoxFuture<'static, Result<(), BrokerError>>
                                                         },
                                                     );
-                                                    tokio::spawn(handler(event));
+                                                    rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                                                 }
                                             }
                                         }

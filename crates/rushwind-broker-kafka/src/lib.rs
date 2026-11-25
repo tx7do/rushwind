@@ -450,7 +450,7 @@ impl Broker for KafkaBroker {
                             Some(Ok(records)) => {
                                 for record in records {
                                     let event = to_event(record);
-                                    tokio::spawn(handler(event));
+                                    rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                                 }
                             }
                             Some(Err(_)) | None => broken = true,

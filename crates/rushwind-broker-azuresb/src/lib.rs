@@ -553,7 +553,7 @@ impl AzureSbBroker {
                         return Ok(());
                     }
                     let event = Event::new(topic.to_string(), message);
-                    tokio::spawn(handler(event));
+                    rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                 }
                 Ok(())
             }
@@ -605,7 +605,7 @@ impl AzureSbBroker {
                                 as BoxFuture<'static, Result<(), BrokerError>>
                         },
                     );
-                    tokio::spawn(handler(event));
+                    rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                 }
                 Ok(())
             }

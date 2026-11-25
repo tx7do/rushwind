@@ -367,7 +367,7 @@ impl Broker for PulsarBroker {
                         Ok(Some(record)) => match ack_mode {
                             AckMode::Auto => {
                                 let event = to_event(&record);
-                                tokio::spawn(handler(event));
+                                rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                                 // Auto-ack semantics:
                                 // every delivery is acknowledged once
                                 // dispatched.
@@ -406,7 +406,7 @@ impl Broker for PulsarBroker {
                                             as BoxFuture<'static, Result<(), BrokerError>>
                                     },
                                 );
-                                tokio::spawn(handler(event));
+                                rushwind_broker::spawn_dispatch(event, Arc::clone(&handler));
                             }
                         },
                         Ok(None) | Err(_) => {

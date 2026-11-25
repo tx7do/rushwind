@@ -180,8 +180,8 @@ mod tests;
 mod wire;
 
 pub use config::{
-    AppConfig, AuthzRef, BootstrapConfig, EngineConfig, RegistryConfig, RoutePackRef, ScriptConfig,
-    ServerConfig, StorageConfig, StorageEndpointConfig, ViewerPolicy,
+    AppConfig, AuthzRef, BootstrapConfig, EngineConfig, PanicReportingConfig, RegistryConfig,
+    RoutePackRef, ScriptConfig, ServerConfig, StorageConfig, StorageEndpointConfig, ViewerPolicy,
 };
 use wire::*;
 pub use wire::{BindWire, DurationWire};
@@ -192,6 +192,30 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 impl std::fmt::Debug for Bootstrapped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bootstrapped").finish_non_exhaustive()
+    }
+}
+
+impl Bootstrapped {
+    /// Runs the application lifecycle and logs the terminal outcome.
+    ///
+    /// [`App::run`](rushwind_core::App::run) aggregates the first
+    /// non-cooperative failure — a panicking server, a teardown
+    /// timeout, a failed bind — into the return value, and nothing
+    /// else. Raise-time panics already reach the pipeline through the
+    /// process-wide `rushwind-panic` hook; this covers the terminal
+    /// aggregate, which otherwise only reaches the caller's return.
+    /// `rushwind-core` itself carries no logging by declaration — the
+    /// logging half of that contract lives here, at the assembly.
+    pub async fn run_logged(&self, external: StopSignal) -> Result<(), ServerError> {
+        let outcome = self.app.run(external).await;
+        if let Err(error) = &outcome {
+            tracing::error!(
+                target: "rushwind.bootstrap",
+                error = %error,
+                "application lifecycle ended non-cooperatively"
+            );
+        }
+        outcome
     }
 }
 
@@ -213,6 +237,11 @@ pub struct Bootstrapped {
     /// removal; the matching deregistration runs as a before-shutdown
     /// hook regardless.
     pub registration: Option<RegistrationHandle>,
+    /// The guard keeping the default panic reporter (target
+    /// `rushwind.panic`) plugged, when the configuration left panic
+    /// reporting enabled. Unplugging rides the assembly's lifetime:
+    /// dropping [`Bootstrapped`] removes the reporter.
+    pub panic_reporting: Option<rushwind_panic::PlugGuard>,
     /// The assembled authn instances, keyed by their configured
     /// instance names.
     pub authn: HashMap<String, Arc<dyn Authenticator>>,
@@ -1204,12 +1233,25 @@ impl Bootstrap {
             builder = builder.erased_server(server);
         }
 
+        // Process-level panic reporting: the default tracing reporter
+        // goes live with the assembly, and its guard rides
+        // Bootstrapped — the reporter unplugs when the assembled
+        // application drops. plug_once keeps repeated assemblies
+        // single-reported.
+        let panic_reporting = (self
+            .config
+            .panic_reporting
+            .as_ref()
+            .map_or(true, |p| p.enabled))
+        .then(|| rushwind_panic::plug_once(Arc::new(rushwind_panic::TracingReporter)));
+
         Ok(Bootstrapped {
             app: builder.build(),
             repository,
             endpoints,
             discovery,
             registration,
+            panic_reporting,
             authn,
             authz,
             brokers,

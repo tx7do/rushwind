@@ -194,6 +194,59 @@ async fn recovery_answers_the_envelope_without_leaking_the_panic() {
     assert_eq!(body["message"], json!("internal server error"));
 }
 
+/// A panic reporter capturing the context the edge scopes onto each
+/// request — the wire between the recovery layer and the process-wide
+/// rushwind-panic hook.
+struct ContextRecorder {
+    reports: std::sync::Mutex<Vec<rushwind_panic::PanicReport>>,
+}
+
+impl rushwind_panic::PanicReporter for ContextRecorder {
+    fn report(&self, report: &rushwind_panic::PanicReport) {
+        self.reports
+            .lock()
+            .expect("recorder poisoned")
+            .push(report.clone());
+    }
+}
+
+#[tokio::test]
+async fn handler_panics_report_with_the_request_identity() {
+    let recorder = Arc::new(ContextRecorder {
+        reports: std::sync::Mutex::new(Vec::new()),
+    });
+    let _guard = rushwind_panic::plug(recorder.clone() as Arc<dyn rushwind_panic::PanicReporter>);
+
+    let app = HttpEdge::new().wrap(protected_router().route(
+        "/boom",
+        get(|| async {
+            panic!("ctx-boom");
+            #[allow(unreachable_code)]
+            "unreachable"
+        }),
+    ));
+    let (status, body) = get_json(app, "/boom").await;
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["reason"], json!(REASON_PANIC));
+
+    // The report carries the request identity: request-id outermost
+    // (the edge's assembled order) lets recovery read the extension.
+    let reports = recorder.reports.lock().expect("recorder poisoned");
+    let report = reports
+        .iter()
+        .find(|r| r.message.contains("ctx-boom"))
+        .expect("the panic report delivered");
+    let context = &report.context;
+    assert!(context.contains(&("method".to_owned(), "GET".to_owned())));
+    assert!(context.contains(&("path".to_owned(), "/boom".to_owned())));
+    let request_id = context
+        .iter()
+        .find(|(k, _)| k == "request_id")
+        .map(|(_, v)| v.clone())
+        .expect("request id in the panic context");
+    assert!(!request_id.is_empty());
+}
+
 // ---------------------------------------------------------------------
 // Request id
 // ---------------------------------------------------------------------
@@ -519,8 +572,8 @@ async fn the_edge_applies_the_default_stack() {
     let app = HttpEdge::new().wrap(protected_router());
     let response = send(app, get_request("/thing")).await;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
-    // The request-id layer sits inside recovery, outside the route: its
-    // header on the answer proves the chain assembled.
+    // The request-id layer sits outside recovery, outside the route:
+    // its header on the answer proves the chain assembled.
     assert!(response.headers().get(HEADER_X_REQUEST_ID).is_some());
 }
 
@@ -534,4 +587,39 @@ async fn the_edge_respects_opt_outs_and_additions() {
     let response = send(app, get_request("/thing")).await;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     assert!(response.headers().get(HEADER_X_REQUEST_ID).is_none());
+}
+
+#[tokio::test]
+async fn standalone_recovery_reports_method_and_path_only() {
+    // Standalone recovery — no request-id layer — falls back to
+    // method/path context; the request_id key must be absent, not
+    // empty.
+    let recorder = Arc::new(ContextRecorder {
+        reports: std::sync::Mutex::new(Vec::new()),
+    });
+    let _guard = rushwind_panic::plug(recorder.clone() as Arc<dyn rushwind_panic::PanicReporter>);
+
+    let app = with_recovery(protected_router().route(
+        "/solo-boom",
+        get(|| async {
+            panic!("solo-boom");
+            #[allow(unreachable_code)]
+            "unreachable"
+        }),
+    ));
+    let (status, body) = get_json(app, "/solo-boom").await;
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["reason"], json!(REASON_PANIC));
+
+    let reports = recorder.reports.lock().expect("recorder poisoned");
+    let report = reports
+        .iter()
+        .find(|r| r.message.contains("solo-boom"))
+        .expect("the panic report delivered");
+    assert!(report.context.contains(&("method".to_owned(), "GET".to_owned())));
+    assert!(report.context.contains(&("path".to_owned(), "/solo-boom".to_owned())));
+    assert!(
+        !report.context.iter().any(|(k, _)| k == "request_id"),
+        "standalone recovery has no request id to attach"
+    );
 }

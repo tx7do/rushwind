@@ -396,7 +396,10 @@ impl Broker for GcpPubSubBroker {
                                             delivery.topic.clone(),
                                             delivery.message.clone(),
                                         );
-                                        tokio::spawn(handler(event));
+                                        rushwind_broker::spawn_dispatch(
+                                            event,
+                                            Arc::clone(&handler),
+                                        );
                                         let _ = engine
                                             .settle(&delivery.ack_id, SettleAction::Ack)
                                             .await;
@@ -449,7 +452,10 @@ impl Broker for GcpPubSubBroker {
                                                     as BoxFuture<'static, Result<(), BrokerError>>
                                             },
                                         );
-                                        tokio::spawn(handler(event));
+                                        rushwind_broker::spawn_dispatch(
+                                            event,
+                                            Arc::clone(&handler),
+                                        );
                                     }
                                 }
                             }
