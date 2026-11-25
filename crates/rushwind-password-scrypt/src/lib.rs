@@ -21,7 +21,12 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use password_hash::{rand_core::OsRng, Output, PasswordHash, PasswordHasher as _, SaltString};
+// password-hash 0.6 moved the PHC face to the `phc` crate (re-exported
+// under `password_hash::phc`) and dropped the rand_core re-export's
+// OsRng entirely — salt generation rides `SaltString::generate()`'s
+// OS-backed path instead.
+use password_hash::phc::{Output, PasswordHash, SaltString};
+use password_hash::{CustomizedPasswordHasher as _, PasswordHasher as _};
 use rushwind_password::{PasswordError, PasswordHasher};
 use scrypt::{Params, Scrypt};
 
@@ -54,7 +59,7 @@ impl ScryptHasher {
     /// policy (`log_n ≥ 16·r`, overflowing cost products, digest length
     /// past the parameter ceiling, …).
     pub fn with_params(log_n: u8, r: u32, p: u32, out_len: usize) -> Result<Self, PasswordError> {
-        Params::new(log_n, r, p, out_len)
+        Params::new_with_output_len(log_n, r, p, out_len)
             .map(|_| Self {
                 log_n,
                 r,
@@ -82,11 +87,14 @@ impl Default for ScryptHasher {
 
 impl PasswordHasher for ScryptHasher {
     fn hash(&self, password: &str) -> Result<String, PasswordError> {
-        let params =
-            Params::new(self.log_n, self.r, self.p, self.len).expect("policy already validated");
-        let salt = SaltString::generate(&mut OsRng);
-        Scrypt
-            .hash_password_customized(password.as_bytes(), None, None, params, &salt)
+        let params = Params::new_with_output_len(self.log_n, self.r, self.p, self.len)
+            .expect("policy already validated");
+        let salt = SaltString::generate();
+        // The customized flow takes the raw salt bytes; the PHC string
+        // carries the same salt back base64-encoded.
+        let salt_bytes = &*salt.to_salt();
+        Scrypt::default()
+            .hash_password_customized(password.as_bytes(), salt_bytes, None, None, params)
             .map(|h| h.to_string())
             .map_err(|e| PasswordError::Hash(e.to_string()))
     }
@@ -99,12 +107,10 @@ impl PasswordHasher for ScryptHasher {
             Params::try_from(&parsed).map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         let salt = parsed.salt.as_ref().expect("parse refuses saltless hashes");
         let digest = parsed.hash.as_ref().expect("parse refuses empty digests");
-        let mut salt_buf = [0u8; 64];
-        let salt_bytes = salt
-            .decode_b64(&mut salt_buf)
-            .map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
+        // `Salt` derefs to its raw bytes; the digest length drives the
+        // output buffer.
         let mut out = vec![0u8; digest.len()];
-        scrypt::scrypt(password.as_bytes(), salt_bytes, &params, &mut out)
+        scrypt::scrypt(password.as_bytes(), salt, &params, &mut out)
             .map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         let derived = Output::new(&out).map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         Ok(parsed.hash.as_ref() == Some(&derived))
@@ -131,7 +137,7 @@ impl PasswordHasher for ScryptHasher {
 impl ScryptHasher {
     /// Parses a stored PHC string, refusing anything that is not a
     /// well-formed scrypt hash.
-    fn parse(hash: &str) -> Result<PasswordHash<'_>, PasswordError> {
+    fn parse(hash: &str) -> Result<PasswordHash, PasswordError> {
         let parsed =
             PasswordHash::new(hash).map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         if parsed.algorithm.as_str() != "scrypt" {
@@ -170,26 +176,28 @@ mod tests {
     #[test]
     fn cheaper_hash_verifies_and_needs_rehash() {
         let hasher = ScryptHasher::with_params(5, 8, 1, 64).expect("policy");
-        let cheap = Scrypt
+        let cheap_salt = SaltString::generate();
+        let cheap = Scrypt::default()
             .hash_password_customized(
                 "legacy".as_bytes(),
+                &*cheap_salt.to_salt(),
                 None,
                 None,
-                Params::new(4, 8, 1, 64).expect("cheap params"),
-                &SaltString::generate(&mut OsRng),
+                Params::new_with_output_len(4, 8, 1, 64).expect("cheap params"),
             )
             .expect("cheap hash")
             .to_string();
         assert!(hasher.verify("legacy", &cheap).expect("verify"));
         assert!(hasher.needs_rehash(&cheap));
 
-        let strong = Scrypt
+        let strong_salt = SaltString::generate();
+        let strong = Scrypt::default()
             .hash_password_customized(
                 "strong".as_bytes(),
+                &*strong_salt.to_salt(),
                 None,
                 None,
-                Params::new(6, 8, 1, 64).expect("strong params"),
-                &SaltString::generate(&mut OsRng),
+                Params::new_with_output_len(6, 8, 1, 64).expect("strong params"),
             )
             .expect("strong hash")
             .to_string();

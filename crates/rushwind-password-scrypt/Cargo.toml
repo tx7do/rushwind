@@ -12,12 +12,17 @@ workspace = true
 
 [dependencies]
 rushwind-password = { workspace = true }
-# Default features: simple (password-hash bridge) + std.
-scrypt = "0.11"
+# scrypt 0.12 reshaped its feature tree: `Scrypt` (the PasswordHasher
+# marker) lives behind `phc`, the OS salt path behind `getrandom` —
+# each forwards to the matching password-hash feature.
+scrypt = { version = "0.12", features = ["phc", "getrandom"] }
 
 # The password-hash face (PHC types, salt generation, constant-time
 # Output equality) is used directly, not through the engine crate's re-export.
-password-hash = "0.5"
+# 0.6 gates everything by default: the PHC types moved to the `phc`
+# crate and ride back in behind `phc` + `alloc`; the OS salt path
+# behind `getrandom` (rand_core 0.10 no longer ships an OsRng).
+password-hash = { version = "0.6", features = ["phc", "alloc", "getrandom"] }
 
 [dev-dependencies]
 rushwind-testkit = { workspace = true, features = ["password"] }
