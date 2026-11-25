@@ -13,7 +13,7 @@ workspace = true
 [dependencies]
 rushwind-password = { workspace = true }
 # Default features: alloc + password-hash + rand_core (salt generation).
-argon2 = "0.5"
+argon2 = "0.6"
 
 # The password-hash face (PHC types, salt generation, constant-time
 # Output equality) is used directly, not through the engine crate's re-export.
