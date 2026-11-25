@@ -21,7 +21,12 @@
 #![deny(missing_docs)]
 
 use argon2::{Algorithm, Argon2, Params, Version};
-use password_hash::{rand_core::OsRng, Output, PasswordHash, PasswordHasher as _, SaltString};
+// password-hash 0.6 moved the PHC face to the `phc` crate (re-exported
+// under `password_hash::phc`) and dropped the rand_core re-export's
+// OsRng entirely — salt generation rides `SaltString::generate()`'s
+// OS-backed path instead.
+use password_hash::phc::{Output, PasswordHash, SaltString};
+use password_hash::PasswordHasher as _;
 use rushwind_password::{PasswordError, PasswordHasher};
 
 /// The Argon2id engine.
@@ -73,9 +78,9 @@ impl Default for Argon2Hasher {
 
 impl PasswordHasher for Argon2Hasher {
     fn hash(&self, password: &str) -> Result<String, PasswordError> {
-        let salt = SaltString::generate(&mut OsRng);
+        let salt = SaltString::generate();
         Argon2::new(Algorithm::Argon2id, Version::V0x13, self.params.clone())
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password_with_salt(password.as_bytes(), &salt.to_salt())
             .map(|h| h.to_string())
             .map_err(|e| PasswordError::Hash(e.to_string()))
     }
@@ -114,10 +119,10 @@ impl Argon2Hasher {
     /// family. Legacy faces (argon2i/argon2d, v=16) parse fine — they
     /// verify, and [`PasswordHasher::needs_rehash`] is what flags them
     /// for upgrade.
-    fn parse(hash: &str) -> Result<PasswordHash<'_>, PasswordError> {
+    fn parse(hash: &str) -> Result<PasswordHash, PasswordError> {
         let parsed =
             PasswordHash::new(hash).map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
-        Algorithm::try_from(parsed.algorithm).map_err(|_| {
+        Algorithm::try_from(parsed.algorithm.as_str()).map_err(|_| {
             PasswordError::InvalidHash(format!("not an argon2 hash: {}", parsed.algorithm.as_str()))
         })?;
         if parsed.salt.is_none() || parsed.hash.is_none() {
@@ -131,8 +136,8 @@ impl Argon2Hasher {
     /// Re-derives the digest with the parsed hash's embedded parameters
     /// and compares it against the stored digest in constant time (the
     /// `Output` equality is the password-hash crate's constant-time one).
-    fn derive(password: &str, parsed: &PasswordHash<'_>) -> Result<Output, PasswordError> {
-        let algorithm = Algorithm::try_from(parsed.algorithm)
+    fn derive(password: &str, parsed: &PasswordHash) -> Result<Output, PasswordError> {
+        let algorithm = Algorithm::try_from(parsed.algorithm.as_str())
             .map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         let version_u32 = parsed
             .version
@@ -142,14 +147,12 @@ impl Argon2Hasher {
         let params =
             Params::try_from(parsed).map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         let salt = parsed.salt.as_ref().expect("parse refuses saltless hashes");
-        let mut salt_buf = [0u8; 64];
-        let salt_bytes = salt
-            .decode_b64(&mut salt_buf)
-            .map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         let digest = parsed.hash.as_ref().expect("parse refuses empty digests");
+        // `Salt` derefs to its raw bytes; the digest length drives the
+        // output buffer.
         let mut out = vec![0u8; digest.len()];
         Argon2::new(algorithm, version, params)
-            .hash_password_into(password.as_bytes(), salt_bytes, &mut out)
+            .hash_password_into(password.as_bytes(), salt, &mut out)
             .map_err(|e| PasswordError::InvalidHash(e.to_string()))?;
         Output::new(&out).map_err(|e| PasswordError::InvalidHash(e.to_string()))
     }
@@ -179,7 +182,7 @@ mod tests {
             Version::V0x13,
             Params::new(64, 1, 1, None).expect("cheap params"),
         )
-        .hash_password("legacy".as_bytes(), &SaltString::generate(&mut OsRng))
+        .hash_password_with_salt("legacy".as_bytes(), &SaltString::generate().to_salt())
         .expect("cheap hash")
         .to_string();
 
@@ -205,7 +208,7 @@ mod tests {
                 version,
                 Params::new(64, 1, 1, None).expect("cheap params"),
             )
-            .hash_password("legacy".as_bytes(), &SaltString::generate(&mut OsRng))
+            .hash_password_with_salt("legacy".as_bytes(), &SaltString::generate().to_salt())
             .expect("legacy hash")
             .to_string();
             assert!(hasher.verify("legacy", &legacy).expect("verify"));

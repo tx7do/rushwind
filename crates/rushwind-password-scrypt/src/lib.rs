@@ -26,7 +26,7 @@
 // OsRng entirely — salt generation rides `SaltString::generate()`'s
 // OS-backed path instead.
 use password_hash::phc::{Output, PasswordHash, SaltString};
-use password_hash::{CustomizedPasswordHasher as _, PasswordHasher as _};
+use password_hash::CustomizedPasswordHasher as _;
 use rushwind_password::{PasswordError, PasswordHasher};
 use scrypt::{Params, Scrypt};
 
@@ -180,7 +180,7 @@ mod tests {
         let cheap = Scrypt::default()
             .hash_password_customized(
                 "legacy".as_bytes(),
-                &*cheap_salt.to_salt(),
+                &cheap_salt.to_salt(),
                 None,
                 None,
                 Params::new_with_output_len(4, 8, 1, 64).expect("cheap params"),
@@ -194,7 +194,7 @@ mod tests {
         let strong = Scrypt::default()
             .hash_password_customized(
                 "strong".as_bytes(),
-                &*strong_salt.to_salt(),
+                &strong_salt.to_salt(),
                 None,
                 None,
                 Params::new_with_output_len(6, 8, 1, 64).expect("strong params"),

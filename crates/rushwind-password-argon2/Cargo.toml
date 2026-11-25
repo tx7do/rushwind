@@ -12,20 +12,16 @@ workspace = true
 
 [dependencies]
 rushwind-password = { workspace = true }
-# Default features: alloc + password-hash + rand_core (salt generation).
-argon2 = "0.5"
+# Default features: alloc + password-hash + getrandom (salt generation).
+argon2 = "0.6"
 
 # The password-hash face (PHC types, salt generation, constant-time
-# Output equality) is used directly, not through the engine crate's re-export.
-password-hash = "0.5"
-
-# The crate names `password_hash::rand_core::OsRng` directly; the
-# salt generator exists only when rand_core carries the getrandom
-# backend. Declared here so the engine is self-sufficient — in the
-# framework workspace some other member used to carry the feature
-# by accident, and a downstream workspace without that member failed
-# to resolve `OsRng`.
-rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+# Output equality) is used directly, not through the engine crate's
+# re-export. 0.6 gates everything by default: the PHC types moved to
+# the `phc` crate and ride back in behind `phc` + `alloc`; the OS salt
+# path behind `getrandom` (rand_core 0.10, which 0.6 tracks, no longer
+# ships an OsRng — the old direct rand_core pin is gone with it).
+password-hash = { version = "0.6", features = ["phc", "alloc", "getrandom"] }
 
 [dev-dependencies]
 rushwind-testkit = { workspace = true, features = ["password"] }
